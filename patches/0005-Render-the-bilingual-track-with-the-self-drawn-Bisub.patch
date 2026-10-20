@@ -1,0 +1,204 @@
+From d6fbdaaec2285fcee3a017adc9999a97815ccadb Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 09:37:50 +0800
+Subject: [PATCH 5/5] Render the bilingual track with the self-drawn
+ BisubSubtitleView in the player
+
+- player.xml: add BisubSubtitleView layered above the exo SubtitleView
+- PlayerLayoutController: feed cues to both views in onCues/reapplyCues
+- PlayerTracksController: applyBisubStyleIfSelected swaps the rendering
+  view based on the selected text track language (case-insensitive,
+  using the callback's Tracks snapshot), hiding the exo view while the
+  bilingual track is active; setupSubtitleView split into a plain
+  style pass to avoid re-entering the selection logic
+---
+ .../newpipe/player/PlayerLayoutController.kt  |  8 +-
+ .../newpipe/player/PlayerTracksController.kt  | 96 +++++++++++++++++++
+ app/src/main/res/layout/player.xml            |  7 ++
+ 3 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+index 66b1276de..8a8b2115f 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+@@ -346,6 +346,9 @@ class PlayerLayoutController(private val player: Player) {
+     fun onCues(cueGroup: CueGroup) {
+         lastCueGroup = cueGroup
+         player.binding.subtitleView.setCues(cueGroup.cues)
++        // BISUB-BEGIN: feed the self-drawn bilingual subtitle view as well
++        player.binding.bisubSubtitleView.setCues(cueGroup.cues)
++        // BISUB-END
+     }
+ 
+     /**
+@@ -358,6 +361,9 @@ class PlayerLayoutController(private val player: Player) {
+      * (#2944).
+      */
+     fun reapplyCues() {
+-        lastCueGroup?.let { player.binding.subtitleView.setCues(it.cues) }
++        lastCueGroup?.let {
++            player.binding.subtitleView.setCues(it.cues)
++            player.binding.bisubSubtitleView.setCues(it.cues)
++        }
+     }
+ }
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerTracksController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerTracksController.kt
+index 89dcc2622..871e8bbc8 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerTracksController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerTracksController.kt
+@@ -1,5 +1,6 @@
+ package org.schabi.newpipe.player
+ 
++import android.util.Log
+ import android.view.View
+ import com.google.android.exoplayer2.C
+ import com.google.android.exoplayer2.Tracks
+@@ -7,6 +8,8 @@ import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
+ import com.google.android.exoplayer2.ui.CaptionStyleCompat
+ import com.google.android.exoplayer2.ui.SubtitleView
+ import org.schabi.newpipe.R
++import org.schabi.newpipe.bisub.BisubManager
++import org.schabi.newpipe.bisub.BisubPrefs
+ import org.schabi.newpipe.player.helper.PlayerHelper
+ import org.schabi.newpipe.util.AudioStreamSelector
+ import java.util.stream.Collectors
+@@ -26,6 +29,17 @@ class PlayerTracksController(private val player: Player) {
+      * Builds the subtitle view from the user's caption style and scale preferences.
+      */
+     fun setupSubtitleView() {
++        setupSubtitleViewStyle()
++        // BISUB-BEGIN: re-evaluate which view renders the subtitles
++        applyBisubStyleIfSelected(null)
++        // BISUB-END
++    }
++
++    /**
++     * Applies the system caption scale and style to the regular subtitle view, without
++     * touching the bilingual view selection logic (see [applyBisubStyleIfSelected]).
++     */
++    private fun setupSubtitleViewStyle() {
+         val context = player.getContext()
+         val binding = player.binding
+         val captionScale = PlayerHelper.getCaptionScale(context)
+@@ -48,6 +62,14 @@ class PlayerTracksController(private val player: Player) {
+         val binding = player.binding ?: return
+         val trackSelector = player.trackSelector
+ 
++        // BISUB-BEGIN: re-evaluate the subtitle appearance whenever the
++        // selected text track changes, so the bilingual track gets its
++        // in-app style and original tracks fall back to the system caption
++        // style. This must run before any early return below, or a text
++        // track change that is deemed "unsupported" would silently skip it.
++        applyBisubStyleIfSelected(currentTrack)
++        // BISUB-END
++
+         val trackTypeTextSupported = !currentTrack.containsType(C.TRACK_TYPE_TEXT)
+             || currentTrack.isTypeSupported(C.TRACK_TYPE_TEXT, false)
+         if (trackSelector.currentMappedTrackInfo == null || !trackTypeTextSupported) {
+@@ -86,6 +108,76 @@ class PlayerTracksController(private val player: Player) {
+             if (availableLanguages.isEmpty()) View.GONE else View.VISIBLE
+     }
+ 
++    // BISUB-BEGIN
++    /**
++     * While the bilingual track is selected, it is rendered by the self-drawn
++     * [org.schabi.newpipe.bisub.BisubSubtitleView] instead of the regular subtitle view, so
++     * the appearance is fully controlled by the in-app bisub style (which also works on
++     * systems without Android caption settings, e.g. HarmonyOS). Any other text track keeps
++     * the regular Android system caption style.
++     *
++     * The decision is based on the [Tracks] snapshot handed to [onTextTracksChanged] (the
++     * very same source the upstream caption button uses), not on a second lookup through
++     * `getExoPlayer().getCurrentTracks()`, which may return a different snapshot at
++     * callback time.
++     *
++     * @param currentTracks the tracks snapshot from the callback, or `null` when no
++     * snapshot is available yet
++     */
++    private fun applyBisubStyleIfSelected(currentTracks: Tracks?) {
++        val binding = player.binding ?: return
++        val context = player.getContext()
++        val selected = getSelectedTextTrackLanguage(currentTracks)
++        // ExoPlayer normalizes track language tags to lower case, so the comparison must
++        // be case-insensitive (log evidence: selected="bilingual（双语）" vs
++        // expected="Bilingual（双语）").
++        val bilingualSelected =
++            BisubManager.bilingualTrackLanguage().equals(selected, ignoreCase = true)
++
++        val diag = StringBuilder("bisub style: bilingualSelected=")
++            .append(bilingualSelected)
++            .append(", selected=")
++            .append(selected)
++            .append(", expected=")
++            .append(BisubManager.bilingualTrackLanguage())
++        currentTracks?.groups?.forEach { group ->
++            if (group.type == C.TRACK_TYPE_TEXT && group.mediaTrackGroup.length > 0) {
++                diag.append(" [lang=")
++                    .append(group.mediaTrackGroup.getFormat(0).language)
++                    .append(",selected=")
++                    .append(group.isSelected)
++                    .append(']')
++            }
++        }
++        Log.i(TAG, diag.toString())
++
++        if (bilingualSelected) {
++            binding.subtitleView.visibility = View.GONE
++            binding.bisubSubtitleView.setBisubStyle(BisubPrefs.loadStyle(context))
++            binding.bisubSubtitleView.visibility = View.VISIBLE
++        } else {
++            binding.bisubSubtitleView.visibility = View.GONE
++            binding.subtitleView.visibility = View.VISIBLE
++            setupSubtitleViewStyle()
++        }
++    }
++
++    private fun getSelectedTextTrackLanguage(tracks: Tracks?): String? {
++        if (tracks == null) {
++            return null
++        }
++        for (group in tracks.groups) {
++            if (group.type == C.TRACK_TYPE_TEXT && group.isSelected
++                && group.mediaTrackGroup.length > 0
++            ) {
++                return group.mediaTrackGroup.getFormat(0).language
++            }
++        }
++        return null
++    }
++
++    // BISUB-END
++
+     fun onAudioTracksChanged() {
+         val binding = player.binding ?: return
+ 
+@@ -165,4 +257,8 @@ class PlayerTracksController(private val player: Player) {
+ 
+             return Player.RENDERER_UNAVAILABLE
+         }
++
++    companion object {
++        private const val TAG = "PlayerTracksController"
++    }
+ }
+diff --git a/app/src/main/res/layout/player.xml b/app/src/main/res/layout/player.xml
+index 75df92be5..c88772f4b 100644
+--- a/app/src/main/res/layout/player.xml
++++ b/app/src/main/res/layout/player.xml
+@@ -44,6 +44,13 @@
+         android:layout_centerInParent="true"
+         android:layout_gravity="center" />
+ 
++    <org.schabi.newpipe.bisub.BisubSubtitleView
++        android:id="@+id/bisubSubtitleView"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:layout_centerInParent="true"
++        android:visibility="gone" />
++
+     <View
+         android:id="@+id/playerTopShadow"
+         android:layout_width="match_parent"
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,108 @@
+name: Build bisub APK
+
+on:
+  schedule:
+    # Every Monday at 04:00 UTC, follow upstream dev/main
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      client_ref:
+        description: 'PipePipeClient branch/tag/commit to build from'
+        required: false
+        default: 'v5.5.0-beta3'
+      extractor_ref:
+        description: 'PipePipeExtractor branch/tag/commit (must be compatible with the client ref)'
+        required: false
+        default: '73442076c671ae09bd5c0f9635932a5a67bdd609'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this patch project
+        uses: actions/checkout@v6
+
+      - name: Resolve upstream refs
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "CLIENT_REF=dev" >> "$GITHUB_ENV"
+            echo "EXTRACTOR_REF=main" >> "$GITHUB_ENV"
+          else
+            echo "CLIENT_REF=${{ github.event.inputs.client_ref }}" >> "$GITHUB_ENV"
+            echo "EXTRACTOR_REF=${{ github.event.inputs.extractor_ref }}" >> "$GITHUB_ENV"
+          fi
+
+      # PipePipeClient's settings.gradle contains includeBuild('../PipePipeExtractor'),
+      # so BOTH repositories must be cloned side by side with their original names
+      # under the same parent directory.
+      - name: Clone upstream PipePipeClient
+        run: |
+          git clone https://github.com/InfinityLoop1309/PipePipeClient.git src/PipePipeClient
+          cd src/PipePipeClient
+          git checkout "$CLIENT_REF"
+
+      - name: Clone upstream PipePipeExtractor
+        run: |
+          git clone https://github.com/InfinityLoop1309/PipePipeExtractor.git src/PipePipeExtractor
+          cd src/PipePipeExtractor
+          git checkout "$EXTRACTOR_REF"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+          cache: 'gradle'
+
+      - name: Apply bisub patches
+        run: |
+          cd src/PipePipeClient
+          git config user.name "bisub-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git am ../../../patches/*.patch
+
+      - name: Build debug APK
+        working-directory: src/PipePipeClient
+        run: ./gradlew assembleDebug --stacktrace -DskipFormatKtlint
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pipepipe-bisub-apk
+          path: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
+
+      - name: Create release (on success)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bisub-${{ github.run_number }}
+          name: PipePipe bisub build ${{ github.run_number }}
+          body: |
+            PipePipe (${{ env.CLIENT_REF }}) + bisub patches.
+
+            - PipePipeClient: ${{ env.CLIENT_REF }}
+            - PipePipeExtractor: ${{ env.EXTRACTOR_REF }}
+          files: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  report-failure:
+    needs: build
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Create issue about patch failure
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Patch application or build failed against upstream',
+              body: `The bisub build failed. Either the patches no longer apply against the requested PipePipeClient ref, or the patched code has compile errors.\n\nCheck the run: ${runUrl}\n\nIf a patch failed to apply, the resolver/player hooks (0003/0005) most likely need a manual update — PipePipe refactors its player controllers frequently. See README for instructions.`,
+              labels: ['patch-broken']
+            });

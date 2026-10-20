@@ -1,0 +1,57 @@
+From 5996d8362e7aba265d207fdcf2c427191de5d966 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 09:37:50 +0800
+Subject: [PATCH 3/5] Wire bisub into VideoPlaybackResolver subtitle source
+ selection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Append the cached bilingual subtitle as an extra text track once its
+translation is complete, so it shows up in the player's caption
+selector as 'Bilingual（双语）'. This only reads the completed cache and
+never starts or waits for a translation.
+---
+ .../resolver/VideoPlaybackResolver.java       | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java b/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
+index 653177243..81cc7ccd6 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
++++ b/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
+@@ -12,6 +12,7 @@ import com.google.android.exoplayer2.source.MediaSource;
+ import com.google.android.exoplayer2.source.MergingMediaSource;
+ import com.google.android.exoplayer2.source.SingleSampleMediaSource;
+ 
++import org.schabi.newpipe.bisub.BisubManager;
+ import org.schabi.newpipe.extractor.MediaFormat;
+ import org.schabi.newpipe.extractor.stream.AudioStream;
+ import org.schabi.newpipe.extractor.stream.DeliveryMethod;
+@@ -239,6 +240,24 @@ public class VideoPlaybackResolver implements PlaybackResolver {
+                     mediaSources.add(textSource);
+                 }
+             }
++            // BISUB-BEGIN: append the cached bilingual subtitle as an extra
++            // track once its translation is complete, so the user can pick
++            // "Bilingual" in the player's subtitle selection. This only
++            // reads the cache and never starts or waits for a translation.
++            final Uri bilingualUri = BisubManager.getInstance(context)
++                    .getCompletedBilingualSubtitle(info);
++            if (bilingualUri != null) {
++                final MediaItem.SubtitleConfiguration bilingualMediaItem =
++                        new MediaItem.SubtitleConfiguration.Builder(bilingualUri)
++                                .setMimeType(BisubManager.subtitleMimeType())
++                                .setRoleFlags(C.ROLE_FLAG_CAPTION)
++                                .setLanguage(BisubManager.bilingualTrackLanguage())
++                                .build();
++                final MediaSource bilingualSource = dataSource.getSingleSampleMediaSourceFactory()
++                        .createMediaSource(bilingualMediaItem, TIME_UNSET);
++                mediaSources.add(bilingualSource);
++            }
++            // BISUB-END
+         }
+ 
+         if (mediaSources.size() == 1) {
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,2096 @@
+From 1fad60dc4c8b7c24d9f5e3acd5e266306743cb44 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 09:37:34 +0800
+Subject: [PATCH 1/5] Add bisub package: streaming LLM bilingual subtitle
+ pipeline
+
+Self-contained package (org.schabi.newpipe.bisub) with no new gradle
+dependencies:
+- BisubManager: single-instance translation orchestrator with manual
+  button-triggered mode, progress callbacks and a completed-only cache
+- VttParser: WebVTT parsing, rolling-window cue de-overlap and the
+  original/translation composition (single-line joined text, two lines
+  per cue)
+- SubtitleTranslator: JSON-batch translation with retry-backfill of
+  missing lines, executor pool and a wall-clock budget
+- BisubPrefs + BisubStyle: 7-field in-app subtitle style
+- BisubSubtitleView: self-drawn subtitle view (StaticLayout text +
+  rounded background), fixed-width container layout model, auto-shrink
+  against unbreakable tokens and true-ratio preview support
+
+Adapted from the NewPipe bisub patch series: the subtitle candidate
+filter is inlined (PipePipe's ListHelper has no
+getUrlAndNonTorrentStreams).
+---
+ .../schabi/newpipe/bisub/BisubManager.java    | 885 ++++++++++++++++++
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 174 ++++
+ .../org/schabi/newpipe/bisub/BisubStyle.java  |  55 ++
+ .../newpipe/bisub/BisubSubtitleView.java      | 300 ++++++
+ .../newpipe/bisub/SubtitleTranslator.java     | 241 +++++
+ .../org/schabi/newpipe/bisub/VttParser.java   | 364 +++++++
+ 6 files changed, 2019 insertions(+)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/VttParser.java
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+new file mode 100644
+index 000000000..5484101f4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -0,0 +1,885 @@
++package org.schabi.newpipe.bisub;
++
++import android.content.Context;
++import android.net.Uri;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.Log;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.schabi.newpipe.DownloaderImpl;
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.extractor.downloader.Response;
++import org.schabi.newpipe.extractor.exceptions.ReCaptchaException;
++import org.schabi.newpipe.extractor.stream.DeliveryMethod;
++import org.schabi.newpipe.extractor.stream.StreamInfo;
++import org.schabi.newpipe.extractor.stream.SubtitlesStream;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.ArrayList;
++
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
++/**
++ * Orchestrates bilingual subtitle generation: pick a source subtitle track,
++ * download it, translate it with an LLM, compose a bilingual WebVTT file and
++ * cache the result on disk.
++ *
++ * <p>Generation is <b>manual and streaming</b>: the user triggers it from the
++ * video detail page, subtitle lines are translated in batches by a small pool
++ * of workers, and the cache file is rewritten after every batch that comes
++ * back. Attached {@link ButtonListener}s receive progress updates on the main
++ * thread, and a toast announces completion, so the user knows when to reopen
++ * the video. Once fully translated, the playback resolver appends the cached
++ * file to the player's subtitle selection as an extra track; nothing is
++ * replaced and playback never waits for a translation.</p>
++ *
++ * <p>All of this runs on dedicated daemon threads, because the playback
++ * loader that calls {@link #getCompletedBilingualSubtitle(StreamInfo)} must
++ * never be blocked or aborted by a translation. Interrupting the caller does
++ * not abort an in-flight translation either: the workers finish it and keep
++ * writing the cache file.</p>
++ */
++public final class BisubManager {
++
++    private static final String TAG = BisubManager.class.getSimpleName();
++    private static final String CACHE_DIR = "bisub";
++    /**
++     * Bump this whenever parsing or composition changes so that stale cache
++     * files from older builds are ignored (and deleted by the legacy cleaner).
++     */
++    private static final int CACHE_VERSION = 6;
++    /**
++     * Soft cap on unique subtitle lines per video. Lines beyond the cap keep
++     * their original text only. 2000 unique lines covers multi-hour videos.
++     */
++    private static final int MAX_UNIQUE_LINES = 2000;
++    /**
++     * How long the background generation may keep translating in total. The
++     * budget only stops batches that have not started yet. It is generous on
++     * purpose: generation is a manual action now, so the user expects even a
++     * multi-hour video to be translated completely (roughly 12 concurrent
++     * batches of 40 lines translate about 20k lines within this budget).
++     */
++    private static final long TOTAL_BUDGET_MS = 20 * 60_000;
++    /**
++     * Subtitle lines per translation batch (one LLM request).
++     */
++    private static final int BATCH_SIZE = 40;
++    /**
++     * Parallel LLM requests. Twelve concurrent batches translate a two-hour
++     * video in a few minutes; the missing-line retries in {@link BatchJob}
++     * absorb the occasional rate limit of stricter providers.
++     */
++    private static final int BATCH_POOL_SIZE = 12;
++    /**
++     * Delay before retrying a partially or fully failed batch.
++     */
++    private static final long BATCH_RETRY_DELAY_MS = 2_000;
++    /**
++     * How many times one batch is attempted in total. Each retry only
++     * re-sends the lines that are still missing, so a model reply with a
++     * truncated array no longer silently leaves whole minutes untranslated.
++     */
++    private static final int BATCH_MAX_ATTEMPTS = 3;
++    /**
++     * Display name (and player track language) of the bilingual track that
++     * the playback resolver appends to the subtitle selection menu once a
++     * translation is complete. The player menu shows this string verbatim
++     * and matches it exactly when the track is selected.
++     */
++    @NonNull
++    private static final String BILINGUAL_TRACK_LANGUAGE = "Bilingual（双语）";
++
++    /**
++     * Coordinates generation jobs (download, parse, dispatch, merge, write).
++     * Two slots are enough for the current video plus one preloaded
++     * neighbour; further videos simply queue.
++     */
++    private static final ExecutorService WORKER = Executors.newFixedThreadPool(2, runnable -> {
++        final Thread thread = new Thread(runnable, "bisub-coordinator");
++        thread.setDaemon(true);
++        return thread;
++    });
++
++    /**
++     * Runs the individual translation batches in parallel. Daemon threads,
++     * never interrupted by the player's RxJava disposal.
++     */
++    private static final ExecutorService SUBPOOL = Executors.newFixedThreadPool(
++            BATCH_POOL_SIZE, runnable -> {
++                final Thread thread = new Thread(runnable, "bisub-batch");
++                thread.setDaemon(true);
++                return thread;
++            });
++
++    /**
++     * Maps a cache key to the generation task currently producing it, so
++     * that repeated button taps and preloading never translate the same
++     * video twice.
++     */
++    private static final ConcurrentHashMap<String, Future<?>> IN_FLIGHT =
++            new ConcurrentHashMap<>();
++
++    /**
++     * Button listeners registered per cache key; invoked on the main thread.
++     */
++    private static final ConcurrentHashMap<String, CopyOnWriteArrayList<ButtonListener>>
++            LISTENERS = new ConcurrentHashMap<>();
++
++    /**
++     * Last known progress per cache key, so a listener attaching to an
++     * in-flight translation immediately sees the current counters.
++     */
++    private static final ConcurrentHashMap<String, int[]> LAST_PROGRESS =
++            new ConcurrentHashMap<>();
++
++    private static final Handler MAIN = new Handler(Looper.getMainLooper());
++
++    private static volatile BisubManager sInstance;
++    private static volatile boolean sLegacyCacheCleaned = false;
++
++    @NonNull
++    private final Context appContext;
++
++    private BisubManager(@NonNull final Context context) {
++        this.appContext = context.getApplicationContext();
++    }
++
++    /**
++     * @param context any context
++     * @return the singleton instance
++     */
++    @NonNull
++    public static BisubManager getInstance(@NonNull final Context context) {
++        if (sInstance == null) {
++            synchronized (BisubManager.class) {
++                if (sInstance == null) {
++                    sInstance = new BisubManager(context);
++                }
++            }
++        }
++        return sInstance;
++    }
++
++    /**
++     * Callbacks driving the state of the detail page bilingual button. All
++     * methods are invoked on the main thread. The sequence is
++     * {@link #onUnavailable()} or {@link #onIdle()} first, then any number of
++     * {@link #onProgress(int, int)} while a translation runs, finally
++     * {@link #onFinished(boolean)} when it ends.
++     */
++    public interface ButtonListener {
++        /**
++         * The feature cannot be used at all (disabled, incomplete
++         * configuration, or no usable subtitle track): hide the button.
++         */
++        void onUnavailable();
++
++        /**
++         * Nothing is running for this video: show the button in its idle
++         * "generate" state, ready for a tap.
++         */
++        void onIdle();
++
++        /**
++         * A translation was just requested and is being prepared (subtitle
++         * download, parsing, dispatching the first batches). Sent
++         * immediately on the main thread so the user gets instant feedback
++         * for their tap; the first {@link #onProgress(int, int)} may still
++         * take a few seconds.
++         */
++        default void onStarting() { }
++
++        /**
++         * A translation is in progress.
++         *
++         * @param translated unique lines translated so far
++         * @param total      unique lines submitted overall
++         */
++        void onProgress(int translated, int total);
++
++        /**
++         * The translation ended. On success the bilingual track is cached
++         * and appears in the player's subtitle menu after reopening the
++         * video; on failure the button may offer a retry.
++         *
++         * @param success whether the complete bilingual file was written
++         */
++        void onFinished(boolean success);
++    }
++
++    /**
++     * Everything the generation pipeline needs for one video, derived once
++     * from the stream info and the current configuration.
++     */
++    private static final class CacheTarget {
++        @NonNull final String cacheKey;
++        @NonNull final File cacheFile;
++        @NonNull final File doneFile;
++        @NonNull final SubtitlesStream source;
++        @NonNull final BisubPrefs.Config cfg;
++
++        CacheTarget(@NonNull final String cacheKey, @NonNull final File cacheFile,
++                    @NonNull final File doneFile, @NonNull final SubtitlesStream source,
++                    @NonNull final BisubPrefs.Config cfg) {
++            this.cacheKey = cacheKey;
++            this.cacheFile = cacheFile;
++            this.doneFile = doneFile;
++            this.source = source;
++            this.cfg = cfg;
++        }
++    }
++
++    /**
++     * Resolves the cache files and the source track for a video based on the
++     * current configuration. The subtitle URL is deliberately not part of the
++     * key: YouTube signs its timedtext URLs with parameters that change
++     * between extractions, which would make the cache miss on every replay.
++     *
++     * @param info the stream info of the video
++     * @return the target, or {@code null} when bisub is disabled,
++     *         misconfigured, or the video has no usable subtitle track
++     */
++    @Nullable
++    private CacheTarget resolveCacheTarget(@NonNull final StreamInfo info) {
++        final BisubPrefs.Config cfg = BisubPrefs.load(appContext);
++        if (!cfg.isUsable()) {
++            Log.i(TAG, "Bisub is disabled or the configuration is incomplete, skipping");
++            return null;
++        }
++        // Only URL streams that are not delivered as torrents can be
++        // downloaded by the translator; embedded subtitle payloads are
++        // left to the regular player pipeline.
++        final List<SubtitlesStream> candidates = new ArrayList<>();
++        final List<SubtitlesStream> allSubtitles = info.getSubtitles();
++        if (allSubtitles != null) {
++            for (final SubtitlesStream stream : allSubtitles) {
++                if (stream.isUrl()
++                        && stream.getDeliveryMethod() != DeliveryMethod.TORRENT) {
++                    candidates.add(stream);
++                }
++            }
++        }
++        if (candidates.isEmpty()) {
++            Log.i(TAG, "This video has no usable URL subtitle tracks, skipping");
++            return null;
++        }
++        final SubtitlesStream source = pickStream(candidates, cfg.sourceLanguage);
++        final String cacheKey = sha256Hex(CACHE_VERSION + "|" + info.getId() + "|"
++                + source.getLanguageTag() + "|" + source.isAutoGenerated()
++                + "|" + cfg.model + "|" + cfg.targetLanguage);
++        final String fileName = "v" + CACHE_VERSION + "-" + cacheKey;
++        final File cacheFile = new File(new File(appContext.getFilesDir(), CACHE_DIR),
++                fileName + ".vtt");
++        final File doneFile = new File(cacheFile.getParentFile(), fileName + ".done");
++        return new CacheTarget(cacheKey, cacheFile, doneFile, source, cfg);
++    }
++
++    /**
++     * @param target the cache target to check
++     * @return whether the complete bilingual file is on disk
++     */
++    private static boolean isDone(@NonNull final CacheTarget target) {
++        return target.doneFile.exists()
++                && target.cacheFile.exists() && target.cacheFile.length() > 0;
++    }
++
++    /**
++     * Reports the current state of a video to a button listener without
++     * starting anything: unavailable, already done (immediate
++     * {@link ButtonListener#onFinished(boolean)}), running (the listener is
++     * attached and receives progress), or idle.
++     *
++     * @param info     the stream info of the video being viewed
++     * @param listener the listener to report to
++     */
++    public void attachButton(@NonNull final StreamInfo info,
++                             @NonNull final ButtonListener listener) {
++        cleanLegacyCacheOnce();
++        final CacheTarget target = resolveCacheTarget(info);
++        if (target == null) {
++            listener.onUnavailable();
++            return;
++        }
++        if (isDone(target)) {
++            listener.onFinished(true);
++            return;
++        }
++        if (!IN_FLIGHT.containsKey(target.cacheKey)) {
++            listener.onIdle();
++            return;
++        }
++        registerListener(target, listener);
++    }
++
++    /**
++     * Starts (or joins) the background translation of a video's subtitles
++     * and attaches a button listener to it. Idempotent: joining an
++     * in-flight or already finished translation never starts a second one.
++     *
++     * @param info     the stream info of the video to translate
++     * @param listener the listener receiving progress and the final result
++     */
++    public void startTranslation(@NonNull final StreamInfo info,
++                                 @NonNull final ButtonListener listener) {
++        cleanLegacyCacheOnce();
++        final CacheTarget target = resolveCacheTarget(info);
++        if (target == null) {
++            listener.onUnavailable();
++            return;
++        }
++        if (isDone(target)) {
++            listener.onFinished(true);
++            return;
++        }
++        final boolean alreadyRunning = IN_FLIGHT.containsKey(target.cacheKey);
++        registerListener(target, listener);
++        if (!alreadyRunning) {
++            MAIN.post(listener::onStarting);
++        }
++        IN_FLIGHT.computeIfAbsent(target.cacheKey, key -> WORKER.submit(() -> {
++            try {
++                generateAndCache(target);
++            } catch (final Exception e) {
++                Log.w(TAG, "Bilingual subtitle generation failed", e);
++                notifyFinished(key, false);
++            } finally {
++                IN_FLIGHT.remove(key);
++            }
++        }));
++    }
++
++    /**
++     * Removes a listener from every translation it is attached to. Callers
++     * must invoke this when their view hierarchy goes away, because the
++     * listener registry outlives individual fragments.
++     *
++     * @param listener the listener to detach
++     */
++    public void detachButton(@NonNull final ButtonListener listener) {
++        for (final CopyOnWriteArrayList<ButtonListener> list : LISTENERS.values()) {
++            list.remove(listener);
++        }
++    }
++
++    /**
++     * Returns the completed bilingual subtitle file of a video, if one is
++     * cached. This only reads disk and never starts or waits for a
++     * translation, so the playback resolver can call it freely.
++     *
++     * @param info the stream info of the video being resolved
++     * @return the local bilingual WebVTT file, or {@code null}
++     */
++    @Nullable
++    public Uri getCompletedBilingualSubtitle(@NonNull final StreamInfo info) {
++        final CacheTarget target = resolveCacheTarget(info);
++        if (target == null || !isDone(target)) {
++            return null;
++        }
++        Log.i(TAG, "Bilingual subtitle cache hit: " + target.cacheFile.getName()
++                + " (" + info.getId() + ")");
++        return Uri.fromFile(target.cacheFile);
++    }
++
++    /**
++     * Registers a listener for a cache key and immediately replays the last
++     * known progress of an in-flight translation to it.
++     *
++     * @param target   the cache target to listen to
++     * @param listener the listener to register
++     */
++    private static void registerListener(@NonNull final CacheTarget target,
++                                         @NonNull final ButtonListener listener) {
++        final CopyOnWriteArrayList<ButtonListener> list = LISTENERS.computeIfAbsent(
++                target.cacheKey, key -> new CopyOnWriteArrayList<>());
++        // A listener re-tapping the button must not be registered twice,
++        // otherwise it would receive every callback twice.
++        list.remove(listener);
++        list.add(listener);
++        final int[] progress = LAST_PROGRESS.get(target.cacheKey);
++        if (progress != null) {
++            MAIN.post(() -> listener.onProgress(progress[0], progress[1]));
++        }
++    }
++
++    /**
++     * Downloads, parses, translates and caches one bilingual subtitle file.
++     * Runs on a dedicated coordinator thread, never on the player's threads.
++     * The cache file is rewritten after every finished batch, but it only
++     * becomes visible to playback once the done marker exists.
++     *
++     * @param target the cache target to produce
++     * @throws IOException when downloading or writing fails
++     */
++    private void generateAndCache(@NonNull final CacheTarget target) throws IOException {
++        final long deadline = System.currentTimeMillis() + TOTAL_BUDGET_MS;
++        final String original = downloadSubtitle(target.source.getContent());
++        List<VttParser.Cue> cues = VttParser.parse(original);
++        if (cues.isEmpty()) {
++            Log.i(TAG, "Subtitle track could not be parsed into any cues (format="
++                    + target.source.getFormat() + ", auto=" + target.source.isAutoGenerated()
++                    + "), skipping");
++            notifyFinished(target.cacheKey, false);
++            return;
++        }
++        // Auto-generated tracks use rolling windows: adjacent cues overlap in
++        // time and often repeat the same text, which a subtitle renderer draws
++        // stacked on top of each other. Merging keeps one steady cue, and the
++        // de-overlap pass then makes sure that never more than one cue is on
++        // screen at any moment, so bilingual lines stay readable.
++        cues = mergeIdenticalOverlappingCues(cues);
++        cues = deOverlapCues(cues);
++        logCueStructure(cues, target.source);
++
++        // Deduplicate cue texts (auto-generated subtitles repeat lines a lot)
++        final Map<String, String> translationMap = new LinkedHashMap<>();
++        final List<String> uniqueTexts = new ArrayList<>();
++        for (final VttParser.Cue cue : cues) {
++            if (!translationMap.containsKey(cue.joinedText())) {
++                translationMap.put(cue.joinedText(), cue.joinedText());
++                uniqueTexts.add(cue.joinedText());
++            }
++        }
++        final List<String> toTranslate =
++                uniqueTexts.subList(0, Math.min(uniqueTexts.size(), MAX_UNIQUE_LINES));
++
++        // Submit every batch at once: the pool size caps the real
++        // parallelism and the queue order keeps the beginning of the video
++        // first in line, so progress reported to the user grows linearly.
++        final List<Future<Map<String, String>>> futures = new ArrayList<>();
++        for (int start = 0; start < toTranslate.size(); start += BATCH_SIZE) {
++            final List<String> batch =
++                    toTranslate.subList(start, Math.min(start + BATCH_SIZE, toTranslate.size()));
++            futures.add(SUBPOOL.submit(new BatchJob(batch, target.cfg, deadline)));
++        }
++
++        // Results are merged strictly in submission order, even though the
++        // batches finish in a random order: the cache file is always a
++        // "prefix" of the video. A slow batch briefly delays later writes,
++        // but the user already sees progress in the detail page.
++        int translatedCount = 0;
++        for (final Future<Map<String, String>> future : futures) {
++            final Map<String, String> part;
++            try {
++                part = future.get();
++            } catch (final InterruptedException e) {
++                Thread.currentThread().interrupt();
++                Log.w(TAG, "Bilingual generation interrupted, keeping what was "
++                        + "written so far");
++                return;
++            } catch (final ExecutionException e) {
++                // BatchJob never lets exceptions escape, but get() declares
++                // this checked exception anyway; treat it as an empty batch.
++                Log.w(TAG, "Unexpected batch execution failure", e.getCause());
++                continue;
++            }
++            if (part.isEmpty()) {
++                continue;
++            }
++            translationMap.putAll(part);
++            translatedCount += part.size();
++            atomicWriteCache(target.cacheFile, VttParser.composeBilingual(cues, translationMap));
++            notifyProgress(target.cacheKey, translatedCount, toTranslate.size());
++            Log.i(TAG, "Bilingual subtitle progress: " + translatedCount + "/"
++                    + toTranslate.size() + " unique lines translated");
++        }
++
++        atomicWriteCache(target.doneFile, "");
++        notifyFinished(target.cacheKey, true);
++        Log.i(TAG, "Bilingual subtitles generated: " + translatedCount + "/"
++                + toTranslate.size() + " lines translated (" + target.cacheFile.getName() + ")");
++        notifyReady(appContext, translatedCount, toTranslate.size());
++    }
++
++    /**
++     * Forwards a progress update to every attached listener of a cache key,
++     * on the main thread, and remembers it for listeners attaching later.
++     *
++     * @param cacheKey   the cache key the progress belongs to
++     * @param translated unique lines translated so far
++     * @param total      unique lines submitted overall
++     */
++    private static void notifyProgress(@NonNull final String cacheKey, final int translated,
++                                       final int total) {
++        LAST_PROGRESS.put(cacheKey, new int[]{translated, total});
++        final List<ButtonListener> list = LISTENERS.get(cacheKey);
++        if (list != null) {
++            MAIN.post(() -> {
++                for (final ButtonListener listener : list) {
++                    listener.onProgress(translated, total);
++                }
++            });
++        }
++    }
++
++    /**
++     * Ends the translation session of a cache key: forgets its progress and
++     * delivers the final result to every attached listener, on the main
++     * thread.
++     *
++     * @param cacheKey the cache key that finished
++     * @param success  whether the complete bilingual file was written
++     */
++    private static void notifyFinished(@NonNull final String cacheKey, final boolean success) {
++        LAST_PROGRESS.remove(cacheKey);
++        final List<ButtonListener> list = LISTENERS.remove(cacheKey);
++        if (list != null) {
++            MAIN.post(() -> {
++                for (final ButtonListener listener : list) {
++                    listener.onFinished(success);
++                }
++            });
++        }
++    }
++
++    /**
++     * Merges adjacent cues that carry the same text and overlap (or touch)
++     * in time into a single cue that spans both. Auto-generated tracks use
++     * rolling windows in which the same text reappears in cue after cue with
++     * overlapping timings; rendering those verbatim makes a subtitle renderer
++     * draw identical lines stacked on top of each other.
++     *
++     * @param cues parsed cues in document (time) order
++     * @return cues with identical adjacent duplicates merged
++     */
++    @NonNull
++    private static List<VttParser.Cue> mergeIdenticalOverlappingCues(
++            @NonNull final List<VttParser.Cue> cues) {
++        final List<VttParser.Cue> merged = new ArrayList<>();
++        for (final VttParser.Cue cue : cues) {
++            if (!merged.isEmpty()) {
++                final VttParser.Cue last = merged.get(merged.size() - 1);
++                if (last.joinedText().equals(cue.joinedText())
++                        && cue.startMs <= last.endMs) {
++                    merged.set(merged.size() - 1, new VttParser.Cue(last.startMs,
++                            Math.max(last.endMs, cue.endMs), last.lines));
++                    continue;
++                }
++            }
++            merged.add(cue);
++        }
++        return merged;
++    }
++
++    /**
++     * Truncates each cue at the start of its successor so that no two cues
++     * overlap in time. Auto-generated tracks use rolling windows in which
++     * several cues are active at the same moment and a subtitle renderer
++     * draws all of them stacked on top of each other, which makes every
++     * line unreadable. Cues sharing the same start time are collapsed to
++     * the one that stays on screen longest; every other cue is cut at the
++     * next cue's start. This keeps exactly one cue (original line above
++     * its translation) on screen at any moment while preserving the
++     * original cue order and text.
++     *
++     * @param cues parsed cues in document (time) order
++     * @return cues whose end times no longer cross into the following cue
++     */
++    @NonNull
++    private static List<VttParser.Cue> deOverlapCues(
++            @NonNull final List<VttParser.Cue> cues) {
++        final List<VttParser.Cue> result = new ArrayList<>(cues.size());
++        int i = 0;
++        while (i < cues.size()) {
++            // Cues starting at the same moment would be rendered stacked
++            // on top of each other; keep only the longest-lived one (the
++            // later one on ties, as rolling windows update over time).
++            VttParser.Cue kept = cues.get(i);
++            int j = i + 1;
++            while (j < cues.size() && cues.get(j).startMs == kept.startMs) {
++                if (cues.get(j).endMs >= kept.endMs) {
++                    kept = cues.get(j);
++                }
++                j++;
++            }
++            long endMs = kept.endMs;
++            if (j < cues.size()) {
++                final long nextStartMs = cues.get(j).startMs;
++                // Only shorten when the successor starts later but still
++                // within this cue; unsorted input is left untouched
++                // instead of producing an unrenderable zero-length cue.
++                if (nextStartMs > kept.startMs && nextStartMs < endMs) {
++                    endMs = nextStartMs;
++                }
++            }
++            result.add(new VttParser.Cue(kept.startMs, endMs, kept.lines));
++            i = j;
++        }
++        return result;
++    }
++
++    /**
++     * Logs the parsed cue structure to make rolling-window formats
++     * diagnosable from a device log alone.
++     *
++     * @param cues   the cues that will be composed
++     * @param source the track the cues were parsed from
++     */
++    private static void logCueStructure(@NonNull final List<VttParser.Cue> cues,
++                                        @NonNull final SubtitlesStream source) {
++        int overlappingPairs = 0;
++        long longestOverlapMs = 0;
++        for (int i = 1; i < cues.size(); i++) {
++            final long overlap = cues.get(i - 1).endMs - cues.get(i).startMs;
++            if (overlap > 0) {
++                overlappingPairs++;
++                longestOverlapMs = Math.max(longestOverlapMs, overlap);
++            }
++        }
++        Log.i(TAG, "Parsed " + cues.size() + " cues (" + overlappingPairs
++                + " overlapping pairs, longest overlap " + longestOverlapMs
++                + " ms, auto=" + source.isAutoGenerated() + ")");
++    }
++
++    /**
++     * Translates one batch on the shared batch pool. Lines that a model
++     * reply left out (a truncated array, for example) or that failed with
++     * an error are re-sent in follow-up requests until they are translated
++     * or the attempt budget is exhausted, so an incomplete reply no longer
++     * silently leaves whole minutes of a video untranslated. Batches that
++     * only start after the deadline has passed return no translations.
++     */
++    private static final class BatchJob implements Callable<Map<String, String>> {
++        @NonNull private final List<String> batch;
++        @NonNull private final BisubPrefs.Config cfg;
++        private final long deadline;
++
++        BatchJob(@NonNull final List<String> batch,
++                 @NonNull final BisubPrefs.Config cfg, final long deadline) {
++            this.batch = batch;
++            this.cfg = cfg;
++            this.deadline = deadline;
++        }
++
++        @Override
++        public Map<String, String> call() {
++            final Map<String, String> translated = new HashMap<>();
++            final List<String> remaining = new ArrayList<>(batch);
++            for (int attempt = 1; attempt <= BATCH_MAX_ATTEMPTS
++                    && !remaining.isEmpty(); attempt++) {
++                if (attempt > 1) {
++                    try {
++                        Thread.sleep(BATCH_RETRY_DELAY_MS);
++                    } catch (final InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                        break;
++                    }
++                    if (System.currentTimeMillis() >= deadline) {
++                        Log.w(TAG, "Translation budget exhausted, keeping the "
++                                + "original text for the remaining " + remaining.size()
++                                + " lines");
++                        break;
++                    }
++                }
++                try {
++                    final Map<String, String> part =
++                            SubtitleTranslator.translateBatch(remaining, cfg);
++                    for (final Map.Entry<String, String> entry : part.entrySet()) {
++                        translated.put(entry.getKey(), entry.getValue());
++                        remaining.remove(entry.getKey());
++                    }
++                } catch (final Exception e) {
++                    Log.w(TAG, "Translation attempt " + attempt + " of a "
++                            + batch.size() + "-line batch failed (" + remaining.size()
++                            + " lines still missing)", e);
++                }
++            }
++            if (!remaining.isEmpty()) {
++                Log.w(TAG, "Translation batch incomplete after " + BATCH_MAX_ATTEMPTS
++                        + " attempts, keeping the original text for " + remaining.size()
++                        + " of " + batch.size() + " lines");
++            }
++            return translated;
++        }
++    }
++
++    /**
++     * Tells the user that a translation just finished, including how much of
++     * the video is covered, so that they know to reopen the video for the
++     * bilingual track to appear in the subtitle menu.
++     *
++     * @param context    the application context used for the toast
++     * @param translated number of unique lines that were translated
++     * @param total      number of unique lines that were submitted
++     */
++    private static void notifyReady(@NonNull final Context context,
++                                    final int translated, final int total) {
++        MAIN.post(() -> Toast.makeText(context,
++                context.getString(R.string.bisub_toast_ready, translated, total,
++                        BILINGUAL_TRACK_LANGUAGE),
++                Toast.LENGTH_LONG).show());
++    }
++
++    /**
++     * Deletes cache files written by older cache versions. Runs once per
++     * process; cheap because the directory only ever holds a few files.
++     */
++    private void cleanLegacyCacheOnce() {
++        if (sLegacyCacheCleaned) {
++            return;
++        }
++        synchronized (BisubManager.class) {
++            if (sLegacyCacheCleaned) {
++                return;
++            }
++            sLegacyCacheCleaned = true;
++        }
++        final File dir = new File(appContext.getFilesDir(), CACHE_DIR);
++        final File[] files = dir.listFiles();
++        if (files == null) {
++            return;
++        }
++        final String keepPrefix = "v" + CACHE_VERSION + "-";
++        int removed = 0;
++        for (final File file : files) {
++            if (!file.getName().startsWith(keepPrefix) && file.delete()) {
++                removed++;
++            }
++        }
++        if (removed > 0) {
++            Log.i(TAG, "Removed " + removed + " legacy bisub cache file(s) "
++                    + "from older cache versions");
++        }
++    }
++
++    @NonNull
++    private static SubtitlesStream pickStream(@NonNull final List<SubtitlesStream> candidates,
++                                              @Nullable final String preferredLanguage) {
++        if (preferredLanguage == null || preferredLanguage.trim().isEmpty()) {
++            return firstNonAutoTrack(candidates);
++        }
++        final String prefix = preferredLanguage.trim().toLowerCase(Locale.ROOT);
++        // Prefer manually created tracks over auto-generated ones
++        SubtitlesStream autoMatch = null;
++        for (final SubtitlesStream stream : candidates) {
++            final String code = stream.getLanguageTag();
++            if (code != null && code.toLowerCase(Locale.ROOT).startsWith(prefix)) {
++                if (!stream.isAutoGenerated()) {
++                    return stream;
++                }
++                if (autoMatch == null) {
++                    autoMatch = stream;
++                }
++            }
++        }
++        if (autoMatch != null) {
++            return autoMatch;
++        }
++        // No track matches the preferred source language: fall back to the
++        // first usable track instead of giving up entirely, so that videos
++        // in any language still get bilingual subtitles.
++        Log.i(TAG, "No subtitle track matches preferred language '" + prefix
++                + "', falling back to the first available track");
++        return firstNonAutoTrack(candidates);
++    }
++
++    @NonNull
++    private static SubtitlesStream firstNonAutoTrack(
++            @NonNull final List<SubtitlesStream> candidates) {
++        for (final SubtitlesStream stream : candidates) {
++            if (!stream.isAutoGenerated()) {
++                return stream;
++            }
++        }
++        return candidates.get(0);
++    }
++
++    @NonNull
++    private static String downloadSubtitle(@NonNull final String url) throws IOException {
++        final Response response;
++        try {
++            response = DownloaderImpl.getInstance().get(url);
++        } catch (final ReCaptchaException e) {
++            // Subtitle downloads hitting a reCaptcha just mean no bilingual
++            // subtitles for this video; the button reports a failure.
++            throw new IOException("ReCaptcha challenge while downloading subtitle", e);
++        }
++        final String body = response.responseBody();
++        if (body == null || body.isEmpty()) {
++            throw new IOException("Empty subtitle response for " + url);
++        }
++        return body;
++    }
++
++    /**
++     * Writes content to the file via a temporary file and an atomic move, so
++     * that a player concurrently reading the previous version never observes
++     * a half-written document.
++     *
++     * @param file    the file to (over)write
++     * @param content the new content
++     * @throws IOException when writing fails
++     */
++    private static void atomicWriteCache(@NonNull final File file, @NonNull final String content)
++            throws IOException {
++        final File parent = file.getParentFile();
++        if (parent != null && !parent.exists() && !parent.mkdirs()) {
++            throw new IOException("Could not create bisub cache directory");
++        }
++        final File tmp = new File(parent, file.getName() + ".tmp");
++        Files.write(tmp.toPath(), content.getBytes(StandardCharsets.UTF_8));
++        try {
++            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING,
++                    StandardCopyOption.ATOMIC_MOVE);
++        } catch (final IOException e) {
++            // Some file systems do not support atomic moves: fall back to a
++            // plain replace, which is still safe enough for these small files.
++            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
++        }
++    }
++
++    @NonNull
++    private static String sha256Hex(@NonNull final String input) {
++        try {
++            final MessageDigest digest = MessageDigest.getInstance("SHA-256");
++            final byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
++            final StringBuilder sb = new StringBuilder();
++            for (final byte b : hash) {
++                sb.append(String.format(Locale.US, "%02x", b));
++            }
++            return sb.substring(0, 16);
++        } catch (final NoSuchAlgorithmException e) {
++            // SHA-256 is guaranteed to be available on Android
++            throw new IllegalStateException(e);
++        }
++    }
++
++    /**
++     * @return the MIME type of the generated bilingual subtitle files
++     */
++    @NonNull
++    public static String subtitleMimeType() {
++        return "text/vtt";
++    }
++
++    /**
++     * @return the language string (and menu label) of the bilingual track
++     *         that the playback resolver appends to the player's subtitle
++     *         selection
++     */
++    @NonNull
++    public static String bilingualTrackLanguage() {
++        return BILINGUAL_TRACK_LANGUAGE;
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+new file mode 100644
+index 000000000..08dc46222
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -0,0 +1,174 @@
++package org.schabi.newpipe.bisub;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.preference.PreferenceManager;
++
++import org.schabi.newpipe.R;
++
++/**
++ * Reads and validates the bilingual subtitle ("bisub") user configuration
++ * from the default shared preferences.
++ */
++public final class BisubPrefs {
++
++    private BisubPrefs() { }
++
++    /**
++     * Immutable snapshot of all bisub-related settings.
++     */
++    public static final class Config {
++        public final boolean enabled;
++        @Nullable public final String provider;
++        @Nullable public final String baseUrl;
++        @Nullable public final String apiKey;
++        @Nullable public final String model;
++        @Nullable public final String targetLanguage;
++        @Nullable public final String sourceLanguage;
++
++        private Config(final boolean enabled, @Nullable final String provider,
++                       @Nullable final String baseUrl, @Nullable final String apiKey,
++                       @Nullable final String model, @Nullable final String targetLanguage,
++                       @Nullable final String sourceLanguage) {
++            this.enabled = enabled;
++            this.provider = provider;
++            this.baseUrl = baseUrl;
++            this.apiKey = apiKey;
++            this.model = model;
++            this.targetLanguage = targetLanguage;
++            this.sourceLanguage = sourceLanguage;
++        }
++
++        /**
++         * @return true when every field required to call a translation API is present
++         */
++        public boolean isUsable() {
++            return enabled && !isNullOrBlank(baseUrl) && !isNullOrBlank(apiKey)
++                    && !isNullOrBlank(model) && !isNullOrBlank(targetLanguage);
++        }
++
++        private static boolean isNullOrBlank(@Nullable final String s) {
++            return s == null || s.trim().isEmpty();
++        }
++    }
++
++    /**
++     * Immutable snapshot of the in-app bilingual subtitle style. It replaces
++     * the Android system caption style (which is unreachable on systems that
++     * ship without the Android caption settings, e.g. HarmonyOS) and is only
++     * applied while the bilingual track is selected.
++     */
++    public static final class Style {
++        /** Overall scale of the whole subtitle block: text, padding and
++         *  corner radius all grow with it, like resizing the outer
++         *  component that contains both language layers. */
++        public final float baseScale;
++        /** Text color, ARGB. */
++        public final int textColor;
++        /** One of {@link BisubStyle#BG_TRANSLUCENT}, {@link BisubStyle#BG_OPAQUE},
++         *  {@link BisubStyle#BG_NONE}. */
++        public final int backgroundMode;
++        /** Padding between the text and the background block edge, in dp. */
++        public final float paddingDp;
++        /** Background corner radius in dp; 0 means square corners. */
++        public final float cornerRadiusDp;
++        /** Maximum text width as a fraction of the view width (0.5-1.0).
++         *  Larger values wrap later, up to single lines spanning the screen. */
++        public final float maxWidthPercent;
++        /** Distance between the subtitle block and the bottom of the view,
++         *  as a fraction of the view height (0.0-0.3). */
++        public final float positionPercent;
++
++        @SuppressWarnings("checkstyle:ParameterNumber")
++        public Style(final float baseScale, final int textColor, final int backgroundMode,
++                     final float paddingDp, final float cornerRadiusDp,
++                     final float maxWidthPercent, final float positionPercent) {
++            this.baseScale = baseScale;
++            this.textColor = textColor;
++            this.backgroundMode = backgroundMode;
++            this.paddingDp = paddingDp;
++            this.cornerRadiusDp = cornerRadiusDp;
++            this.maxWidthPercent = maxWidthPercent;
++            this.positionPercent = positionPercent;
++        }
++    }
++
++    /**
++     * Loads the in-app bilingual subtitle style.
++     *
++     * @param context any context
++     * @return the current style, never {@code null}
++     */
++    @NonNull
++    public static Style loadStyle(@NonNull final Context context) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        return new Style(
++                prefs.getFloat(context.getString(R.string.bisub_style_base_scale_key),
++                        BisubStyle.DEFAULT_BASE_SCALE),
++
++                prefs.getInt(context.getString(R.string.bisub_style_text_color_key),
++                        BisubStyle.DEFAULT_TEXT_COLOR),
++                prefs.getInt(context.getString(R.string.bisub_style_background_key),
++                        BisubStyle.BG_TRANSLUCENT),
++                prefs.getFloat(context.getString(R.string.bisub_style_padding_key),
++                        BisubStyle.DEFAULT_PADDING_DP),
++                prefs.getFloat(context.getString(R.string.bisub_style_corner_radius_key),
++                        BisubStyle.DEFAULT_CORNER_RADIUS_DP),
++                prefs.getFloat(context.getString(R.string.bisub_style_max_width_key),
++                        BisubStyle.DEFAULT_MAX_WIDTH_PERCENT),
++                prefs.getFloat(context.getString(R.string.bisub_style_position_key),
++                        BisubStyle.DEFAULT_POSITION_PERCENT));
++    }
++
++    /**
++     * Persists the in-app bilingual subtitle style.
++     *
++     * @param context any context
++     * @param style   the style to save
++     */
++    public static void saveStyle(@NonNull final Context context, @NonNull final Style style) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        final SharedPreferences.Editor editor = prefs.edit();
++        editor.putFloat(context.getString(R.string.bisub_style_base_scale_key),
++                style.baseScale);
++
++        editor.putInt(context.getString(R.string.bisub_style_text_color_key),
++                style.textColor);
++        editor.putInt(context.getString(R.string.bisub_style_background_key),
++                style.backgroundMode);
++        editor.putFloat(context.getString(R.string.bisub_style_padding_key),
++                style.paddingDp);
++        editor.putFloat(context.getString(R.string.bisub_style_corner_radius_key),
++                style.cornerRadiusDp);
++        editor.putFloat(context.getString(R.string.bisub_style_max_width_key),
++                style.maxWidthPercent);
++        editor.putFloat(context.getString(R.string.bisub_style_position_key),
++                style.positionPercent);
++        editor.apply();
++    }
++
++    /**
++     * Loads the current bisub configuration.
++     *
++     * @param context any context; only the application context is retained indirectly
++     * @return a snapshot of the current settings
++     */
++    @NonNull
++    public static Config load(@NonNull final Context context) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        return new Config(
++                prefs.getBoolean(context.getString(R.string.bisub_enable_key), false),
++                prefs.getString(context.getString(R.string.bisub_provider_key), null),
++                prefs.getString(context.getString(R.string.bisub_base_url_key), null),
++                prefs.getString(context.getString(R.string.bisub_api_key_key), null),
++                prefs.getString(context.getString(R.string.bisub_model_key), null),
++                prefs.getString(context.getString(R.string.bisub_target_lang_key), null),
++                prefs.getString(context.getString(R.string.bisub_source_lang_key), null));
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
+new file mode 100644
+index 000000000..85fad6e15
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
+@@ -0,0 +1,55 @@
++package org.schabi.newpipe.bisub;
++
++import androidx.annotation.NonNull;
++
++/**
++ * In-app style of the bilingual subtitle track.
++ *
++ * <p>The style replaces the Android system caption style while the bilingual
++ * track is selected. This keeps the bilingual appearance adjustable on
++ * systems that ship without the Android caption settings (e.g. HarmonyOS,
++ * where {@code Settings.ACTION_CAPTIONING_SETTINGS} leads nowhere). The
++ * actual rendering happens in {@link BisubSubtitleView}, which is used by
++ * both the player and the style editor preview, so both always match.</p>
++ */
++public final class BisubStyle {
++
++    /** Translucent black background behind each subtitle block (default). */
++    public static final int BG_TRANSLUCENT = 0;
++    /** Fully opaque black background behind each subtitle block. */
++    public static final int BG_OPAQUE = 1;
++    /** No background, black outline around the glyphs instead. */
++    public static final int BG_NONE = 2;
++
++    /** Default text color: white, like the Android system caption default. */
++    public static final int DEFAULT_TEXT_COLOR = 0xFFFFFFFF;
++    /** Default overall scale of the whole subtitle block (text, padding
++     *  and corner radius all follow it). */
++    public static final float DEFAULT_BASE_SCALE = 1.0f;
++    /** Default padding between the text and the background block edge, in dp. */
++    public static final float DEFAULT_PADDING_DP = 4.0f;
++    /** Default background corner radius in dp; 0 means square corners. */
++    public static final float DEFAULT_CORNER_RADIUS_DP = 4.0f;
++    /** Default maximum text width as a fraction of the view width; 1.0 lets
++     *  long lines span the whole screen before wrapping. */
++    public static final float DEFAULT_MAX_WIDTH_PERCENT = 1.0f;
++    /** Default distance between the subtitle block and the bottom of the
++     *  view, as a fraction of the view height. */
++    public static final float DEFAULT_POSITION_PERCENT = 0.05f;
++
++    static final int COLOR_TRANSLUCENT_BLACK = 0x8A000000;
++    static final int COLOR_OPAQUE_BLACK = 0xFF000000;
++
++    private BisubStyle() { }
++
++    /**
++     * Applies a style to the self-drawn bilingual subtitle view.
++     *
++     * @param view  the subtitle view to style (player view or preview)
++     * @param style the style to apply
++     */
++    public static void applyTo(@NonNull final BisubSubtitleView view,
++                               @NonNull final BisubPrefs.Style style) {
++        view.setBisubStyle(style);
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+new file mode 100644
+index 000000000..ac09cda42
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+@@ -0,0 +1,300 @@
++package org.schabi.newpipe.bisub;
++
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.Typeface;
++import android.text.Layout;
++import android.text.StaticLayout;
++import android.text.TextPaint;
++import android.util.AttributeSet;
++import android.view.View;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import com.google.android.exoplayer2.text.Cue;
++import com.google.android.exoplayer2.ui.SubtitleView;
++
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Self-drawn rendering view for the bilingual subtitle track.
++ *
++ * <p>ExoPlayer's {@code SubtitleView} paints plain axis-aligned rectangles
++ * tightly around each cue line: no padding and no rounded corners can be
++ * expressed through {@code CaptionStyleCompat}. This view instead renders
++ * the bilingual cues itself, so the in-app style fully controls the
++ * appearance: one overall size for the whole block (the background bar,
++ * the font size of both language lines, padding and corner radius all
++ * follow it), text color, translucent/opaque/none background (with a
++ * black outline in the "none" case), background padding, rounded corners,
++ * the wrap width and the vertical position of the subtitle block.</p>
++ *
++ * <p>The layout is a fixed-width container, like a div with a set width
++ * containing two centered text layers: the background bar's width is
++ * derived from the overall size and the wrap width only, never from the
++ * text. Growing the size re-wraps both layers inside the bar (centered),
++ * it can never stretch or shrink the background.</p>
++ *
++ * <p>The bilingual VTT written by {@link VttParser} uses exactly two lines
++ * per cue (original text, then translation), which is how this view tells
++ * the two apart. It is used both by the player and by the style editor
++ * preview. The preview sets a reference player size: the cues are laid
++ * out exactly as on a fullscreen player (same font sizes, same wrap
++ * points) and the finished drawing is scaled down as a whole, so the
++ * preview is a true miniature of the on-screen result instead of wrapping
++ * early inside the narrow dialog box.</p>
++ */
++public final class BisubSubtitleView extends View {
++
++    private List<Cue> cues = Collections.emptyList();
++    private BisubPrefs.Style style = new BisubPrefs.Style(
++            BisubStyle.DEFAULT_BASE_SCALE,
++            BisubStyle.DEFAULT_TEXT_COLOR, BisubStyle.BG_TRANSLUCENT,
++            BisubStyle.DEFAULT_PADDING_DP, BisubStyle.DEFAULT_CORNER_RADIUS_DP,
++            BisubStyle.DEFAULT_MAX_WIDTH_PERCENT,
++            BisubStyle.DEFAULT_POSITION_PERCENT);
++
++    private final TextPaint textPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint backgroundPaint = new Paint();
++
++    /** Reference player width the preview lays out at; 0 disables it. */
++    private float referenceWidthPx;
++    /** Reference player height the preview lays out at; 0 disables it. */
++    private float referenceHeightPx;
++
++    public BisubSubtitleView(@NonNull final Context context,
++                             @Nullable final AttributeSet attrs) {
++        super(context, attrs);
++    }
++
++    /**
++     * Sets the cues to render, the same list the player hands to the
++     * regular subtitle view.
++     *
++     * @param cueList the active cues; {@code null} clears the view
++     */
++    public void setCues(@Nullable final List<Cue> cueList) {
++        this.cues = cueList == null ? Collections.emptyList() : cueList;
++        invalidate();
++    }
++
++    /**
++     * Sets the style used while drawing the cues.
++     *
++     * @param newStyle the in-app bilingual subtitle style
++     */
++    public void setBisubStyle(@NonNull final BisubPrefs.Style newStyle) {
++        this.style = newStyle;
++        invalidate();
++    }
++
++    /**
++     * Sets the player size the preview emulates: cues are laid out at the
++     * reference size and the drawing is scaled down as a whole, so font
++     * sizes and wrap points match a fullscreen player exactly.
++     *
++     * @param widthDp  the reference player width in dp, or 0 to use the
++     *                 view's own size (what the player does)
++     * @param heightDp the reference player height in dp, or 0 to use the
++     *                 view's own size
++     */
++    public void setReferenceSize(final float widthDp, final float heightDp) {
++        final float density = getResources().getDisplayMetrics().density;
++        this.referenceWidthPx = widthDp > 0 ? widthDp * density : 0f;
++        this.referenceHeightPx = heightDp > 0 ? heightDp * density : 0f;
++        invalidate();
++    }
++
++    @Override
++    protected void onDraw(@NonNull final Canvas canvas) {
++        final int viewWidth = getWidth() - getPaddingLeft() - getPaddingRight();
++        final int viewHeight = getHeight() - getPaddingTop() - getPaddingBottom();
++        if (viewWidth <= 0 || viewHeight <= 0 || cues.isEmpty()) {
++            return;
++        }
++
++        final boolean preview = referenceWidthPx > 0 && referenceHeightPx > 0;
++        final float width = preview ? referenceWidthPx : viewWidth;
++        final float height = preview ? referenceHeightPx : viewHeight;
++
++        final float baseScale =
++                Math.max(0.4f, Math.min(3.0f, style.baseScale));
++        final float baseTextSize =
++                height * SubtitleView.DEFAULT_TEXT_SIZE_FRACTION;
++        if (baseTextSize <= 0) {
++            return;
++        }
++        final float density = getResources().getDisplayMetrics().density;
++        // The overall scale resizes the whole block like resizing the
++        // outer component: the background bar, the base font size,
++        // padding, corners and cue gaps all follow it.
++        final float padPx = style.paddingDp * density * baseScale;
++        final float radiusPx = style.cornerRadiusDp * density * baseScale;
++        final float cueGapPx = 12 * density * baseScale;
++        // The background is a fixed-width container: its width depends
++        // only on the overall scale and the user-adjustable wrap width
++        // (0.5-1.0 of the view width), never on the text. Font sizes are
++        // relative to that fixed bar: growing a language layer just
++        // re-wraps it inside the bar, it can never stretch or shrink the
++        // background (which is what "fit the background to the widest
++        // line" did before).
++        final float blockWidth = Math.min(
++                width * Math.max(0.5f, Math.min(1.0f, style.maxWidthPercent))
++                        * baseScale,
++                width);
++        final float layoutWidth = Math.max(1f, blockWidth - 2 * padPx);
++
++        if (preview) {
++            final float scale = Math.min(viewWidth / width, viewHeight / height);
++            canvas.save();
++            canvas.translate((viewWidth - width * scale) / 2f,
++                    (viewHeight - height * scale) / 2f);
++            canvas.scale(scale, scale);
++        }
++
++        textPaint.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
++
++        float bottom = height - height
++                * Math.max(0f, Math.min(0.3f, style.positionPercent));
++        for (final Cue cue : cues) {
++            final CharSequence cueText = cue == null ? null : cue.text;
++            if (cueText == null || cueText.length() == 0) {
++                continue;
++            }
++            final String raw = cueText.toString();
++            final int newline = raw.indexOf('\n');
++            final String original = newline > 0 ? raw.substring(0, newline) : raw;
++            final String translation =
++                    newline > 0 && newline < raw.length() - 1
++                            ? raw.substring(newline + 1) : null;
++
++            final float textSize = baseTextSize * baseScale;
++
++            // Both text layers live inside the fixed-width bar: each one
++            // is laid out with the full layout width and centered on it
++            // by ALIGN_CENTER, exactly like text-align: center inside a
++            // fixed-width container. No per-layer re-wrapping, no shared
++            // width measuring: the layers can never influence the bar.
++            final StaticLayout originalLayout =
++                    fitLayout(original, textSize, layoutWidth);
++            final StaticLayout translationLayout = translation != null
++                    ? fitLayout(translation, textSize, layoutWidth)
++                    : null;
++
++            final float gapPx = textSize * 0.25f;
++            final float blockHeight = originalLayout.getHeight()
++                    + (translationLayout != null
++                        ? translationLayout.getHeight() + gapPx : 0) + 2 * padPx;
++            final float center = width / 2f;
++            final float left = center - blockWidth / 2f;
++            // Keep oversized blocks (large scales) on screen instead of
++            // letting them start above the top of the view.
++            float top = bottom - blockHeight;
++            if (top < 0) {
++                top = 0;
++            }
++            final float blockBottom = top + blockHeight;
++
++            if (style.backgroundMode != BisubStyle.BG_NONE) {
++                backgroundPaint.setColor(style.backgroundMode == BisubStyle.BG_OPAQUE
++                        ? BisubStyle.COLOR_OPAQUE_BLACK
++                        : BisubStyle.COLOR_TRANSLUCENT_BLACK);
++                backgroundPaint.setStyle(Paint.Style.FILL);
++                if (radiusPx > 0) {
++                    canvas.drawRoundRect(left, top, left + blockWidth, blockBottom,
++                            radiusPx, radiusPx, backgroundPaint);
++                } else {
++                    canvas.drawRect(left, top, left + blockWidth, blockBottom,
++                            backgroundPaint);
++                }
++            }
++
++            float y = top + padPx;
++            y = drawLayout(canvas, originalLayout, left + padPx, y,
++                    style.backgroundMode == BisubStyle.BG_NONE, textSize);
++            if (translationLayout != null) {
++                drawLayout(canvas, translationLayout, left + padPx, y + gapPx,
++                        style.backgroundMode == BisubStyle.BG_NONE,
++                        textSize);
++            }
++
++            bottom = top - cueGapPx;
++        }
++
++        if (preview) {
++            canvas.restore();
++        }
++    }
++
++    @NonNull
++    private StaticLayout layout(@NonNull final String text, final float textSize,
++                                final float width) {
++        textPaint.setTextSize(textSize);
++        return StaticLayout.Builder.obtain(
++                text, 0, text.length(), textPaint, Math.max(1,
++                        (int) Math.ceil(width)))
++                .setAlignment(Layout.Alignment.ALIGN_CENTER)
++                .setLineSpacing(0f, 1.0f)
++                .setIncludePad(false)
++                .build();
++    }
++
++    /**
++     * Builds a layout that fits the given width: a line holding a single
++     * unbreakable token (long word, URL) wider than the available width
++     * is not wrapped by {@link StaticLayout} but overflows it, so the
++     * font size is stepped down until every line fits. This keeps text
++     * inside the background block at any font scale.
++     *
++     * @param text     the text to lay out
++     * @param textSize the desired font size in px
++     * @param maxWidth the available width in px
++     * @return a layout whose widest line does not exceed {@code maxWidth}
++     */
++    @NonNull
++    private StaticLayout fitLayout(@NonNull final String text, final float textSize,
++                                   final float maxWidth) {
++        float size = textSize;
++        StaticLayout result = layout(text, size, maxWidth);
++        for (int attempt = 0; attempt < 3; attempt++) {
++            final float measured = measureWidth(result);
++            if (measured <= maxWidth) {
++                break;
++            }
++            size *= Math.max(0.5f, maxWidth / measured * 0.98f);
++            result = layout(text, size, maxWidth);
++        }
++        return result;
++    }
++
++    private static float measureWidth(@NonNull final StaticLayout layout) {
++        float textWidth = 0;
++        for (int line = 0; line < layout.getLineCount(); line++) {
++            textWidth = Math.max(textWidth, layout.getLineWidth(line));
++        }
++        return textWidth;
++    }
++
++    private float drawLayout(@NonNull final Canvas canvas,
++                             @NonNull final StaticLayout layout,
++                             final float x, final float y, final boolean outline,
++                             final float textSize) {
++        canvas.save();
++        canvas.translate(x, y);
++        if (outline) {
++            textPaint.setStyle(Paint.Style.STROKE);
++            textPaint.setStrokeWidth(Math.max(2f, textSize / 12f));
++            textPaint.setColor(Color.BLACK);
++            layout.draw(canvas);
++            textPaint.setStyle(Paint.Style.FILL);
++        }
++        textPaint.setColor(style.textColor);
++        layout.draw(canvas);
++        canvas.restore();
++        return y + layout.getHeight();
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+new file mode 100644
+index 000000000..e06cd4d80
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -0,0 +1,241 @@
++package org.schabi.newpipe.bisub;
++
++import android.util.Log;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++import org.schabi.newpipe.bisub.BisubPrefs.Config;
++
++import java.io.IOException;
++
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.MediaType;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++
++/**
++ * Translates subtitle lines in batches by calling an OpenAI-compatible
++ * chat completion endpoint (OpenAI, DeepSeek, Moonshot, GLM, OpenRouter, ...).
++ *
++ * <p>Translations are requested as a strict JSON array so that the result can
++ * be aligned back to the input by index. When the model returns fewer items
++ * than requested, the missing entries simply fall back to the original text.</p>
++ */
++public final class SubtitleTranslator {
++
++    private static final String TAG = SubtitleTranslator.class.getSimpleName();
++    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
++    private static final int PER_BATCH_TIMEOUT_SECONDS = 60;
++
++    private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
++            .connectTimeout(20, TimeUnit.SECONDS)
++            .readTimeout(PER_BATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .writeTimeout(20, TimeUnit.SECONDS)
++            .build();
++
++    private SubtitleTranslator() { }
++
++    /**
++     * Translates one batch of texts using the provided configuration, in a
++     * single chat completion request. Batch scheduling (size, parallelism,
++     * retries, budget) is handled by the caller.
++     *
++     * @param batch the unique subtitle texts of one batch
++     * @param cfg   the user configuration (must be usable)
++     * @return a map from original text to translated text; texts that the
++     *         model did not translate are absent from the map
++     * @throws IOException   on network errors, HTTP errors or timeouts
++     * @throws JSONException when the response cannot be parsed
++     */
++    @NonNull
++    static Map<String, String> translateBatch(@NonNull final List<String> batch,
++                                              @NonNull final Config cfg)
++            throws IOException, JSONException {
++        final Map<String, String> result = new HashMap<>();
++
++        final JSONObject payload = buildPayload(batch, cfg);
++        final Request request = new Request.Builder()
++                .url(normalizeEndpoint(cfg.baseUrl))
++                .header("Authorization", "Bearer " + cfg.apiKey.trim())
++                .header("Content-Type", "application/json")
++                .post(RequestBody.create(payload.toString(), JSON))
++                .build();
++
++        try (Response response = CLIENT.newCall(request).execute()) {
++            final String body = response.body() == null ? "" : response.body().string();
++            if (!response.isSuccessful()) {
++                throw new IOException("Translation API returned HTTP " + response.code()
++                        + describeErrorBody(body));
++            }
++            final String content = extractContent(body);
++            final JSONArray translations = extractTranslations(content, batch.size());
++            if (translations.length() < batch.size()) {
++                Log.w(TAG, "Translation response contained " + translations.length()
++                        + " of " + batch.size() + " expected items, missing lines "
++                        + "fall back to the original text");
++            }
++
++            for (int i = 0; i < batch.size() && i < translations.length(); i++) {
++                final String translated = translations.optString(i, "").trim();
++                if (!translated.isEmpty()) {
++                    result.put(batch.get(i), translated);
++                }
++            }
++        }
++        return result;
++    }
++
++    /**
++     * Extracts a short human-readable reason from an error response body.
++     * OpenAI-compatible APIs usually reply with
++     * {@code {"error":{"message":"..."}}} which is shown verbatim.
++     *
++     * @param body the raw error response body, possibly empty
++     * @return a suffix like ": invalid api key" or an empty string
++     */
++    @NonNull
++    private static String describeErrorBody(@Nullable final String body) {
++        if (body == null || body.trim().isEmpty()) {
++            return "";
++        }
++        try {
++            final JSONObject root = new JSONObject(body);
++            final String message = root.optJSONObject("error") != null
++                    ? root.optJSONObject("error").optString("message", "") : "";
++            if (!message.trim().isEmpty()) {
++                return ": " + message.trim();
++            }
++        } catch (final JSONException ignored) {
++            // Not JSON: fall back to the raw body below
++        }
++        final String raw = body.trim();
++        return ": " + (raw.length() > 200 ? raw.substring(0, 200) + "…" : raw);
++    }
++
++    @NonNull
++    private static JSONObject buildPayload(@NonNull final List<String> batch,
++                                           @NonNull final Config cfg) throws JSONException {
++        final JSONArray lines = new JSONArray();
++        for (final String text : batch) {
++            lines.put(text);
++        }
++
++        final String systemPrompt = "You are a professional subtitle translator. "
++                + "Translate every subtitle line from its original language into "
++                + cfg.targetLanguage + ". Keep translations natural, concise and "
++                + "suitable for subtitles. Preserve names, numbers and tone. "
++                + "Use the context of the whole list to keep wording consistent. "
++                + "Reply with ONLY a JSON object of the exact form "
++                + "{\"t\":[\"translation 1\",\"translation 2\",...]} containing exactly "
++                + batch.size() + " items, in the same order as the input. "
++                + "Do not add any other text.";
++
++        final JSONObject userMsg = new JSONObject();
++        userMsg.put("lines", lines);
++
++        final JSONArray messages = new JSONArray();
++        messages.put(new JSONObject().put("role", "system").put("content", systemPrompt));
++        messages.put(new JSONObject().put("role", "user").put("content", userMsg.toString()));
++
++        final JSONObject payload = new JSONObject();
++        payload.put("model", cfg.model.trim());
++        payload.put("messages", messages);
++        payload.put("temperature", 0.3);
++        return payload;
++    }
++
++    @Nullable
++    private static String extractContent(@NonNull final String responseBody)
++            throws JSONException {
++        final JSONObject root = new JSONObject(responseBody);
++        final JSONArray choices = root.optJSONArray("choices");
++        if (choices == null || choices.length() == 0) {
++            return null;
++        }
++        return choices.getJSONObject(0).getJSONObject("message").optString("content", null);
++    }
++
++    @NonNull
++    private static JSONArray extractTranslations(@Nullable final String content,
++                                                 final int expectedSize) throws JSONException {
++        if (content == null) {
++            return new JSONArray();
++        }
++        // The model may wrap the JSON in a markdown code fence
++        String cleaned = content.trim();
++        if (cleaned.startsWith("```")) {
++            final int first = cleaned.indexOf('\n');
++            final int last = cleaned.lastIndexOf("```");
++            if (first >= 0 && last > first) {
++                cleaned = cleaned.substring(first + 1, last).trim();
++            }
++        }
++        final JSONObject parsed = new JSONObject(cleaned);
++        final JSONArray t = parsed.optJSONArray("t");
++        if (t != null) {
++            return t;
++        }
++        Log.w(TAG, "Translation response did not contain the expected \"t\" array");
++        return new JSONArray();
++    }
++
++    /**
++     * Sends a one-line probe request through the full translation pipeline
++     * so that the settings screen can verify the provider configuration.
++     *
++     * @param cfg the user configuration (must be usable)
++     * @return the translated probe text, for display to the user
++     * @throws IOException   on network errors, HTTP errors or timeouts
++     * @throws JSONException when the response cannot be parsed
++     */
++    @NonNull
++    public static String testConnection(@NonNull final Config cfg)
++            throws IOException, JSONException {
++        final List<String> probe = Collections.singletonList(
++                "Hello, this is a connection test.");
++        final Map<String, String> result = translateBatch(probe, cfg);
++        final String translated = result.get(probe.get(0));
++        if (translated == null || translated.trim().isEmpty()) {
++            throw new IOException("The API responded but returned no translation, "
++                    + "please check the model name");
++        }
++        return translated;
++    }
++
++    /**
++     * Normalizes a user-provided base URL into a full chat completion endpoint.
++     * For example "https://api.deepseek.com" becomes
++     * "https://api.deepseek.com/v1/chat/completions".
++     *
++     * @param baseUrl the user-provided base URL
++     * @return the full chat completion endpoint URL
++     */
++    @NonNull
++    static String normalizeEndpoint(@Nullable final String baseUrl) throws IOException {
++        String url = baseUrl == null ? "" : baseUrl.trim();
++        if (url.isEmpty()) {
++            throw new IOException("Empty translation API base URL");
++        }
++        while (url.endsWith("/")) {
++            url = url.substring(0, url.length() - 1);
++        }
++        if (url.endsWith("/chat/completions")) {
++            return url;
++        }
++        if (url.endsWith("/v1")) {
++            return url + "/chat/completions";
++        }
++        return url + "/v1/chat/completions";
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/VttParser.java b/app/src/main/java/org/schabi/newpipe/bisub/VttParser.java
+new file mode 100644
+index 000000000..a079ca45b
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/VttParser.java
+@@ -0,0 +1,364 @@
++package org.schabi.newpipe.bisub;
++
++import android.util.Xml;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.xmlpull.v1.XmlPullParser;
++
++import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * Minimal subtitle parser and composer.
++ *
++ * <p>Both WebVTT and YouTube-flavored TTML are supported because NewPipe's
++ * YouTube extractor hands out TTML tracks by default while other services
++ * (e.g. PeerTube) provide WebVTT. The format is detected from the content
++ * itself. It is good enough for YouTube subtitles (manual and
++ * auto-generated): it parses cue timings and text lines, strips inline tags
++ * and restores the most common HTML entities.</p>
++ */
++public final class VttParser {
++
++    private static final String WEBVTT_HEADER = "WEBVTT";
++    private static final String CUE_ARROW = "-->";
++
++    private VttParser() { }
++
++    /**
++     * A single subtitle cue.
++     */
++    public static final class Cue {
++        public final long startMs;
++        public final long endMs;
++        public final List<String> lines;
++
++        Cue(final long startMs, final long endMs, @NonNull final List<String> lines) {
++            this.startMs = startMs;
++            this.endMs = endMs;
++            this.lines = Collections.unmodifiableList(lines);
++        }
++
++        /**
++         * @return the cue text lines joined into a single line. Used as the
++         *         translation key and as the original line of the bilingual
++         *         output: BisubSubtitleView splits a rendered cue at the
++         *         first newline (original above, translation below), so the
++         *         original must never contain a newline itself. Auto
++         *         generated tracks carry two rolling-window lines per cue
++         *         that belong to the same sentence, joining them with a
++         *         space keeps them one line.
++         */
++        @NonNull
++        public String joinedText() {
++            return String.join(" ", lines);
++        }
++    }
++
++    /**
++     * Parses a subtitle document into a list of cues. Both WebVTT and
++     * YouTube-flavored TTML are supported; the format is detected from the
++     * content. Malformed blocks are skipped.
++     *
++     * @param content the raw subtitle content
++     * @return the parsed cues, possibly empty
++     */
++    @NonNull
++    public static List<Cue> parse(@NonNull final String content) {
++        final String cleaned = content.replace("\uFEFF", "").trim();
++        if (cleaned.startsWith("<")) {
++            return parseTtml(cleaned);
++        }
++        return parseVtt(cleaned);
++    }
++
++    /**
++     * Parses a WebVTT document into a list of cues.
++     *
++     * @param vtt the raw WebVTT content
++     * @return the parsed cues, possibly empty
++     */
++    @NonNull
++    private static List<Cue> parseVtt(@NonNull final String vtt) {
++        final List<Cue> cues = new ArrayList<>();
++        final String[] lines = vtt.replace("\r\n", "\n").replace('\r', '\n').split("\n");
++
++        int i = 0;
++        // Skip the file header block (WEBVTT ... up to the first empty line)
++        while (i < lines.length && !lines[i].startsWith(WEBVTT_HEADER)) {
++            i++;
++        }
++        i++;
++
++        while (i < lines.length) {
++            // Skip blank lines and metadata blocks (NOTE, STYLE, REGION)
++            if (lines[i].trim().isEmpty() || lines[i].startsWith("NOTE")
++                    || lines[i].startsWith("STYLE") || lines[i].startsWith("REGION")
++                    || lines[i].startsWith(WEBVTT_HEADER)) {
++                i++;
++                continue;
++            }
++
++            // A block may start with an optional cue identifier line
++            int timingLine = i;
++            if (!lines[timingLine].contains(CUE_ARROW)) {
++                timingLine++;
++            }
++            if (timingLine >= lines.length || !lines[timingLine].contains(CUE_ARROW)) {
++                i++;
++                continue;
++            }
++
++            final long[] timing = parseTiming(lines[timingLine]);
++            if (timing == null) {
++                i = timingLine + 1;
++                continue;
++            }
++
++            final List<String> textLines = new ArrayList<>();
++            int j = timingLine + 1;
++            while (j < lines.length && !lines[j].trim().isEmpty()) {
++                final String cleanedLine = cleanLine(lines[j]);
++                if (!cleanedLine.isEmpty()) {
++                    textLines.add(cleanedLine);
++                }
++                j++;
++            }
++
++            if (!textLines.isEmpty()) {
++                cues.add(new Cue(timing[0], timing[1], textLines));
++            }
++            i = j;
++        }
++        return cues;
++    }
++
++    /**
++     * Parses a TTML document into a list of cues. Handles both the standard
++     * {@code begin}/{@code end} clock attributes and YouTube's flavor using
++     * {@code t} (start in milliseconds) plus {@code d} (duration), including
++     * the word-level {@code <s>} tags of auto-generated tracks.
++     *
++     * @param ttml the raw TTML content
++     * @return the parsed cues, possibly empty
++     */
++    @NonNull
++    private static List<Cue> parseTtml(@NonNull final String ttml) {
++        final List<Cue> cues = new ArrayList<>();
++        try {
++            final XmlPullParser parser = Xml.newPullParser();
++            parser.setInput(new StringReader(ttml));
++
++            long startMs = -1;
++            long endMs = -1;
++            final StringBuilder text = new StringBuilder();
++
++            int event = parser.getEventType();
++            while (event != XmlPullParser.END_DOCUMENT) {
++                if (event == XmlPullParser.START_TAG) {
++                    if ("p".equals(parser.getName())) {
++                        startMs = ttmlStartMs(parser);
++                        endMs = ttmlEndMs(parser, startMs);
++                        text.setLength(0);
++                    } else if ("br".equals(parser.getName()) && startMs >= 0) {
++                        text.append('\n');
++                    }
++                } else if (event == XmlPullParser.TEXT && startMs >= 0) {
++                    text.append(parser.getText());
++                } else if (event == XmlPullParser.END_TAG) {
++                    if ("p".equals(parser.getName())) {
++                        if (startMs >= 0 && endMs > startMs) {
++                            final List<String> cueLines = splitTtmlText(text.toString());
++                            if (!cueLines.isEmpty()) {
++                                cues.add(new Cue(startMs, endMs, cueLines));
++                            }
++                        }
++                        startMs = -1;
++                    } else if ("s".equals(parser.getName()) && startMs >= 0) {
++                        // YouTube's word tags do not carry separators themselves
++                        text.append(' ');
++                    }
++                }
++                event = parser.next();
++            }
++        } catch (final Exception ignored) {
++            // Malformed TTML: return whatever was parsed so far
++        }
++        return cues;
++    }
++
++    @NonNull
++    private static List<String> splitTtmlText(@NonNull final String rawText) {
++        final List<String> cueLines = new ArrayList<>();
++        for (final String line : rawText.split("\n")) {
++            final String cleaned = line.replaceAll("[ \\t]+", " ").trim();
++            if (!cleaned.isEmpty()) {
++                cueLines.add(cleaned);
++            }
++        }
++        return cueLines;
++    }
++
++    /**
++     * @param parser the parser positioned on a TTML {@code <p>} start tag
++     * @return the cue start time in milliseconds, or {@code -1} if unknown
++     */
++    private static long ttmlStartMs(@NonNull final XmlPullParser parser) {
++        final String t = parser.getAttributeValue(null, "t");
++        if (t != null) {
++            return parseTimingMs(t);
++        }
++        final String begin = parser.getAttributeValue(null, "begin");
++        return begin != null ? parseTimingMs(begin) : -1;
++    }
++
++    /**
++     * @param parser  the parser positioned on a TTML {@code <p>} start tag
++     * @param startMs the cue start time in milliseconds
++     * @return the cue end time in milliseconds, or {@code -1} if unknown
++     */
++    private static long ttmlEndMs(@NonNull final XmlPullParser parser, final long startMs) {
++        final String end = parser.getAttributeValue(null, "end");
++        if (end != null) {
++            return parseTimingMs(end);
++        }
++        final String duration = parser.getAttributeValue(null, "d") != null
++                ? parser.getAttributeValue(null, "d")
++                : parser.getAttributeValue(null, "dur");
++        if (duration != null && startMs >= 0) {
++            return startMs + parseTimingMs(duration);
++        }
++        return -1;
++    }
++
++    /**
++     * Parses a TTML timing value, which may be a plain millisecond number
++     * (YouTube: {@code 1200}), a clock value ({@code 00:00:01.200}) or a
++     * suffixed offset ({@code 1.2s}, {@code 1200ms}).
++     *
++     * @param value the raw attribute value
++     * @return the value in milliseconds, or {@code -1} if it cannot be parsed
++     */
++    private static long parseTimingMs(@Nullable final String value) {
++        if (value == null) {
++            return -1;
++        }
++        String v = value.trim();
++        boolean seconds = false;
++        if (v.endsWith("ms")) {
++            v = v.substring(0, v.length() - 2);
++        } else if (v.endsWith("s")) {
++            seconds = true;
++            v = v.substring(0, v.length() - 1);
++        }
++        if (v.contains(":")) {
++            final String[] parts = v.split(":");
++            try {
++                if (parts.length == 3) {
++                    return (long) (Double.parseDouble(parts[0]) * 3_600_000
++                            + Double.parseDouble(parts[1]) * 60_000
++                            + Double.parseDouble(parts[2]) * 1000);
++                } else if (parts.length == 2) {
++                    return (long) (Double.parseDouble(parts[0]) * 60_000
++                            + Double.parseDouble(parts[1]) * 1000);
++                }
++            } catch (final NumberFormatException ignored) {
++                // fall through: malformed timestamp
++            }
++            return -1;
++        }
++        try {
++            final double number = Double.parseDouble(v);
++            return (long) (seconds ? number * 1000 : number);
++        } catch (final NumberFormatException ignored) {
++            // fall through: malformed number
++        }
++        return -1;
++    }
++
++    /**
++     * Composes a bilingual WebVTT document. For every cue the original text
++     * lines are followed by the translated text (when available).
++     *
++     * @param cues        the original parsed cues
++     * @param translation a map from original joined cue text to translated text
++     * @return a WebVTT document as a string
++     */
++    @NonNull
++    public static String composeBilingual(@NonNull final List<Cue> cues,
++                                          @NonNull final Map<String, String> translation) {
++        final StringBuilder sb = new StringBuilder();
++        sb.append(WEBVTT_HEADER).append('\n');
++        sb.append('\n');
++        for (final Cue cue : cues) {
++            sb.append(formatTiming(cue.startMs)).append(' ').append(CUE_ARROW).append(' ')
++                    .append(formatTiming(cue.endMs)).append('\n');
++            // Exactly two lines per cue: the original text first, the
++            // translation second. BisubSubtitleView relies on this fixed
++            // structure to render the two lines with separate font sizes.
++            sb.append(cue.joinedText()).append('\n');
++            final String translated = translation.get(cue.joinedText());
++            if (translated != null && !translated.trim().isEmpty()) {
++                sb.append(translated.replace("\n", " ").trim()).append('\n');
++            }
++            sb.append('\n');
++        }
++        return sb.toString();
++    }
++
++    @NonNull
++    private static String formatTiming(final long ms) {
++        return String.format(Locale.US, "%02d:%02d:%02d.%03d",
++                ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60, ms % 1000);
++    }
++
++    @Nullable
++    private static long[] parseTiming(@NonNull final String line) {
++        // "00:00:01.000 --> 00:00:03.000 align:start position:0%" or short form "00:01.000 --> ..."
++        final String[] parts = line.split(CUE_ARROW);
++        if (parts.length < 2) {
++            return null;
++        }
++        final Long start = parseTimestamp(parts[0].trim());
++        final Long end = parseTimestamp(parts[1].trim().split("\\s+")[0]);
++        if (start == null || end == null || end <= start) {
++            return null;
++        }
++        return new long[]{start, end};
++    }
++
++    @Nullable
++    private static Long parseTimestamp(@NonNull final String stamp) {
++        final String[] hms = stamp.replace(',', '.').split(":");
++        try {
++            if (hms.length == 3) {
++                return (Long.parseLong(hms[0]) * 3_600_000L)
++                        + (Long.parseLong(hms[1]) * 60_000L)
++                        + (long) (Double.parseDouble(hms[2]) * 1000);
++            } else if (hms.length == 2) {
++                return (Long.parseLong(hms[0]) * 60_000L)
++                        + (long) (Double.parseDouble(hms[1]) * 1000);
++            }
++        } catch (final NumberFormatException ignored) {
++            // fall through: malformed timestamp
++        }
++        return null;
++    }
++
++    @NonNull
++    private static String cleanLine(@NonNull final String raw) {
++        String s = raw;
++        // Strip inline timing tags like <00:00:01.000> and voice/style tags <v Name>, <c>, </c>
++        s = s.replaceAll("<[^>]*>", "");
++        // Restore common HTML entities
++        s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
++                .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ");
++        return s.trim();
++    }
++}
+-- 
+2.54.0.windows.1
+

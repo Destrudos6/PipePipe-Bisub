@@ -1,0 +1,947 @@
+From c80f1d2515501c8bc08a2f4e3bb5d8073c5cfa1d Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 09:37:41 +0800
+Subject: [PATCH 2/5] Add bilingual subtitle settings screen with provider
+ config and style editor
+
+- New BisubSettingsFragment registered in SettingsResourceRegistry and
+  linked from main_settings (language pair, LLM provider/API key/model,
+  batch/budget parameters)
+- In-app style editor dialog (dialog_bisub_style.xml) with a live
+  true-ratio BisubSubtitleView preview on a neutral gradient
+  background; single 'subtitle size' slider plus text color,
+  background mode, padding, corner radius, max width and vertical
+  position
+- All bisub string resources for values and values-zh-rCN
+---
+ .../settings/BisubSettingsFragment.java       | 440 ++++++++++++++++++
+ .../settings/SettingsResourceRegistry.java    |   1 +
+ .../res/drawable/bisub_preview_background.xml |   8 +
+ .../main/res/layout/dialog_bisub_style.xml    | 156 +++++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  60 ++-
+ app/src/main/res/values/settings_keys.xml     |  34 ++
+ app/src/main/res/values/strings.xml           |  58 +++
+ app/src/main/res/xml/bisub_settings.xml       |  75 +++
+ app/src/main/res/xml/main_settings.xml        |   6 +
+ 9 files changed, 836 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+ create mode 100644 app/src/main/res/drawable/bisub_preview_background.xml
+ create mode 100644 app/src/main/res/layout/dialog_bisub_style.xml
+ create mode 100644 app/src/main/res/xml/bisub_settings.xml
+
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+new file mode 100644
+index 000000000..9fe2ea935
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -0,0 +1,440 @@
++package org.schabi.newpipe.settings;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.widget.RadioGroup;
++import android.widget.SeekBar;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AlertDialog;
++import androidx.preference.EditTextPreference;
++import androidx.preference.ListPreference;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceManager;
++import androidx.preference.SwitchPreferenceCompat;
++
++import com.google.android.exoplayer2.text.Cue;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubPrefs;
++import org.schabi.newpipe.bisub.BisubStyle;
++import org.schabi.newpipe.bisub.BisubSubtitleView;
++import org.schabi.newpipe.bisub.SubtitleTranslator;
++
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Settings fragment for the bilingual subtitle (bisub) feature.
++ *
++ * <p>Selecting a known provider automatically fills in the API base URL and
++ * the model name, unless the user has customized them. The API key summary
++ * only shows whether a key is set, never the key itself. The master switch
++ * summary always reflects the current configuration state and a test button
++ * sends a one-line probe request through the whole translation pipeline.</p>
++ */
++public class BisubSettingsFragment extends BasePreferenceFragment {
++
++    /**
++     * Base URL and default model for every built-in provider.
++     * Keys match the values of {@code bisub_provider_values}.
++     */
++    private static final Map<String, String[]> PROVIDER_PRESETS = new HashMap<>();
++
++    static {
++        PROVIDER_PRESETS.put("openai",
++                new String[]{"https://api.openai.com/v1", "gpt-4o-mini"});
++        PROVIDER_PRESETS.put("deepseek",
++                new String[]{"https://api.deepseek.com/v1", "deepseek-chat"});
++        PROVIDER_PRESETS.put("moonshot",
++                new String[]{"https://api.moonshot.cn/v1", "moonshot-v1-8k"});
++        PROVIDER_PRESETS.put("zhipu",
++                new String[]{"https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"});
++        PROVIDER_PRESETS.put("openrouter",
++                new String[]{"https://openrouter.ai/api/v1", "openrouter/auto"});
++    }
++
++    private SharedPreferences prefs;
++
++    /**
++     * Keeps the master switch summary in sync while the user edits any
++     * bisub preference on this screen.
++     */
++    private final SharedPreferences.OnSharedPreferenceChangeListener prefChangeListener =
++            (final SharedPreferences sharedPreferences, final String key) -> {
++                if (getString(R.string.bisub_enable_key).equals(key)
++                        || getString(R.string.bisub_base_url_key).equals(key)
++                        || getString(R.string.bisub_api_key_key).equals(key)
++                        || getString(R.string.bisub_model_key).equals(key)
++                        || getString(R.string.bisub_target_lang_key).equals(key)) {
++                    refreshEnableSummary();
++                }
++            };
++
++    @Override
++    public void onCreatePreferences(@Nullable final Bundle savedInstanceState,
++                                    @Nullable final String rootKey) {
++        addPreferencesFromResourceRegistry();
++
++        prefs = PreferenceManager.getDefaultSharedPreferences(requireContext());
++
++        setupProviderPreset();
++        setupApiKeySummary();
++        setupTestButton();
++        setupCaptionStyleButton();
++        prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        refreshEnableSummary();
++    }
++
++    @Override
++    public void onDestroy() {
++        super.onDestroy();
++        if (prefs != null) {
++            prefs.unregisterOnSharedPreferenceChangeListener(prefChangeListener);
++        }
++    }
++
++    private void setupProviderPreset() {
++        final ListPreference providerPref =
++                (ListPreference) requirePreference(R.string.bisub_provider_key);
++        providerPref.setOnPreferenceChangeListener((final Preference p,
++                                                    final Object newValue) -> {
++            final String[] preset = PROVIDER_PRESETS.get(String.valueOf(newValue));
++            if (preset != null) {
++                final SharedPreferences.Editor editor = prefs.edit();
++                editor.putString(getString(R.string.bisub_base_url_key), preset[0]);
++                editor.putString(getString(R.string.bisub_model_key), preset[1]);
++                editor.apply();
++                // Also refresh the visible preferences immediately
++                final EditTextPreference baseUrlPref =
++                        (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
++                baseUrlPref.setText(preset[0]);
++                final EditTextPreference modelPref =
++                        (EditTextPreference) requirePreference(R.string.bisub_model_key);
++                modelPref.setText(preset[1]);
++            }
++            refreshEnableSummary();
++            return true;
++        });
++    }
++
++    private void setupApiKeySummary() {
++        final EditTextPreference apiKeyPref =
++                (EditTextPreference) requirePreference(R.string.bisub_api_key_key);
++        apiKeyPref.setSummary(isBlank(prefs.getString(
++                getString(R.string.bisub_api_key_key), null))
++                ? getString(R.string.bisub_api_key_unset)
++                : getString(R.string.bisub_api_key_set));
++
++        apiKeyPref.setOnPreferenceChangeListener((final Preference p,
++                                                  final Object newValue) -> {
++            final String value = newValue == null ? null : String.valueOf(newValue);
++            p.setSummary(isBlank(value)
++                    ? getString(R.string.bisub_api_key_unset)
++                    : getString(R.string.bisub_api_key_set));
++            return true;
++        });
++    }
++
++    /**
++     * Updates the master switch summary so the user can immediately see
++     * whether bisub is enabled and whether the configuration is complete.
++     */
++    private void refreshEnableSummary() {
++        final SwitchPreferenceCompat enablePref =
++                (SwitchPreferenceCompat) requirePreference(R.string.bisub_enable_key);
++        if (!enablePref.isChecked()) {
++            enablePref.setSummary(R.string.bisub_enable_summary);
++            return;
++        }
++        final int missingResId = findMissingFieldResId();
++        if (missingResId != 0) {
++            enablePref.setSummary(getString(R.string.bisub_status_incomplete,
++                    getString(missingResId)));
++        } else {
++            enablePref.setSummary(R.string.bisub_status_ready);
++        }
++    }
++
++    /**
++     * @return the string resource of the first missing required field,
++     *         or {@code 0} when the configuration is complete
++     */
++    private int findMissingFieldResId() {
++        if (isBlank(prefs.getString(getString(R.string.bisub_base_url_key), null))) {
++            return R.string.bisub_missing_base_url;
++        }
++        if (isBlank(prefs.getString(getString(R.string.bisub_api_key_key), null))) {
++            return R.string.bisub_missing_api_key;
++        }
++        if (isBlank(prefs.getString(getString(R.string.bisub_model_key), null))) {
++            return R.string.bisub_missing_model;
++        }
++        if (isBlank(prefs.getString(getString(R.string.bisub_target_lang_key), null))) {
++            return R.string.bisub_missing_target_lang;
++        }
++        return 0;
++    }
++
++    private void setupTestButton() {
++        final Preference testPref = requirePreference(R.string.bisub_test_connection_key);
++        testPref.setOnPreferenceClickListener((final Preference p) -> {
++            runConnectionTest();
++            return true;
++        });
++    }
++
++    /**
++     * Runs the API probe on a background thread and shows the result in a
++     * dialog on the UI thread.
++     */
++    private void runConnectionTest() {
++        final Context context = requireContext();
++        final BisubPrefs.Config cfg = BisubPrefs.load(context);
++        if (!cfg.isUsable()) {
++            showTestResult(context, false, getString(R.string.bisub_test_missing_config));
++            return;
++        }
++
++        final Preference testPref = requirePreference(R.string.bisub_test_connection_key);
++        testPref.setEnabled(false);
++        testPref.setSummary(R.string.bisub_test_running);
++        final long started = System.currentTimeMillis();
++
++        new Thread(() -> {
++            boolean success = false;
++            String message;
++            try {
++                final String translated = SubtitleTranslator.testConnection(cfg);
++                success = true;
++                message = getString(R.string.bisub_test_result_success_format,
++                        System.currentTimeMillis() - started, translated);
++            } catch (final Exception e) {
++                message = e.getMessage() == null ? e.getClass().getSimpleName()
++                        : e.getMessage();
++            }
++            final boolean ok = success;
++            final String result = message;
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                testPref.setEnabled(true);
++                testPref.setSummary(R.string.bisub_test_connection_summary);
++                showTestResult(context, ok, result);
++            });
++        }).start();
++    }
++
++    private void showTestResult(@NonNull final Context context, final boolean success,
++                                @NonNull final String message) {
++        if (getActivity() == null) {
++            return;
++        }
++        new AlertDialog.Builder(context)
++                .setTitle(success ? R.string.bisub_test_success : R.string.bisub_test_failed)
++                .setMessage(message)
++                .setPositiveButton(android.R.string.ok, null)
++                .show();
++    }
++
++    /**
++     * Opens the in-app bilingual subtitle style editor with a live preview.
++     * The preview uses the very same {@link BisubSubtitleView} the player
++     * uses, so what the user sees in the dialog is exactly what the
++     * bilingual track will look like. This replaces the old shortcut to the
++     * Android system caption settings, which does not exist on HarmonyOS.
++     */
++    private void setupCaptionStyleButton() {
++        final Preference stylePref = requirePreference(R.string.bisub_caption_style_key);
++        stylePref.setOnPreferenceClickListener((final Preference p) -> {
++            showStyleDialog();
++            return true;
++        });
++    }
++
++    /**
++     * Text colors offered in the style editor, in the same order as the
++     * radio buttons in {@code dialog_bisub_style.xml}.
++     */
++    private static final int[] TEXT_COLORS =
++            {0xFFFFFFFF, 0xFFFFFF00, 0xFF00FFFF, 0xFF00FF00};
++
++    private void showStyleDialog() {
++        final Context context = requireContext();
++        final View view = LayoutInflater.from(context)
++                .inflate(R.layout.dialog_bisub_style, null);
++
++        final BisubSubtitleView preview = view.findViewById(R.id.bisub_style_preview);
++        // Lay the preview out at a reference player size and scale the whole
++        // drawing down: font sizes, wrap points and spacing then match
++        // fullscreen playback exactly, instead of wrapping early inside the
++        // narrow dialog box.
++        preview.setReferenceSize(640f, 400f);
++        final SeekBar baseScaleBar = view.findViewById(R.id.bisub_style_base_scale);
++
++        final SeekBar paddingBar = view.findViewById(R.id.bisub_style_padding);
++        final SeekBar cornerRadiusBar = view.findViewById(R.id.bisub_style_corner_radius);
++        final SeekBar maxWidthBar = view.findViewById(R.id.bisub_style_max_width);
++        final SeekBar positionBar = view.findViewById(R.id.bisub_style_position);
++        final RadioGroup textColorGroup = view.findViewById(R.id.bisub_style_text_color_group);
++        final RadioGroup backgroundGroup = view.findViewById(R.id.bisub_style_background_group);
++
++        final BisubPrefs.Style initial = BisubPrefs.loadStyle(context);
++        final BisubPrefs.Style[] current = {initial};
++
++        baseScaleBar.setProgress(Math.round(initial.baseScale * 10));
++
++        paddingBar.setProgress(Math.round(initial.paddingDp));
++        cornerRadiusBar.setProgress(Math.round(initial.cornerRadiusDp));
++        maxWidthBar.setProgress(Math.round(initial.maxWidthPercent * 10));
++        positionBar.setProgress(Math.round(initial.positionPercent * 100));
++        checkColorButton(textColorGroup, initial.textColor);
++        checkBackgroundButton(backgroundGroup, initial.backgroundMode);
++
++        preview.setCues(Collections.singletonList(new Cue.Builder()
++                .setText(getString(R.string.bisub_style_preview_original) + "\n"
++                        + getString(R.string.bisub_style_preview_translation))
++                .build()));
++
++        final Runnable updatePreview = () -> {
++            BisubStyle.applyTo(preview, current[0]);
++        };
++
++        final SeekBar.OnSeekBarChangeListener barListener =
++                new SeekBar.OnSeekBarChangeListener() {
++            @Override
++            public void onProgressChanged(final SeekBar seekBar, final int progress,
++                                          final boolean fromUser) {
++                // switch is not possible here: R.id fields are not
++                // compile-time constants in this project
++                final int id = seekBar.getId();
++                if (id == R.id.bisub_style_base_scale) {
++                    current[0] = new BisubPrefs.Style(
++                            // No android:min on the bar (minSdk 23), clamp
++                            Math.max(0.4f, progress / 10.0f),
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, current[0].positionPercent);
++                } else if (id == R.id.bisub_style_padding) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            progress, current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, current[0].positionPercent);
++                } else if (id == R.id.bisub_style_corner_radius) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].paddingDp, progress,
++                            current[0].maxWidthPercent, current[0].positionPercent);
++                } else if (id == R.id.bisub_style_max_width) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            // Map the 5..10 slider range to 0.5..1.0, clamped
++                            // (there is no android:min below API 26)
++                            Math.max(0.5f, progress / 10.0f),
++                            current[0].positionPercent);
++                } else if (id == R.id.bisub_style_position) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, progress / 100.0f);
++                } else {
++                    return;
++                }
++                updatePreview.run();
++            }
++
++            @Override
++            public void onStartTrackingTouch(final SeekBar seekBar) { }
++
++            @Override
++            public void onStopTrackingTouch(final SeekBar seekBar) { }
++        };
++        baseScaleBar.setOnSeekBarChangeListener(barListener);
++
++        paddingBar.setOnSeekBarChangeListener(barListener);
++        cornerRadiusBar.setOnSeekBarChangeListener(barListener);
++        maxWidthBar.setOnSeekBarChangeListener(barListener);
++        positionBar.setOnSeekBarChangeListener(barListener);
++
++        textColorGroup.setOnCheckedChangeListener((final RadioGroup group, final int id) -> {
++            for (int i = 0; i < TEXT_COLORS.length; i++) {
++                if (id == colorButtonId(i)) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++
++                            TEXT_COLORS[i], current[0].backgroundMode,
++                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, current[0].positionPercent);
++                    updatePreview.run();
++                    return;
++                }
++            }
++        });
++
++        backgroundGroup.setOnCheckedChangeListener((final RadioGroup group, final int id) -> {
++            final int mode = id == R.id.bisub_bg_opaque ? BisubStyle.BG_OPAQUE
++                    : id == R.id.bisub_bg_none ? BisubStyle.BG_NONE
++                    : BisubStyle.BG_TRANSLUCENT;
++            current[0] = new BisubPrefs.Style(current[0].baseScale,
++
++                    current[0].textColor, mode,
++                    current[0].paddingDp, current[0].cornerRadiusDp,
++                    current[0].maxWidthPercent, current[0].positionPercent);
++            updatePreview.run();
++        });
++
++        updatePreview.run();
++
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_caption_style_title)
++                .setView(view)
++                .setPositiveButton(android.R.string.ok, (dialog, which) ->
++                        BisubPrefs.saveStyle(context, current[0]))
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private int colorButtonId(final int index) {
++        switch (index) {
++            case 1: return R.id.bisub_color_yellow;
++            case 2: return R.id.bisub_color_cyan;
++            case 3: return R.id.bisub_color_green;
++            default: return R.id.bisub_color_white;
++        }
++    }
++
++    private void checkColorButton(final RadioGroup group, final int textColor) {
++        for (int i = 0; i < TEXT_COLORS.length; i++) {
++            if (textColor == TEXT_COLORS[i]) {
++                group.check(colorButtonId(i));
++                return;
++            }
++        }
++        group.check(R.id.bisub_color_white);
++    }
++
++    private void checkBackgroundButton(final RadioGroup group, final int backgroundMode) {
++        if (backgroundMode == BisubStyle.BG_OPAQUE) {
++            group.check(R.id.bisub_bg_opaque);
++        } else if (backgroundMode == BisubStyle.BG_NONE) {
++            group.check(R.id.bisub_bg_none);
++        } else {
++            group.check(R.id.bisub_bg_translucent);
++        }
++    }
++
++    private static boolean isBlank(@Nullable final String value) {
++        return value == null || value.trim().isEmpty();
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+index 009a7dd36..7d486cbc9 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+@@ -40,6 +40,7 @@ public final class SettingsResourceRegistry {
+         add(PlayerNotificationSettingsFragment.class, R.xml.player_notification_settings);
+         add(UpdateSettingsFragment.class, R.xml.update_settings);
+         add(VideoAudioSettingsFragment.class, R.xml.video_audio_settings);
++        add(BisubSettingsFragment.class, R.xml.bisub_settings);
+         add(GestureSettingsFragment.class, R.xml.gesture_settings);
+         add(AdvancedSettingsFragment.class, R.xml.advanced_settings);
+         add(BackupSettingsFragment.class, R.xml.backup_settings);
+diff --git a/app/src/main/res/drawable/bisub_preview_background.xml b/app/src/main/res/drawable/bisub_preview_background.xml
+new file mode 100644
+index 000000000..38d8aa75e
+--- /dev/null
++++ b/app/src/main/res/drawable/bisub_preview_background.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<shape xmlns:android="http://schemas.android.com/apk/res/android"
++    android:shape="rectangle">
++    <gradient
++        android:angle="270"
++        android:startColor="#FF4A4A4A"
++        android:endColor="#FF1E1E1E" />
++</shape>
+diff --git a/app/src/main/res/layout/dialog_bisub_style.xml b/app/src/main/res/layout/dialog_bisub_style.xml
+new file mode 100644
+index 000000000..a256c9ac3
+--- /dev/null
++++ b/app/src/main/res/layout/dialog_bisub_style.xml
+@@ -0,0 +1,156 @@
++<?xml version="1.0" encoding="utf-8"?>
++<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:paddingHorizontal="24dp"
++    android:paddingTop="12dp">
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="vertical">
++
++        <FrameLayout
++            android:layout_width="match_parent"
++            android:layout_height="220dp"
++            android:background="@drawable/bisub_preview_background">
++
++            <org.schabi.newpipe.bisub.BisubSubtitleView
++                android:id="@+id/bisub_style_preview"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent" />
++        </FrameLayout>
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="16dp"
++            android:text="@string/bisub_style_base_size" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_base_scale"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="20" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++
++            android:text="@string/bisub_style_text_color" />
++
++        <RadioGroup
++            android:id="@+id/bisub_style_text_color_group"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="horizontal">
++
++            <RadioButton
++                android:id="@+id/bisub_color_white"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginEnd="8dp"
++                android:buttonTint="#FFFFFF" />
++
++            <RadioButton
++                android:id="@+id/bisub_color_yellow"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginEnd="8dp"
++                android:buttonTint="#FFFF00" />
++
++            <RadioButton
++                android:id="@+id/bisub_color_cyan"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginEnd="8dp"
++                android:buttonTint="#00FFFF" />
++
++            <RadioButton
++                android:id="@+id/bisub_color_green"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:buttonTint="#00FF00" />
++        </RadioGroup>
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_background" />
++
++        <RadioGroup
++            android:id="@+id/bisub_style_background_group"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="vertical">
++
++            <RadioButton
++                android:id="@+id/bisub_bg_translucent"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/bisub_style_bg_translucent" />
++
++            <RadioButton
++                android:id="@+id/bisub_bg_opaque"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/bisub_style_bg_opaque" />
++
++            <RadioButton
++                android:id="@+id/bisub_bg_none"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/bisub_style_bg_none" />
++        </RadioGroup>
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_padding" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_padding"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="16" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_corner_radius" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_corner_radius"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="16" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_max_width" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_max_width"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="10" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_position" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_position"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="30" />
++    </LinearLayout>
++</ScrollView>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 78e07cb29..4fa7be84e 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1202,5 +1202,61 @@
+ <string name="remove_selected_from_playlist_confirm">确定要从播放列表中移除 %d 项吗？</string>
+ <string name="audio_quality_high">高（最高比特率）</string>
+ <string name="audio_quality_medium">中（约 128 kbps）</string>
+-<string name="audio_quality_low">低（最低比特率，节省流量）</string>
+-</resources>
+\ No newline at end of file
++    <!-- Bilingual subtitles (bisub) -->
++    <string name="bisub_settings_title">双语字幕</string>
++    <string name="bisub_enable_title">启用双语字幕</string>
++    <string name="bisub_enable_summary">在视频页显示“双语字幕”按钮，按需生成并缓存翻译字幕</string>
++    <string name="bisub_provider_title">提供商</string>
++    <string name="bisub_provider_custom">自定义</string>
++    <string name="bisub_provider_openai">OpenAI</string>
++    <string name="bisub_provider_deepseek">DeepSeek（深度求索）</string>
++    <string name="bisub_provider_moonshot">Moonshot（Kimi）</string>
++    <string name="bisub_provider_zhipu">智谱（GLM）</string>
++    <string name="bisub_provider_openrouter">OpenRouter</string>
++    <string name="bisub_base_url_title">API 地址</string>
++    <string name="bisub_base_url_summary">OpenAI 兼容接口地址，如 https://api.deepseek.com/v1</string>
++    <string name="bisub_api_key_title">API 密钥</string>
++    <string name="bisub_api_key_unset">未设置</string>
++    <string name="bisub_api_key_set">已设置</string>
++    <string name="bisub_model_title">模型名称</string>
++    <string name="bisub_model_summary">模型名称，如 deepseek-chat</string>
++    <string name="bisub_target_lang_title">目标语言</string>
++    <string name="bisub_target_lang_summary">字幕要翻译成的语言，如 Simplified Chinese</string>
++    <string name="bisub_source_lang_title">源字幕语言</string>
++    <string name="bisub_source_lang_summary">要翻译的字幕轨语言代码，如 en。留空则使用第一条可用字幕轨</string>
++    <string name="bisub_status_ready">已就绪 · 在视频页点按“双语字幕”按钮即可生成并缓存字幕</string>
++    <string name="bisub_status_incomplete">配置不完整：缺少 %1$s</string>
++    <string name="bisub_missing_base_url">API 地址</string>
++    <string name="bisub_missing_api_key">API 密钥</string>
++    <string name="bisub_missing_model">模型名称</string>
++    <string name="bisub_missing_target_lang">目标语言</string>
++    <string name="bisub_test_connection_title">测试 API 连接</string>
++    <string name="bisub_test_connection_summary">发送一句测试请求，验证服务商配置是否可用</string>
++    <string name="bisub_test_running">测试中…</string>
++    <string name="bisub_test_success">API 可用</string>
++    <string name="bisub_test_failed">API 测试失败</string>
++    <string name="bisub_test_missing_config">请先补全上方的配置，再运行测试</string>
++    <string name="bisub_test_result_success_format">翻译成功（%1$d 毫秒）：%2$s</string>
++    <string name="bisub_caption_style_title">字幕外观</string>
++    <string name="bisub_caption_style_summary">在应用内调整双语字幕的大小、颜色和背景，支持实时预览</string>
++    <string name="bisub_style_base_size">字幕大小</string>
++    <string name="bisub_style_text_color">文字颜色</string>
++    <string name="bisub_style_background">背景</string>
++    <string name="bisub_style_padding">内边距</string>
++    <string name="bisub_style_corner_radius">圆角半径</string>
++    <string name="bisub_style_max_width">文字最大宽度</string>
++    <string name="bisub_style_position">垂直位置</string>
++    <string name="bisub_style_bg_translucent">半透明黑</string>
++    <string name="bisub_style_bg_opaque">纯黑</string>
++    <string name="bisub_style_bg_none">无背景（描边）</string>
++    <string name="bisub_style_preview_original">The hardest problem ever set</string>
++    <string name="bisub_style_preview_translation">史上最难的题</string>
++    <string name="bisub_button_starting">准备中…</string>
++    <string name="bisub_toast_ready">双语字幕已生成（%1$d/%2$d 句）。重新打开视频，在字幕菜单选择“%3$s”</string>
++    <string name="bisub_button_idle">双语</string>
++    <string name="bisub_button_progress">%1$d%%</string>
++    <string name="bisub_button_done">已生成</string>
++    <string name="bisub_button_failed">重试</string>
++    <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
++    <string name="bisub_toast_failed">字幕翻译失败，请检查网络后重试</string>
++</resources>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 53078609f..2658ed8fb 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1883,4 +1883,38 @@
+         <item>@string/audio_quality_low</item>
+     </string-array>
+     <string name="lock_screen_button_key" translatable="false">lock_screen_button</string>
++    <!-- Bilingual subtitles (bisub) -->
++    <string name="bisub_enable_key">bisub_enable</string>
++    <string name="bisub_provider_key">bisub_provider</string>
++    <string name="bisub_base_url_key">bisub_base_url</string>
++    <string name="bisub_api_key_key">bisub_api_key</string>
++    <string name="bisub_model_key">bisub_model</string>
++    <string name="bisub_target_lang_key">bisub_target_lang</string>
++    <string name="bisub_source_lang_key">bisub_source_lang</string>
++    <string name="bisub_test_connection_key">bisub_test_connection</string>
++    <string name="bisub_caption_style_key">bisub_caption_style</string>
++    <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
++    <string name="bisub_style_text_color_key">bisub_style_text_color</string>
++    <string name="bisub_style_background_key">bisub_style_background</string>
++    <string name="bisub_style_padding_key">bisub_style_padding</string>
++    <string name="bisub_style_corner_radius_key">bisub_style_corner_radius</string>
++    <string name="bisub_style_max_width_key">bisub_style_max_width</string>
++    <string name="bisub_style_position_key">bisub_style_position</string>
++
++    <string-array name="bisub_provider_values">
++        <item>custom</item>
++        <item>openai</item>
++        <item>deepseek</item>
++        <item>moonshot</item>
++        <item>zhipu</item>
++        <item>openrouter</item>
++    </string-array>
++    <string-array name="bisub_provider_descriptions">
++        <item>@string/bisub_provider_custom</item>
++        <item>@string/bisub_provider_openai</item>
++        <item>@string/bisub_provider_deepseek</item>
++        <item>@string/bisub_provider_moonshot</item>
++        <item>@string/bisub_provider_zhipu</item>
++        <item>@string/bisub_provider_openrouter</item>
++    </string-array>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f30139d5d..cfe0c7ee3 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1206,4 +1206,62 @@
+ <string name="audio_quality_low">Low (lowest bitrate, saves data)</string>
+ <string name="lock_screen_button_title">Lock screen button</string>
+ <string name="lock_screen_button_summary">Show a button in the fullscreen player to lock touch controls</string>
++    <!-- Bilingual subtitles (bisub) -->
++    <string name="bisub_settings_title">Bilingual subtitles</string>
++    <string name="bisub_enable_title">Enable bilingual subtitles</string>
++    <string name="bisub_enable_summary">Show a Bilingual button on video pages that generates translated subtitles on demand</string>
++    <string name="bisub_provider_title">Provider</string>
++    <string name="bisub_provider_custom">Custom</string>
++    <string name="bisub_provider_openai">OpenAI</string>
++    <string name="bisub_provider_deepseek">DeepSeek</string>
++    <string name="bisub_provider_moonshot">Moonshot (Kimi)</string>
++    <string name="bisub_provider_zhipu">Zhipu (GLM)</string>
++    <string name="bisub_provider_openrouter">OpenRouter</string>
++    <string name="bisub_base_url_title">API base URL</string>
++    <string name="bisub_base_url_summary">OpenAI-compatible endpoint, e.g. https://api.deepseek.com/v1</string>
++    <string name="bisub_api_key_title">API key</string>
++    <string name="bisub_api_key_unset">Not set</string>
++    <string name="bisub_api_key_set">Set</string>
++    <string name="bisub_model_title">Model</string>
++    <string name="bisub_model_summary">Model name, e.g. deepseek-chat</string>
++    <string name="bisub_target_lang_title">Target language</string>
++    <string name="bisub_target_lang_summary">Language to translate subtitles into, e.g. Simplified Chinese</string>
++    <string name="bisub_source_lang_title">Source subtitle language</string>
++    <string name="bisub_source_lang_summary">ISO code of the subtitle track to translate, e.g. en. Leave empty to use the first available track</string>
++    <string name="bisub_status_ready">Ready · tap the Bilingual button on a video page to generate and cache its subtitles</string>
++    <string name="bisub_status_incomplete">Incomplete configuration: missing %1$s</string>
++    <string name="bisub_missing_base_url">API base URL</string>
++    <string name="bisub_missing_api_key">API key</string>
++    <string name="bisub_missing_model">model name</string>
++    <string name="bisub_missing_target_lang">target language</string>
++    <string name="bisub_test_connection_title">Test API connection</string>
++    <string name="bisub_test_connection_summary">Send a one-line probe request to verify the provider settings</string>
++    <string name="bisub_test_running">Testing…</string>
++    <string name="bisub_test_success">API is working</string>
++    <string name="bisub_test_failed">API test failed</string>
++    <string name="bisub_test_missing_config">Please complete the configuration above first, then run the test</string>
++    <string name="bisub_test_result_success_format">Translated in %1$d ms: %2$s</string>
++    <string name="bisub_caption_style_title">Subtitle appearance</string>
++    <string name="bisub_caption_style_summary">Adjust the size, color and background of the bilingual subtitles inside the app, with a live preview</string>
++
++    <string name="bisub_style_base_size">Subtitle size</string>
++    <string name="bisub_style_text_color">Text color</string>
++    <string name="bisub_style_background">Background</string>
++    <string name="bisub_style_padding">Padding</string>
++    <string name="bisub_style_corner_radius">Corner radius</string>
++    <string name="bisub_style_max_width">Maximum text width</string>
++    <string name="bisub_style_position">Vertical position</string>
++    <string name="bisub_style_bg_translucent">Translucent black</string>
++    <string name="bisub_style_bg_opaque">Solid black</string>
++    <string name="bisub_style_bg_none">None (outline)</string>
++    <string name="bisub_style_preview_original">The hardest problem ever set</string>
++    <string name="bisub_style_preview_translation">史上最难的题</string>
++    <string name="bisub_button_starting">Starting…</string>
++    <string name="bisub_toast_ready">Bilingual subtitles ready (%1$d of %2$d lines). Reopen the video and pick “%3$s” in the subtitle menu.</string>
++    <string name="bisub_button_idle">Bilingual</string>
++    <string name="bisub_button_progress">%1$d%%</string>
++    <string name="bisub_button_done">Done</string>
++    <string name="bisub_button_failed">Retry</string>
++    <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
++    <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
+ </resources>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+new file mode 100644
+index 000000000..305682886
+--- /dev/null
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -0,0 +1,75 @@
++<?xml version="1.0" encoding="utf-8"?>
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:key="bisub_preferences"
++    android:title="@string/bisub_settings_title">
++
++    <SwitchPreferenceCompat
++        android:defaultValue="false"
++        android:key="@string/bisub_enable_key"
++        android:summary="@string/bisub_enable_summary"
++        android:title="@string/bisub_enable_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <ListPreference
++        android:defaultValue="custom"
++        android:entries="@array/bisub_provider_descriptions"
++        android:entryValues="@array/bisub_provider_values"
++        android:key="@string/bisub_provider_key"
++        android:title="@string/bisub_provider_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false"
++        app:useSimpleSummaryProvider="true" />
++
++    <EditTextPreference
++        android:key="@string/bisub_base_url_key"
++        android:summary="@string/bisub_base_url_summary"
++        android:title="@string/bisub_base_url_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <EditTextPreference
++        android:inputType="textPassword"
++        android:key="@string/bisub_api_key_key"
++        android:title="@string/bisub_api_key_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <EditTextPreference
++        android:key="@string/bisub_model_key"
++        android:summary="@string/bisub_model_summary"
++        android:title="@string/bisub_model_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <EditTextPreference
++        android:defaultValue="Simplified Chinese"
++        android:key="@string/bisub_target_lang_key"
++        android:summary="@string/bisub_target_lang_summary"
++        android:title="@string/bisub_target_lang_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <EditTextPreference
++        android:defaultValue="en"
++        android:key="@string/bisub_source_lang_key"
++        android:summary="@string/bisub_source_lang_summary"
++        android:title="@string/bisub_source_lang_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <Preference
++        android:key="@string/bisub_test_connection_key"
++        android:summary="@string/bisub_test_connection_summary"
++        android:title="@string/bisub_test_connection_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <Preference
++        android:key="@string/bisub_caption_style_key"
++        android:summary="@string/bisub_caption_style_summary"
++        android:title="@string/bisub_caption_style_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++</PreferenceScreen>
+\ No newline at end of file
+diff --git a/app/src/main/res/xml/main_settings.xml b/app/src/main/res/xml/main_settings.xml
+index e45b33762..13cad822c 100644
+--- a/app/src/main/res/xml/main_settings.xml
++++ b/app/src/main/res/xml/main_settings.xml
+@@ -10,6 +10,12 @@
+         android:title="@string/settings_category_player_title"
+         app:iconSpaceReserved="false" />
+ 
++    <PreferenceScreen
++        android:fragment="org.schabi.newpipe.settings.BisubSettingsFragment"
++        android:icon="@drawable/ic_language"
++        android:title="@string/bisub_settings_title"
++        app:iconSpaceReserved="false" />
++
+     <PreferenceScreen
+         android:fragment="org.schabi.newpipe.settings.GestureSettingsFragment"
+         android:icon="@drawable/ic_button_pointer"
+-- 
+2.54.0.windows.1
+
