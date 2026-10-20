@@ -1,0 +1,635 @@
+From 6e0dd984dd12c73bc1d736f9e08ec1025cf89302 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 20:08:59 +0800
+Subject: [PATCH] Fix preview-to-playback size mismatch, split paddings and
+ per-layer opacity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The bilingual subtitle view covers the whole player surface including
+letterbox bars, and its font size was computed against that full
+height. In portrait playback the raw view height is roughly double the
+video area, so subtitles came out far larger than the style editor
+preview (which assumed a 640x400 landscape reference). The player now
+feeds the view the video aspect ratio, and the font size and the
+bottom anchor are computed against the video area carved out of the
+view — identical to fullscreen playback and to the preview, which also
+moved to a 16:9 640x360 reference.
+
+The single padding setting also tied the horizontal padding to the
+vertical one (always half of it). It is now two independent sliders
+(0-16 dp each); the legacy single value migrates to vertical = old,
+horizontal = old / 2, which is exactly what it used to render.
+
+The original-text opacity only affected the first (original) layer.
+Each layer now has its own opacity slider (30-100%), so whichever
+language ends up on either line can be dimmed independently.
+---
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 61 +++++++++++---
+ .../org/schabi/newpipe/bisub/BisubStyle.java  | 13 ++-
+ .../newpipe/bisub/BisubSubtitleView.java      | 56 ++++++++++---
+ .../newpipe/player/PlayerUiModeController.kt  | 11 +++
+ .../settings/BisubSettingsFragment.java       | 83 ++++++++++++++-----
+ .../main/res/layout/dialog_bisub_style.xml    | 24 ++++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  2 +
+ app/src/main/res/values/settings_keys.xml     |  3 +
+ app/src/main/res/values/strings.xml           |  2 +
+ 9 files changed, 207 insertions(+), 48 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index 75981b1c6..11f811aee 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -213,34 +213,44 @@ public final class BisubPrefs {
+         public final int backgroundMode;
+         /** Opacity of the solid background block (0.0-1.0). */
+         public final float backgroundOpacity;
+-        /** Padding between the text and the background block edge, in dp. */
+-        public final float paddingDp;
++        /** Vertical padding between the text and the background block edge,
++         *  in dp; adjusted independently from the horizontal one. */
++        public final float paddingVerticalDp;
++        /** Horizontal padding between the text and the background block
++         *  edge, in dp. */
++        public final float paddingHorizontalDp;
+         /** Background corner radius in dp; 0 means square corners. */
+         public final float cornerRadiusDp;
+         /** Maximum text width as a fraction of the view width (0.5-1.0).
+          *  Larger values wrap later, up to single lines spanning the screen. */
+         public final float maxWidthPercent;
+-        /** Distance between the subtitle block and the bottom of the view,
+-         *  as a fraction of the view height (0.0-0.3). */
++        /** Distance between the subtitle block and the bottom of the video
++         *  area, as a fraction of the video area height (0.0-0.3). */
+         public final float positionPercent;
+         /** Opacity of the original-language layer (0.3-1.0): lower values
+          *  dim the original text so the translation stands out. */
+         public final float originalAlpha;
++        /** Opacity of the translation layer (0.3-1.0), adjustable
++         *  separately from the original one. */
++        public final float translationAlpha;
+ 
+         @SuppressWarnings("checkstyle:ParameterNumber")
+         public Style(final float baseScale, final int textColor, final int backgroundMode,
+-                     final float backgroundOpacity, final float paddingDp,
+-                     final float cornerRadiusDp, final float maxWidthPercent,
+-                     final float positionPercent, final float originalAlpha) {
++                     final float backgroundOpacity, final float paddingVerticalDp,
++                     final float paddingHorizontalDp, final float cornerRadiusDp,
++                     final float maxWidthPercent, final float positionPercent,
++                     final float originalAlpha, final float translationAlpha) {
+             this.baseScale = baseScale;
+             this.textColor = textColor;
+             this.backgroundMode = backgroundMode;
+             this.backgroundOpacity = backgroundOpacity;
+-            this.paddingDp = paddingDp;
++            this.paddingVerticalDp = paddingVerticalDp;
++            this.paddingHorizontalDp = paddingHorizontalDp;
+             this.cornerRadiusDp = cornerRadiusDp;
+             this.maxWidthPercent = maxWidthPercent;
+             this.positionPercent = positionPercent;
+             this.originalAlpha = originalAlpha;
++            this.translationAlpha = translationAlpha;
+         }
+     }
+ 
+@@ -267,6 +277,23 @@ public final class BisubPrefs {
+             backgroundOpacity = backgroundMode == 1 ? 1.0f : 0.5f;
+             backgroundMode = BisubStyle.BG_SOLID;
+         }
++        // Migrate the retired single-padding setting: the old value was the
++        // vertical padding and the horizontal one was half of it, which is
++        // exactly what it used to render, so the look stays the same.
++        final String paddingVerticalKey =
++                context.getString(R.string.bisub_style_padding_vertical_key);
++        float paddingVerticalDp = prefs.getFloat(paddingVerticalKey, Float.NaN);
++        if (Float.isNaN(paddingVerticalDp)) {
++            final float legacy = prefs.getFloat(
++                    context.getString(R.string.bisub_style_padding_key),
++                    BisubStyle.DEFAULT_PADDING_VERTICAL_DP);
++            paddingVerticalDp = legacy;
++            final SharedPreferences.Editor editor = prefs.edit();
++            editor.putFloat(paddingVerticalKey, legacy);
++            editor.putFloat(context.getString(R.string.bisub_style_padding_horizontal_key),
++                    legacy / 2f);
++            editor.apply();
++        }
+         return new Style(
+                 prefs.getFloat(context.getString(R.string.bisub_style_base_scale_key),
+                         BisubStyle.DEFAULT_BASE_SCALE),
+@@ -275,8 +302,10 @@ public final class BisubPrefs {
+                         BisubStyle.DEFAULT_TEXT_COLOR),
+                 backgroundMode,
+                 Math.max(0f, Math.min(1f, backgroundOpacity)),
+-                prefs.getFloat(context.getString(R.string.bisub_style_padding_key),
+-                        BisubStyle.DEFAULT_PADDING_DP),
++                Math.max(0f, paddingVerticalDp),
++                Math.max(0f, prefs.getFloat(
++                        context.getString(R.string.bisub_style_padding_horizontal_key),
++                        BisubStyle.DEFAULT_PADDING_HORIZONTAL_DP)),
+                 prefs.getFloat(context.getString(R.string.bisub_style_corner_radius_key),
+                         BisubStyle.DEFAULT_CORNER_RADIUS_DP),
+                 prefs.getFloat(context.getString(R.string.bisub_style_max_width_key),
+@@ -284,7 +313,9 @@ public final class BisubPrefs {
+                 prefs.getFloat(context.getString(R.string.bisub_style_position_key),
+                         BisubStyle.DEFAULT_POSITION_PERCENT),
+                 prefs.getFloat(context.getString(R.string.bisub_style_original_alpha_key),
+-                        BisubStyle.DEFAULT_ORIGINAL_ALPHA));
++                        BisubStyle.DEFAULT_ORIGINAL_ALPHA),
++                prefs.getFloat(context.getString(R.string.bisub_style_translation_alpha_key),
++                        BisubStyle.DEFAULT_TRANSLATION_ALPHA));
+     }
+ 
+     /**
+@@ -306,8 +337,10 @@ public final class BisubPrefs {
+                 style.backgroundMode);
+         editor.putFloat(context.getString(R.string.bisub_style_background_opacity_key),
+                 style.backgroundOpacity);
+-        editor.putFloat(context.getString(R.string.bisub_style_padding_key),
+-                style.paddingDp);
++        editor.putFloat(context.getString(R.string.bisub_style_padding_vertical_key),
++                style.paddingVerticalDp);
++        editor.putFloat(context.getString(R.string.bisub_style_padding_horizontal_key),
++                style.paddingHorizontalDp);
+         editor.putFloat(context.getString(R.string.bisub_style_corner_radius_key),
+                 style.cornerRadiusDp);
+         editor.putFloat(context.getString(R.string.bisub_style_max_width_key),
+@@ -316,6 +349,8 @@ public final class BisubPrefs {
+                 style.positionPercent);
+         editor.putFloat(context.getString(R.string.bisub_style_original_alpha_key),
+                 style.originalAlpha);
++        editor.putFloat(context.getString(R.string.bisub_style_translation_alpha_key),
++                style.translationAlpha);
+         editor.apply();
+     }
+ 
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
+index 572e01f88..6ed3b6e49 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubStyle.java
+@@ -27,15 +27,19 @@ public final class BisubStyle {
+     /** Default overall scale of the whole subtitle block (text, padding
+      *  and corner radius all follow it). */
+     public static final float DEFAULT_BASE_SCALE = 1.0f;
+-    /** Default padding between the text and the background block edge, in dp. */
+-    public static final float DEFAULT_PADDING_DP = 4.0f;
++    /** Default vertical padding between the text and the background block
++     *  edge, in dp. Adjusted independently from the horizontal one. */
++    public static final float DEFAULT_PADDING_VERTICAL_DP = 4.0f;
++    /** Default horizontal padding, in dp; half the vertical one, which is
++     *  what the old single-padding style used to render. */
++    public static final float DEFAULT_PADDING_HORIZONTAL_DP = 2.0f;
+     /** Default background corner radius in dp; 0 means square corners. */
+     public static final float DEFAULT_CORNER_RADIUS_DP = 4.0f;
+     /** Default maximum text width as a fraction of the view width; 1.0 lets
+      *  long lines span the whole screen before wrapping. */
+     public static final float DEFAULT_MAX_WIDTH_PERCENT = 1.0f;
+     /** Default distance between the subtitle block and the bottom of the
+-     *  view, as a fraction of the view height. */
++     *  video area, as a fraction of the video area height. */
+     public static final float DEFAULT_POSITION_PERCENT = 0.05f;
+     /** Default opacity of the solid background block: half-transparent,
+      *  following what the mainstream players preset for subtitles. */
+@@ -44,6 +48,9 @@ public final class BisubStyle {
+      *  values dim the original text to make the translation stand out,
+      *  like bilingual subtitle browser extensions do. */
+     public static final float DEFAULT_ORIGINAL_ALPHA = 1.0f;
++    /** Default opacity of the translation layer: fully visible. Adjustable
++     *  separately from the original layer. */
++    public static final float DEFAULT_TRANSLATION_ALPHA = 1.0f;
+ 
+     private BisubStyle() { }
+ 
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+index e19c73314..264735139 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+@@ -58,14 +58,23 @@ public final class BisubSubtitleView extends View {
+             BisubStyle.DEFAULT_BASE_SCALE,
+             BisubStyle.DEFAULT_TEXT_COLOR, BisubStyle.BG_SOLID,
+             BisubStyle.DEFAULT_BACKGROUND_OPACITY,
+-            BisubStyle.DEFAULT_PADDING_DP, BisubStyle.DEFAULT_CORNER_RADIUS_DP,
++            BisubStyle.DEFAULT_PADDING_VERTICAL_DP,
++            BisubStyle.DEFAULT_PADDING_HORIZONTAL_DP,
++            BisubStyle.DEFAULT_CORNER_RADIUS_DP,
+             BisubStyle.DEFAULT_MAX_WIDTH_PERCENT,
+             BisubStyle.DEFAULT_POSITION_PERCENT,
+-            BisubStyle.DEFAULT_ORIGINAL_ALPHA);
++            BisubStyle.DEFAULT_ORIGINAL_ALPHA,
++            BisubStyle.DEFAULT_TRANSLATION_ALPHA);
+ 
+     private final TextPaint textPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+     private final Paint backgroundPaint = new Paint();
+ 
++    /** Video aspect ratio (width / height) of the played stream, 0 when
++     *  unknown. Used to keep the font size relative to the video area
++     *  instead of the whole view, so portrait playback with letterboxing
++     *  no longer inflates the subtitles. */
++    private float videoAspectRatio;
++
+     /** Reference player width the preview lays out at; 0 disables it. */
+     private float referenceWidthPx;
+     /** Reference player height the preview lays out at; 0 disables it. */
+@@ -97,6 +106,20 @@ public final class BisubSubtitleView extends View {
+         invalidate();
+     }
+ 
++    /**
++     * Sets the aspect ratio (width / height) of the played video. The font
++     * size and the bottom anchor are computed against the video area this
++     * ratio carves out of the view, so the subtitles look the same on a
++     * fullscreen phone (no letterboxing) and in portrait playback with
++     * black bars above and below the video.
++     *
++     * @param ratio the video width divided by its height, or 0 when unknown
++     */
++    public void setVideoAspectRatio(final float ratio) {
++        this.videoAspectRatio = Math.max(0f, ratio);
++        invalidate();
++    }
++
+     /**
+      * Sets the player size the preview emulates: cues are laid out at the
+      * reference size and the drawing is scaled down as a whole, so font
+@@ -126,10 +149,19 @@ public final class BisubSubtitleView extends View {
+         final float width = preview ? referenceWidthPx : viewWidth;
+         final float height = preview ? referenceHeightPx : viewHeight;
+ 
++        // The subtitles scale with the video area, not with the whole view:
++        // this view covers the whole player surface including letterbox
++        // bars, so in portrait playback the raw view height would inflate
++        // everything. Clamping the height to what the video aspect ratio
++        // occupies inside the view keeps the size identical to fullscreen
++        // playback — and to the style editor preview.
++        final float videoHeight = videoAspectRatio > 0f
++                ? Math.min(height, width / videoAspectRatio) : height;
++
+         final float baseScale =
+                 Math.max(0.4f, Math.min(3.0f, style.baseScale));
+         final float baseTextSize =
+-                height * SubtitleView.DEFAULT_TEXT_SIZE_FRACTION;
++                videoHeight * SubtitleView.DEFAULT_TEXT_SIZE_FRACTION;
+         if (baseTextSize <= 0) {
+             return;
+         }
+@@ -137,11 +169,10 @@ public final class BisubSubtitleView extends View {
+         // The overall scale resizes the whole block like resizing the
+         // outer component: the base font size, padding, corners and cue
+         // gaps all follow it, and the background grows with the text.
+-        final float padYPx = style.paddingDp * density * baseScale;
+-        // Horizontal padding is half the vertical one: the bar hugs the
+-        // text closely on the left and right, like an inline-block whose
+-        // padding is mainly there for the lines above and below.
+-        final float padXPx = padYPx / 2f;
++        final float padYPx = style.paddingVerticalDp * density * baseScale;
++        // Horizontal padding is its own setting; the default is half the
++        // vertical one, so the bar keeps hugging the text on the sides.
++        final float padXPx = style.paddingHorizontalDp * density * baseScale;
+         final float radiusPx = style.cornerRadiusDp * density * baseScale;
+         final float cueGapPx = 12 * density * baseScale;
+         // Long cues wrap at most at this width; the background itself is
+@@ -160,7 +191,10 @@ public final class BisubSubtitleView extends View {
+ 
+         textPaint.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+ 
+-        float bottom = height - height
++        // The bottom anchor sits at the bottom of the video area too, so
++        // portrait playback keeps the subtitles inside the letterboxed
++        // video instead of touching the physical screen edge.
++        float bottom = videoHeight - videoHeight
+                 * Math.max(0f, Math.min(0.3f, style.positionPercent));
+         for (final Cue cue : cues) {
+             final CharSequence cueText = cue == null ? null : cue.text;
+@@ -234,6 +268,8 @@ public final class BisubSubtitleView extends View {
+ 
+             final float originalAlpha =
+                     Math.max(0.3f, Math.min(1f, style.originalAlpha));
++            final float translationAlpha =
++                    Math.max(0.3f, Math.min(1f, style.translationAlpha));
+             float y = top + padYPx;
+             y = drawLayout(canvas, originalLayout, left + padXPx, y,
+                     style.backgroundMode == BisubStyle.BG_NONE, originalSize,
+@@ -241,7 +277,7 @@ public final class BisubSubtitleView extends View {
+             if (translationLayout != null) {
+                 drawLayout(canvas, translationLayout, left + padXPx, y + gapPx,
+                         style.backgroundMode == BisubStyle.BG_NONE,
+-                        translationSize, 1.0f);
++                        translationSize, translationAlpha);
+             }
+ 
+             bottom = top - cueGapPx;
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerUiModeController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerUiModeController.kt
+index 9c8b67f94..75fd0ac95 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerUiModeController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerUiModeController.kt
+@@ -228,6 +228,17 @@ class PlayerUiModeController(private val player: Player) {
+         player.menuController.onVideoSizeChanged(videoSize.width, videoSize.height)
+         isVerticalVideo = videoSize.width < videoSize.height
+ 
++        // BISUB-BEGIN: the bilingual subtitle view covers the whole player
++        // surface including letterbox bars; feeding it the video aspect
++        // ratio keeps its font size relative to the video area, matching
++        // fullscreen playback and the style editor preview in any orientation
++        if (videoSize.height > 0) {
++            player.binding.bisubSubtitleView.setVideoAspectRatio(
++                videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height.toFloat()
++            )
++        }
++        // BISUB-END
++
+         if (isFullscreen) {
+             applyVideoOrientation()
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index fdbacc596..808a591e5 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -692,14 +692,17 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 .inflate(R.layout.dialog_bisub_style, null);
+ 
+         final BisubSubtitleView preview = view.findViewById(R.id.bisub_style_preview);
+-        // Lay the preview out at a reference player size and scale the whole
+-        // drawing down: font sizes, wrap points and spacing then match
++        // Lay the preview out at a reference video area (16:9) and scale the
++        // whole drawing down: font sizes, wrap points and spacing then match
+         // fullscreen playback exactly, instead of wrapping early inside the
+-        // narrow dialog box.
+-        preview.setReferenceSize(640f, 400f);
++        // narrow dialog box. The view itself gets no video aspect ratio, so
++        // its own size is the video area — same as the player in landscape.
++        preview.setReferenceSize(640f, 360f);
+         final SeekBar baseScaleBar = view.findViewById(R.id.bisub_style_base_scale);
+ 
+         final SeekBar paddingBar = view.findViewById(R.id.bisub_style_padding);
++        final SeekBar paddingHorizontalBar =
++                view.findViewById(R.id.bisub_style_padding_horizontal);
+         final SeekBar cornerRadiusBar = view.findViewById(R.id.bisub_style_corner_radius);
+         final SeekBar maxWidthBar = view.findViewById(R.id.bisub_style_max_width);
+         final SeekBar positionBar = view.findViewById(R.id.bisub_style_position);
+@@ -709,6 +712,8 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 view.findViewById(R.id.bisub_style_background_opacity_label);
+         final SeekBar originalAlphaBar =
+                 view.findViewById(R.id.bisub_style_original_alpha);
++        final SeekBar translationAlphaBar =
++                view.findViewById(R.id.bisub_style_translation_alpha);
+         final RadioGroup textColorGroup = view.findViewById(R.id.bisub_style_text_color_group);
+         final RadioGroup backgroundGroup = view.findViewById(R.id.bisub_style_background_group);
+ 
+@@ -717,7 +722,8 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+ 
+         baseScaleBar.setProgress(Math.round(initial.baseScale * 10));
+ 
+-        paddingBar.setProgress(Math.round(initial.paddingDp));
++        paddingBar.setProgress(Math.round(initial.paddingVerticalDp));
++        paddingHorizontalBar.setProgress(Math.round(initial.paddingHorizontalDp));
+         cornerRadiusBar.setProgress(Math.round(initial.cornerRadiusDp));
+         maxWidthBar.setProgress(Math.round(initial.maxWidthPercent * 10));
+         positionBar.setProgress(Math.round(initial.positionPercent * 100));
+@@ -725,6 +731,8 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 Math.round(Math.max(0f, Math.min(1f, initial.backgroundOpacity)) * 100));
+         originalAlphaBar.setProgress(
+                 Math.round(Math.max(0.3f, Math.min(1f, initial.originalAlpha)) * 100));
++        translationAlphaBar.setProgress(
++                Math.round(Math.max(0.3f, Math.min(1f, initial.translationAlpha)) * 100));
+         checkColorButton(textColorGroup, initial.textColor);
+         checkBackgroundButton(backgroundGroup, initial.backgroundMode);
+ 
+@@ -751,54 +759,81 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                             Math.max(0.4f, progress / 10.0f),
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, current[0].positionPercent,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_padding) {
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            progress, current[0].cornerRadiusDp,
++                            progress, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, current[0].positionPercent,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
++                } else if (id == R.id.bisub_style_padding_horizontal) {
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].backgroundOpacity,
++                            current[0].paddingVerticalDp, progress,
++                            current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, current[0].positionPercent,
++                            current[0].originalAlpha, current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_corner_radius) {
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, progress,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            progress,
+                             current[0].maxWidthPercent, current[0].positionPercent,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_max_width) {
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             // Map the 5..10 slider range to 0.5..1.0, clamped
+                             // (there is no android:min below API 26)
+                             Math.max(0.5f, progress / 10.0f),
+-                            current[0].positionPercent, current[0].originalAlpha);
++                            current[0].positionPercent, current[0].originalAlpha,
++                            current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_position) {
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, progress / 100.0f,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_background_opacity) {
+                     // Map the 0..100 slider range to 0.0..1.0
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             progress / 100.0f,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, current[0].positionPercent,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
+                 } else if (id == R.id.bisub_style_original_alpha) {
+                     // Map the 30..100 slider range to 0.3..1.0, clamped
+                     current[0] = new BisubPrefs.Style(current[0].baseScale,
+                             current[0].textColor, current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
++                            current[0].maxWidthPercent, current[0].positionPercent,
++                            Math.max(0.3f, Math.min(1f, progress / 100.0f)),
++                            current[0].translationAlpha);
++                } else if (id == R.id.bisub_style_translation_alpha) {
++                    // Map the 30..100 slider range to 0.3..1.0, clamped
++                    current[0] = new BisubPrefs.Style(current[0].baseScale,
++                            current[0].textColor, current[0].backgroundMode,
++                            current[0].backgroundOpacity,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, current[0].positionPercent,
++                            current[0].originalAlpha,
+                             Math.max(0.3f, Math.min(1f, progress / 100.0f)));
+                 } else {
+                     return;
+@@ -815,11 +850,13 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         baseScaleBar.setOnSeekBarChangeListener(barListener);
+ 
+         paddingBar.setOnSeekBarChangeListener(barListener);
++        paddingHorizontalBar.setOnSeekBarChangeListener(barListener);
+         cornerRadiusBar.setOnSeekBarChangeListener(barListener);
+         maxWidthBar.setOnSeekBarChangeListener(barListener);
+         positionBar.setOnSeekBarChangeListener(barListener);
+         backgroundOpacityBar.setOnSeekBarChangeListener(barListener);
+         originalAlphaBar.setOnSeekBarChangeListener(barListener);
++        translationAlphaBar.setOnSeekBarChangeListener(barListener);
+ 
+         // The opacity slider only does something in the solid-background
+         // mode, so it fades out while "no background" is selected instead
+@@ -839,9 +876,10 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+ 
+                             TEXT_COLORS[i], current[0].backgroundMode,
+                             current[0].backgroundOpacity,
+-                            current[0].paddingDp, current[0].cornerRadiusDp,
++                            current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                            current[0].cornerRadiusDp,
+                             current[0].maxWidthPercent, current[0].positionPercent,
+-                            current[0].originalAlpha);
++                            current[0].originalAlpha, current[0].translationAlpha);
+                     updatePreview.run();
+                     return;
+                 }
+@@ -855,9 +893,10 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+ 
+                     current[0].textColor, mode,
+                     current[0].backgroundOpacity,
+-                    current[0].paddingDp, current[0].cornerRadiusDp,
++                    current[0].paddingVerticalDp, current[0].paddingHorizontalDp,
++                    current[0].cornerRadiusDp,
+                     current[0].maxWidthPercent, current[0].positionPercent,
+-                    current[0].originalAlpha);
++                    current[0].originalAlpha, current[0].translationAlpha);
+             syncOpacityEnabled.run();
+             updatePreview.run();
+         });
+diff --git a/app/src/main/res/layout/dialog_bisub_style.xml b/app/src/main/res/layout/dialog_bisub_style.xml
+index 92e6e12c7..ad15f3e43 100644
+--- a/app/src/main/res/layout/dialog_bisub_style.xml
++++ b/app/src/main/res/layout/dialog_bisub_style.xml
+@@ -124,6 +124,18 @@
+             android:layout_height="wrap_content"
+             android:max="100" />
+ 
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_translation_alpha" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_translation_alpha"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="100" />
++
+         <org.schabi.newpipe.views.NewPipeTextView
+             android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+@@ -136,6 +148,18 @@
+             android:layout_height="wrap_content"
+             android:max="16" />
+ 
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="12dp"
++            android:text="@string/bisub_style_padding_horizontal" />
++
++        <SeekBar
++            android:id="@+id/bisub_style_padding_horizontal"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:max="16" />
++
+         <org.schabi.newpipe.views.NewPipeTextView
+             android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 593c34c4d..d9545122e 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1265,6 +1265,7 @@
+     <string name="bisub_style_text_color">文字颜色</string>
+     <string name="bisub_style_background">背景</string>
+     <string name="bisub_style_padding">上下内边距</string>
++    <string name="bisub_style_padding_horizontal">左右内边距</string>
+     <string name="bisub_style_corner_radius">圆角半径</string>
+     <string name="bisub_style_max_width">文字最大宽度</string>
+     <string name="bisub_style_position">垂直位置</string>
+@@ -1272,6 +1273,7 @@
+     <string name="bisub_style_bg_none">无背景（描边）</string>
+     <string name="bisub_style_background_opacity">背景不透明度</string>
+     <string name="bisub_style_original_alpha">原文不透明度</string>
++    <string name="bisub_style_translation_alpha">译文不透明度</string>
+     <string name="bisub_style_preview_original">The hardest problem ever set</string>
+     <string name="bisub_style_preview_translation">史上最难的题</string>
+     <string name="bisub_button_starting">准备中…</string>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 6b80351ce..334297483 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1905,10 +1905,13 @@
+     <string name="bisub_style_background_key">bisub_style_background</string>
+     <string name="bisub_style_background_opacity_key">bisub_style_background_opacity</string>
+     <string name="bisub_style_padding_key">bisub_style_padding</string>
++    <string name="bisub_style_padding_vertical_key">bisub_style_padding_vertical</string>
++    <string name="bisub_style_padding_horizontal_key">bisub_style_padding_horizontal</string>
+     <string name="bisub_style_corner_radius_key">bisub_style_corner_radius</string>
+     <string name="bisub_style_max_width_key">bisub_style_max_width</string>
+     <string name="bisub_style_position_key">bisub_style_position</string>
+     <string name="bisub_style_original_alpha_key">bisub_style_original_alpha</string>
++    <string name="bisub_style_translation_alpha_key">bisub_style_translation_alpha</string>
+ 
+     <string-array name="bisub_provider_values">
+         <item>custom</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4f3f973b7..fa43eeba0 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1268,6 +1268,7 @@
+     <string name="bisub_style_text_color">Text color</string>
+     <string name="bisub_style_background">Background</string>
+     <string name="bisub_style_padding">Vertical padding</string>
++    <string name="bisub_style_padding_horizontal">Horizontal padding</string>
+     <string name="bisub_style_corner_radius">Corner radius</string>
+     <string name="bisub_style_max_width">Maximum text width</string>
+     <string name="bisub_style_position">Vertical position</string>
+@@ -1275,6 +1276,7 @@
+     <string name="bisub_style_bg_none">None (outline)</string>
+     <string name="bisub_style_background_opacity">Background opacity</string>
+     <string name="bisub_style_original_alpha">Original text opacity</string>
++    <string name="bisub_style_translation_alpha">Translation opacity</string>
+     <string name="bisub_style_preview_original">The hardest problem ever set</string>
+     <string name="bisub_style_preview_translation">史上最难的题</string>
+     <string name="bisub_button_starting">Starting…</string>
+-- 
+2.54.0.windows.1
+
