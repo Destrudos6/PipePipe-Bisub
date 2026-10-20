@@ -1,0 +1,56 @@
+From dba8828ff8d0afd316e5d08d01a98e6f9cc30355 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 18:52:53 +0800
+Subject: [PATCH 13/14] Hide engine-irrelevant settings fields per provider
+
+Google and Microsoft need nothing, DeepL needs only its API key and
+LibreTranslate its server address (plus an optional key), so the base
+URL, API key and model fields are now hidden unless the active profile
+actually uses them, instead of showing confusing 'not needed'
+summaries.
+---
+ .../settings/BisubSettingsFragment.java       | 20 +++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 064e3097d..3b3f7721d 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -279,20 +279,28 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+ 
+         final boolean traditional = SubtitleTranslator.isTraditionalEngine(
+                 active == null ? null : active.provider);
++        final String provider = active == null ? null : active.provider;
++        // Only the fields the selected engine actually uses stay visible:
++        // Google/Microsoft need nothing, DeepL needs its key, LibreTranslate
++        // needs its server address (plus an optional key), and the chat
++        // models need the full base URL, key and model name.
++        final boolean showBaseUrl = !traditional || "libre".equals(provider);
++        final boolean showApiKey = !traditional || "deepl".equals(provider)
++                || "libre".equals(provider);
++        final boolean showModel = !traditional;
+         final EditTextPreference baseUrlPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
++        baseUrlPref.setVisible(showBaseUrl);
+         baseUrlPref.setText(active == null ? null : active.baseUrl);
+-        baseUrlPref.setSummary(traditional
+-                ? getString(R.string.bisub_base_url_traditional_summary)
+-                : getString(R.string.bisub_base_url_summary));
++        baseUrlPref.setSummary(getString(R.string.bisub_base_url_summary));
+         final EditTextPreference modelPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_model_key);
++        modelPref.setVisible(showModel);
+         modelPref.setText(active == null ? null : active.model);
+-        modelPref.setSummary(traditional
+-                ? getString(R.string.bisub_model_traditional_summary)
+-                : getString(R.string.bisub_model_summary));
++        modelPref.setSummary(getString(R.string.bisub_model_summary));
+         final EditTextPreference apiKeyPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_api_key_key);
++        apiKeyPref.setVisible(showApiKey);
+         apiKeyPref.setText(active == null ? null : active.apiKey);
+         apiKeyPref.setSummary(active != null && !isBlank(active.apiKey)
+                 ? getString(R.string.bisub_api_key_set)
+-- 
+2.54.0.windows.1
+
