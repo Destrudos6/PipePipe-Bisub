@@ -1,0 +1,333 @@
+From 23ea50da6aa9814274471928f81b6f2fbb698e3b Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 19:11:20 +0800
+Subject: [PATCH] Ask for the provider before translating and offer
+ re-translation
+
+Tapping the Bilingual control used to start translating immediately
+with the active profile. It now opens a single-choice picker of the
+configured profiles first, so switching the engine for one video does
+not require a detour through the settings.
+
+- the picker marks entries that already cached this video and entries
+  whose configuration is incomplete (tapping those explains instead
+  of failing silently)
+- picking a profile activates it and then starts the translation, so
+  the player still resolves the bilingual track through the active
+  configuration and finds the freshly cached file
+- picking an already-cached profile asks whether to re-translate;
+  confirming deletes the old cache files (vtt/done/meta) and starts
+  over, replacing the previous translation
+- BisubPrefs.configOf builds a Config from any profile regardless of
+  which one is active; load() delegates to it
+- BisubManager gains isTranslationCached, deleteTranslationCache and
+  startTranslationWithProfile on top of a cfg-explicit
+  resolveCacheTarget overload
+---
+ .../schabi/newpipe/bisub/BisubManager.java    | 76 +++++++++++++++-
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 35 ++++++--
+ .../fragments/detail/VideoDetailFragment.java | 86 ++++++++++++++++++-
+ app/src/main/res/values-zh-rCN/strings.xml    |  8 ++
+ app/src/main/res/values/strings.xml           |  8 ++
+ 5 files changed, 200 insertions(+), 13 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index 8cfe948f9..ba12c604a 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -273,7 +273,21 @@ public final class BisubManager {
+      */
+     @Nullable
+     private CacheTarget resolveCacheTarget(@NonNull final StreamInfo info) {
+-        final BisubPrefs.Config cfg = BisubPrefs.load(appContext);
++        return resolveCacheTarget(info, BisubPrefs.load(appContext));
++    }
++
++    /**
++     * Same as {@link #resolveCacheTarget(StreamInfo)} but with an explicit
++     * configuration, so the cache of a video can be checked or started for
++     * a profile that is not the active one.
++     *
++     * @param info the stream info of the video
++     * @param cfg  the configuration to resolve with
++     * @return the target, or {@code null} when unusable or subtitle-less
++     */
++    @Nullable
++    private CacheTarget resolveCacheTarget(@NonNull final StreamInfo info,
++                                           @NonNull final BisubPrefs.Config cfg) {
+         if (!cfg.isUsable()) {
+             Log.i(TAG, "Bisub is disabled or the configuration is incomplete, skipping");
+             BisubLog.i("Cache target: unusable configuration (enabled=" + cfg.enabled
+@@ -401,6 +415,66 @@ public final class BisubManager {
+         }));
+     }
+ 
++    /**
++     * Checks whether a video already has a completed bilingual subtitle
++     * that the given profile would produce, without starting anything.
++     * Only touches in-memory data and file existence checks, so it is safe
++     * on the main thread.
++     *
++     * @param info    the stream info of the video
++     * @param profile the profile whose cache to check, or {@code null}
++     *                for the empty (never usable) configuration
++     * @return whether the completed file for that profile is on disk
++     */
++    public boolean isTranslationCached(@NonNull final StreamInfo info,
++                                       @Nullable final BisubPrefs.ProviderProfile profile) {
++        final CacheTarget target = resolveCacheTarget(info,
++                BisubPrefs.configOf(appContext, profile));
++        return target != null && isDone(target);
++    }
++
++    /**
++     * Deletes the completed bilingual subtitle that the given profile
++     * produced for a video (subtitle file, done marker and metadata
++     * sidecar), so the video can be translated again.
++     *
++     * @param info    the stream info of the video
++     * @param profile the profile whose cache to delete
++     * @return whether the subtitle file is gone
++     */
++    public boolean deleteTranslationCache(@NonNull final StreamInfo info,
++                                          @Nullable final BisubPrefs.ProviderProfile profile) {
++        final CacheTarget target = resolveCacheTarget(info,
++                BisubPrefs.configOf(appContext, profile));
++        if (target == null) {
++            return false;
++        }
++        BisubLog.i("Cache: deleting the bilingual subtitle of video "
++                + target.videoId + " for profile '" + profile.name
++                + "' to re-translate it");
++        sibling(target.cacheFile, ".done").delete();
++        sibling(target.cacheFile, ".meta").delete();
++        return target.cacheFile.delete() || !target.cacheFile.exists();
++    }
++
++    /**
++     * Makes the given profile the active one and starts (or joins) the
++     * background translation of a video with it. Activating the profile
++     * keeps everything consistent: the player resolves the bilingual track
++     * through the active configuration, so the freshly cached file is the
++     * one playback will find.
++     *
++     * @param info     the stream info of the video to translate
++     * @param listener the listener receiving progress and the final result
++     * @param profile  the profile to translate with and to activate
++     */
++    public void startTranslationWithProfile(@NonNull final StreamInfo info,
++                                            @NonNull final ButtonListener listener,
++                                            @NonNull final BisubPrefs.ProviderProfile profile) {
++        BisubPrefs.setActiveProfileId(appContext, profile.id);
++        startTranslation(info, listener);
++    }
++
+     /**
+      * Removes a listener from every translation it is attached to. Callers
+      * must invoke this when their view hierarchy goes away, because the
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index b1162bb87..75981b1c6 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -329,22 +329,39 @@ public final class BisubPrefs {
+      */
+     @NonNull
+     public static Config load(@NonNull final Context context) {
++        return configOf(context, getActiveProfile(context));
++    }
++
++    /**
++     * Builds the configuration of one specific provider profile, ignoring
++     * which profile is active: the enable switch and the languages are
++     * global, while the connection fields and the request tuning come from
++     * the given profile. Used to check what a translation with that
++     * profile would use, e.g. whether it already cached a video.
++     *
++     * @param context any context
++     * @param profile the profile to build the configuration from, or
++     *                {@code null} for the empty configuration
++     * @return the configuration snapshot
++     */
++    @NonNull
++    public static Config configOf(@NonNull final Context context,
++                                  @Nullable final ProviderProfile profile) {
+         final SharedPreferences prefs =
+                 PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
+-        final ProviderProfile active = getActiveProfile(context);
+         return new Config(
+                 prefs.getBoolean(context.getString(R.string.bisub_enable_key), false),
+-                active == null ? null : active.provider,
+-                active == null ? null : active.baseUrl,
+-                active == null ? null : active.apiKey,
+-                active == null ? null : active.model,
++                profile == null ? null : profile.provider,
++                profile == null ? null : profile.baseUrl,
++                profile == null ? null : profile.apiKey,
++                profile == null ? null : profile.model,
+                 prefs.getString(context.getString(R.string.bisub_target_lang_key), null),
+                 prefs.getString(context.getString(R.string.bisub_source_lang_key), null),
+-                active == null ? Config.CONCURRENCY_DEFAULT
+-                        : clampInt(active.concurrency, Config.CONCURRENCY_MIN,
++                profile == null ? Config.CONCURRENCY_DEFAULT
++                        : clampInt(profile.concurrency, Config.CONCURRENCY_MIN,
+                         Config.CONCURRENCY_MAX, Config.CONCURRENCY_DEFAULT),
+-                active == null ? Config.BATCH_SIZE_DEFAULT
+-                        : clampInt(active.batchSize, Config.BATCH_SIZE_MIN,
++                profile == null ? Config.BATCH_SIZE_DEFAULT
++                        : clampInt(profile.batchSize, Config.BATCH_SIZE_MIN,
+                         Config.BATCH_SIZE_MAX, Config.BATCH_SIZE_DEFAULT));
+     }
+ 
+diff --git a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+index 83a9e1211..c2fb86ed9 100644
+--- a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+@@ -56,6 +56,7 @@ import io.reactivex.rxjava3.core.Single;
+ import org.schabi.newpipe.App;
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.BisubManager;
++import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.database.stream.model.StreamEntity;
+ import org.schabi.newpipe.databinding.FragmentVideoDetailBinding;
+ import org.schabi.newpipe.download.DownloadDialog;
+@@ -289,6 +290,83 @@ public final class VideoDetailFragment
+                 }
+             };
+     // BISUB-END
++
++    // BISUB-BEGIN: provider picker for the "Bilingual" detail control.
++    // The single-choice list marks profiles that already cached this
++    // video; picking one activates it and starts the translation, while
++    // cached ones ask first whether to re-translate and replace.
++    private void showBisubProfileDialog() {
++        final Context context = getContext();
++        if (context == null || currentInfo == null) {
++            return;
++        }
++        final List<BisubPrefs.ProviderProfile> profiles =
++                BisubPrefs.loadProfiles(context);
++        if (profiles.isEmpty()) {
++            new AlertDialog.Builder(context)
++                    .setTitle(R.string.bisub_picker_title)
++                    .setMessage(R.string.bisub_picker_empty)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show();
++            return;
++        }
++        final BisubManager manager = BisubManager.getInstance(context);
++        final String activeId = BisubPrefs.getActiveProfileId(context);
++        final String[] labels = new String[profiles.size()];
++        final boolean[] cached = new boolean[profiles.size()];
++        int checked = 0;
++        for (int i = 0; i < profiles.size(); i++) {
++            final BisubPrefs.ProviderProfile profile = profiles.get(i);
++            if (profile.id.equals(activeId)) {
++                checked = i;
++            }
++            final boolean usable = BisubPrefs.configOf(context, profile).isUsable();
++            cached[i] = usable && manager.isTranslationCached(currentInfo, profile);
++            labels[i] = profile.name
++                    + (cached[i]
++                        ? getString(R.string.bisub_picker_cached_suffix) : "")
++                    + (!usable
++                        ? getString(R.string.bisub_picker_incomplete_suffix) : "");
++        }
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_picker_title)
++                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
++                    dialog.dismiss();
++                    final BisubPrefs.ProviderProfile profile = profiles.get(which);
++                    if (!BisubPrefs.configOf(context, profile).isUsable()) {
++                        Toast.makeText(context, R.string.bisub_picker_incomplete_toast,
++                                Toast.LENGTH_SHORT).show();
++                        return;
++                    }
++                    if (cached[which]) {
++                        confirmBisubRetranslate(profile);
++                    } else {
++                        manager.startTranslationWithProfile(
++                                currentInfo, bisubButtonListener, profile);
++                    }
++                })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private void confirmBisubRetranslate(final BisubPrefs.ProviderProfile profile) {
++        final Context context = getContext();
++        if (context == null || currentInfo == null) {
++            return;
++        }
++        final BisubManager manager = BisubManager.getInstance(context);
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_retranslate_title)
++                .setMessage(getString(R.string.bisub_retranslate_message, profile.name))
++                .setPositiveButton(R.string.bisub_retranslate_confirm, (dialog, which) -> {
++                    manager.deleteTranslationCache(currentInfo, profile);
++                    manager.startTranslationWithProfile(
++                            currentInfo, bisubButtonListener, profile);
++                })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++    // BISUB-END
+     @NonNull
+     private final CompositeDisposable disposables = new CompositeDisposable();
+     @Nullable
+@@ -620,10 +698,12 @@ public final class VideoDetailFragment
+                 this.openDownloadDialog();
+             }
+         } else if (id == R.id.detail_controls_bisub) {
+-            // BISUB-BEGIN: start (or join) the background translation
++            // BISUB-BEGIN: let the user pick which configured provider
++            // translates this video instead of starting immediately;
++            // videos already cached with the picked provider offer a
++            // re-translation that replaces the old cache
+             if (currentInfo != null) {
+-                BisubManager.getInstance(requireContext())
+-                        .startTranslation(currentInfo, bisubButtonListener);
++                showBisubProfileDialog();
+             }
+             // BISUB-END
+         } else if (id == R.id.detail_controls_share) {
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index a86424f06..c343cca1d 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1278,6 +1278,14 @@
+     <string name="bisub_toast_ready">双语字幕已生成（%1$d/%2$d 句）。重新打开视频，在字幕菜单选择“%3$s”</string>
+     <string name="bisub_button_idle">双语</string>
+     <string name="bisub_button_progress">%1$d%%</string>
++    <string name="bisub_picker_title">选择翻译服务</string>
++    <string name="bisub_picker_empty">尚未配置任何翻译服务，请先在双语字幕设置中添加。</string>
++    <string name="bisub_picker_cached_suffix">（已缓存）</string>
++    <string name="bisub_picker_incomplete_suffix">（未配置完整）</string>
++    <string name="bisub_picker_incomplete_toast">该服务配置不完整，请在双语字幕设置中补全。</string>
++    <string name="bisub_retranslate_title">重新翻译？</string>
++    <string name="bisub_retranslate_message">“%1$s”已有此视频的双语字幕缓存，重新翻译将替换旧缓存。</string>
++    <string name="bisub_retranslate_confirm">重新翻译</string>
+     <string name="bisub_button_done">已生成</string>
+     <string name="bisub_button_failed">重试</string>
+     <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index fe9362759..96935f8df 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1281,6 +1281,14 @@
+     <string name="bisub_toast_ready">Bilingual subtitles ready (%1$d of %2$d lines). Reopen the video and pick “%3$s” in the subtitle menu.</string>
+     <string name="bisub_button_idle">Bilingual</string>
+     <string name="bisub_button_progress">%1$d%%</string>
++    <string name="bisub_picker_title">Translate with</string>
++    <string name="bisub_picker_empty">No translation provider is configured yet. Add one in the bilingual subtitle settings first.</string>
++    <string name="bisub_picker_cached_suffix"> (cached)</string>
++    <string name="bisub_picker_incomplete_suffix"> (incomplete)</string>
++    <string name="bisub_picker_incomplete_toast">This provider is incompletely configured. Finish it in the bilingual subtitle settings.</string>
++    <string name="bisub_retranslate_title">Re-translate?</string>
++    <string name="bisub_retranslate_message">“%1$s” already has a bilingual subtitle for this video. Re-translating replaces the old one.</string>
++    <string name="bisub_retranslate_confirm">Re-translate</string>
+     <string name="bisub_button_done">Done</string>
+     <string name="bisub_button_failed">Retry</string>
+     <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
+-- 
+2.54.0.windows.1
+
