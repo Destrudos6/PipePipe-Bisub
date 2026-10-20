@@ -61,7 +61,7 @@ jobs:
           cd src/PipePipeClient
           git config user.name "bisub-bot"
           git config user.email "bot@users.noreply.github.com"
-          git am ../../../patches/*.patch
+          git am "$GITHUB_WORKSPACE"/patches/*.patch
 
       - name: Build debug APK
         working-directory: src/PipePipeClient
