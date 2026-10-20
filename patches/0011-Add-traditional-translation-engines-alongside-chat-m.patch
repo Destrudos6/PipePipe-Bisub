@@ -1,4 +1,4 @@
-From cb8985918478f6ea64d7e67bebd9ee8291b88275 Mon Sep 17 00:00:00 2001
+From 3a041a2dc8ec8ffa33fe0ff03a3fa4c27b438bba Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 16:03:32 +0800
 Subject: [PATCH 11/11] Add traditional translation engines alongside chat
@@ -146,7 +146,7 @@ index 7f33b5118..d2370454e 100644
  
          private static boolean isNullOrBlank(@Nullable final String s) {
 diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
-index e2de5a07d..77cafc921 100644
+index e2de5a07d..c70ce0a27 100644
 --- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
 +++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
 @@ -12,12 +12,16 @@ import org.schabi.newpipe.bisub.BisubPrefs.Config;
@@ -312,7 +312,7 @@ index e2de5a07d..77cafc921 100644
 +     * @return whether the provider is a traditional machine translation
 +     *         engine instead of an OpenAI-compatible chat model
 +     */
-+    static boolean isTraditionalEngine(@Nullable final String provider) {
++    public static boolean isTraditionalEngine(@Nullable final String provider) {
 +        return "google".equals(provider) || "microsoft".equals(provider)
 +                || "deepl".equals(provider) || "libre".equals(provider);
 +    }
