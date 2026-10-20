@@ -1,6 +1,6 @@
 # PipePipe Bisub — LLM 双语字幕补丁工程
 
-给 [PipePipe](https://github.com/InfinityLoop1309/PipePipe)（NewPipe 知名分支）加上「LLM 实时翻译双语字幕」的 patch 集合。
+给 [PipePipe](https://github.com/InfinityLoop1308/PipePipe)（NewPipe 知名分支）加上「LLM 实时翻译双语字幕」的 patch 集合。
 
 不 fork、不长期维护整个项目——只维护最小的补丁集，可手动/定期跟随上游重新构建。上游失效时自动收到 issue 通知。
 

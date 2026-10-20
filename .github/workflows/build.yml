@@ -39,13 +39,13 @@ jobs:
       # under the same parent directory.
       - name: Clone upstream PipePipeClient
         run: |
-          git clone https://github.com/InfinityLoop1309/PipePipeClient.git src/PipePipeClient
+          git clone https://github.com/InfinityLoop1308/PipePipeClient.git src/PipePipeClient
           cd src/PipePipeClient
           git checkout "$CLIENT_REF"
 
       - name: Clone upstream PipePipeExtractor
         run: |
-          git clone https://github.com/InfinityLoop1309/PipePipeExtractor.git src/PipePipeExtractor
+          git clone https://github.com/InfinityLoop1308/PipePipeExtractor.git src/PipePipeExtractor
           cd src/PipePipeExtractor
           git checkout "$EXTRACTOR_REF"
 

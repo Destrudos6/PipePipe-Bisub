@@ -14,8 +14,8 @@
 
 set -euo pipefail
 
-CLIENT_URL="https://github.com/InfinityLoop1309/PipePipeClient.git"
-EXTRACTOR_URL="https://github.com/InfinityLoop1309/PipePipeExtractor.git"
+CLIENT_URL="https://github.com/InfinityLoop1308/PipePipeClient.git"
+EXTRACTOR_URL="https://github.com/InfinityLoop1308/PipePipeExtractor.git"
 DEFAULT_CLIENT_REF="v5.5.0-beta3"
 DEFAULT_EXTRACTOR_REF="73442076c671ae09bd5c0f9635932a5a67bdd609"
 
