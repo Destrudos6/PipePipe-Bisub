@@ -1,7 +1,7 @@
 From 147a269e589b77476bafba4501ab3eb4a8724f8c Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 14:58:04 +0800
-Subject: [PATCH 10/11] Overhaul the translation pipeline following proven
+Subject: [PATCH 10/12] Overhaul the translation pipeline following proven
  open-source tools
 
 Lessons borrowed from pyvideotrans (19k stars) and YouDub-webui

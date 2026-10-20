@@ -1,0 +1,776 @@
+From c5cf4daefad5047c3d1697ceebf0e6b52e4a44f9 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 16:56:06 +0800
+Subject: [PATCH 12/12] Add a bisub debug log with in-app viewer and failure
+ dumps
+
+Every pipeline stage now records into a 2000-entry in-memory ring
+buffer mirrored to logcat under one tag (adb logcat -s Bisub):
+cache target resolution and track picking, per-chunk engine requests
+with line/char counts, HTTP status codes with elapsed time and error
+body excerpts, batch retries with stack traces, and cache writes.
+The settings screen gains a Debug category with a viewer dialog
+(monospace, copy/clear), and every failed translation dumps the whole
+buffer to bisub/logs/last-failure.txt so the evidence survives later
+activity.
+---
+ .../org/schabi/newpipe/bisub/BisubLog.java    | 232 ++++++++++++++++++
+ .../schabi/newpipe/bisub/BisubManager.java    |  45 ++++
+ .../newpipe/bisub/SubtitleTranslator.java     |  71 +++++-
+ .../settings/BisubSettingsFragment.java       |  67 +++++
+ app/src/main/res/values-zh-rCN/strings.xml    |   8 +
+ app/src/main/res/values/settings_keys.xml     |   1 +
+ app/src/main/res/values/strings.xml           |   8 +
+ app/src/main/res/xml/bisub_settings.xml       |  12 +
+ 8 files changed, 440 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubLog.java
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubLog.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubLog.java
+new file mode 100644
+index 000000000..3ac3bbc1b
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubLog.java
+@@ -0,0 +1,232 @@
++package org.schabi.newpipe.bisub;
++
++import android.content.Context;
++import android.util.Log;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.text.SimpleDateFormat;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * In-memory ring buffer of bisub pipeline events, mirrored to logcat under
++ * one tag ({@code Bisub}) so {@code adb logcat -s Bisub} shows everything.
++ * The buffer keeps the most recent entries across videos and survives
++ * fragment lifecycles, which makes it viewable in the settings screen after
++ * a failure happened; every failed translation additionally dumps the whole
++ * buffer to {@code bisub/logs/last-failure.txt}.
++ *
++ * <p>All methods are thread-safe; logging never throws and never slows the
++ * pipeline down measurably (an append is a few microseconds).</p>
++ */
++public final class BisubLog {
++
++    /** Everything is mirrored to logcat under this single tag. */
++    private static final String TAG = "Bisub";
++    /** Ring buffer capacity: enough for a full video of engine requests. */
++    private static final int MAX_ENTRIES = 2000;
++    /** Stack traces longer than this are cut off in the formatted output. */
++    private static final int MAX_THROWABLE_CHARS = 1200;
++    /** A single message longer than this is truncated (protects the buffer). */
++    private static final int MAX_MESSAGE_CHARS = 1000;
++
++    private static final ArrayDeque<Entry> BUFFER = new ArrayDeque<>();
++    private static final SimpleDateFormat TIME_FORMAT =
++            new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
++
++    private BisubLog() { }
++
++    /** One log record: when it happened, how severe, and the message. */
++    public static final class Entry {
++        /** Wall-clock time of the event in epoch milliseconds. */
++        public final long time;
++        /** Severity: one of {@code 'I'}, {@code 'W'} or {@code 'E'}. */
++        public final char level;
++        /** The message, never {@code null}, already single-line. */
++        public final String message;
++
++        Entry(final long time, final char level, @NonNull final String message) {
++            this.time = time;
++            this.level = level;
++            this.message = message;
++        }
++    }
++
++    /**
++     * Records an informational event.
++     *
++     * @param message the event description
++     */
++    public static void i(@NonNull final String message) {
++        append('I', message);
++    }
++
++    /**
++     * Records a warning.
++     *
++     * @param message the warning description
++     */
++    public static void w(@NonNull final String message) {
++        append('W', message);
++    }
++
++    /**
++     * Records a warning together with the exception that caused it.
++     *
++     * @param message the warning description
++     * @param error   the exception, or {@code null} for none
++     */
++    public static void w(@NonNull final String message, @Nullable final Throwable error) {
++        append('W', error == null ? message : message + "\n" + describe(error));
++    }
++
++    /**
++     * Records an error.
++     *
++     * @param message the error description
++     */
++    public static void e(@NonNull final String message) {
++        append('E', message);
++    }
++
++    /**
++     * Records an error together with the exception that caused it.
++     *
++     * @param message the error description
++     * @param error   the exception, or {@code null} for none
++     */
++    public static void e(@NonNull final String message, @Nullable final Throwable error) {
++        append('E', error == null ? message : message + "\n" + describe(error));
++    }
++
++    private static void append(final char level, @NonNull final String message) {
++        final String trimmed = truncate(message, MAX_MESSAGE_CHARS);
++        final Entry entry = new Entry(System.currentTimeMillis(), level, trimmed);
++        synchronized (BUFFER) {
++            BUFFER.addLast(entry);
++            while (BUFFER.size() > MAX_ENTRIES) {
++                BUFFER.removeFirst();
++            }
++        }
++        Log.println(logcatPriority(level), TAG, trimmed);
++    }
++
++    private static int logcatPriority(final char level) {
++        if (level == 'E') {
++            return Log.ERROR;
++        }
++        if (level == 'W') {
++            return Log.WARN;
++        }
++        return Log.INFO;
++    }
++
++    /**
++     * @return an immutable copy of the buffered entries, oldest first
++     */
++    @NonNull
++    public static List<Entry> snapshot() {
++        synchronized (BUFFER) {
++            return new ArrayList<>(BUFFER);
++        }
++    }
++
++    /**
++     * Empties the buffer; logcat output is not affected.
++     */
++    public static void clear() {
++        synchronized (BUFFER) {
++            BUFFER.clear();
++        }
++    }
++
++    /**
++     * Formats buffered entries as shareable text: one line per event with
++     * timestamp and level, stack traces indented below their message.
++     *
++     * @param entries the entries to format, as returned by {@link #snapshot()}
++     * @return the formatted log, empty when there are no entries
++     */
++    @NonNull
++    public static String formatSnapshot(@NonNull final List<Entry> entries) {
++        if (entries.isEmpty()) {
++            return "";
++        }
++        final StringBuilder text = new StringBuilder();
++        for (final Entry entry : entries) {
++            synchronized (TIME_FORMAT) {
++                text.append(TIME_FORMAT.format(new Date(entry.time)))
++                        .append(' ').append(entry.level).append(' ');
++            }
++            final String body = entry.message.replace("\n", "\n    ");
++            text.append(body).append('\n');
++        }
++        return text.toString();
++    }
++
++    /**
++     * Writes the current buffer to {@code bisub/logs/last-failure.txt},
++     * overwriting any previous failure dump. Called whenever a translation
++     * fails, so the log of what went wrong survives later activity that
++     * would eventually evict it from the ring buffer.
++     *
++     * @param context any context; the application context is used
++     * @return the file the log was written to, or {@code null} on failure
++     */
++    @Nullable
++    public static File persistLastFailure(@NonNull final Context context) {
++        final List<Entry> entries = snapshot();
++        if (entries.isEmpty()) {
++            return null;
++        }
++        final File dir = new File(new File(
++                context.getApplicationContext().getFilesDir(), "bisub"), "logs");
++        try {
++            if (!dir.exists() && !dir.mkdirs()) {
++                Log.w(TAG, "Could not create the bisub log directory " + dir);
++                return null;
++            }
++            final File file = new File(dir, "last-failure.txt");
++            final String header = "bisub debug log - dump of the last failure\n"
++                    + "written " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
++                    .format(new Date()) + ", " + entries.size() + " entries\n\n";
++            Files.write(file.toPath(), (header + formatSnapshot(entries))
++                    .getBytes(StandardCharsets.UTF_8));
++            return file;
++        } catch (final IOException e) {
++            Log.w(TAG, "Could not write the bisub failure log", e);
++            return null;
++        }
++    }
++
++    /**
++     * @param error the throwable to describe
++     * @return class name, message and a bounded stack trace, single string
++     */
++    @NonNull
++    private static String describe(@NonNull final Throwable error) {
++        String text = error.getClass().getSimpleName() + ": " + error.getMessage();
++        for (final StackTraceElement frame : error.getStackTrace()) {
++            text += "\n    at " + frame;
++        }
++        return truncate(text, MAX_THROWABLE_CHARS);
++    }
++
++    @NonNull
++    private static String truncate(@NonNull final String text, final int limit) {
++        String flat = text.replace('\r', ' ');
++        if (flat.length() > limit) {
++            flat = flat.substring(0, limit) + "…(truncated)";
++        }
++        return flat;
++    }
++}
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index c08c35495..8cfe948f9 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -276,6 +276,9 @@ public final class BisubManager {
+         final BisubPrefs.Config cfg = BisubPrefs.load(appContext);
+         if (!cfg.isUsable()) {
+             Log.i(TAG, "Bisub is disabled or the configuration is incomplete, skipping");
++            BisubLog.i("Cache target: unusable configuration (enabled=" + cfg.enabled
++                    + ", provider=" + cfg.provider + ", target=" + cfg.targetLanguage
++                    + "), skipping video " + info.getId());
+             return null;
+         }
+         // Only URL streams that are not delivered as torrents can be
+@@ -293,9 +296,16 @@ public final class BisubManager {
+         }
+         if (candidates.isEmpty()) {
+             Log.i(TAG, "This video has no usable URL subtitle tracks, skipping");
++            BisubLog.i("Cache target: video " + info.getId() + " has no usable"
++                    + " URL subtitle tracks (" + (allSubtitles == null ? 0
++                    : allSubtitles.size()) + " in total), skipping");
+             return null;
+         }
+         final SubtitlesStream source = pickStream(candidates, cfg.sourceLanguage);
++        BisubLog.i("Cache target: video " + info.getId() + " picked track '"
++                + source.getLanguageTag() + "' (auto=" + source.isAutoGenerated()
++                + ") out of " + candidates.size() + " candidate track(s), engine '"
++                + cfg.provider + "'");
+         final String cacheKey = sha256Hex(CACHE_VERSION + "|" + info.getId() + "|"
+                 + source.getLanguageTag() + "|" + source.isAutoGenerated()
+                 + "|" + cfg.provider + "|" + cfg.model + "|" + cfg.targetLanguage);
+@@ -334,10 +344,12 @@ public final class BisubManager {
+             return;
+         }
+         if (isDone(target)) {
++            BisubLog.i("Button: video " + target.videoId + " is already translated");
+             listener.onFinished(true);
+             return;
+         }
+         if (!IN_FLIGHT.containsKey(target.cacheKey)) {
++            BisubLog.i("Button: video " + target.videoId + " is idle, waiting for a tap");
+             listener.onIdle();
+             return;
+         }
+@@ -368,12 +380,20 @@ public final class BisubManager {
+         registerListener(target, listener);
+         if (!alreadyRunning) {
+             MAIN.post(listener::onStarting);
++            BisubLog.i("Translation: starting video " + target.videoId
++                    + " with engine '" + target.cfg.provider + "', concurrency "
++                    + target.cfg.concurrency + ", batch size " + target.cfg.batchSize);
+         }
+         IN_FLIGHT.computeIfAbsent(target.cacheKey, key -> WORKER.submit(() -> {
+             try {
+                 generateAndCache(target);
+             } catch (final Exception e) {
+                 Log.w(TAG, "Bilingual subtitle generation failed", e);
++                BisubLog.e("Translation: video " + target.videoId + " failed", e);
++                final File dump = BisubLog.persistLastFailure(appContext);
++                if (dump != null) {
++                    BisubLog.i("Translation: failure log dumped to " + dump.getName());
++                }
+                 notifyFinished(key, false);
+             } finally {
+                 IN_FLIGHT.remove(key);
+@@ -410,6 +430,8 @@ public final class BisubManager {
+         }
+         Log.i(TAG, "Bilingual subtitle cache hit: " + target.cacheFile.getName()
+                 + " (" + info.getId() + ")");
++        BisubLog.i("Playback: video " + info.getId()
++                + " resolves to the cached bilingual file " + target.cacheFile.getName());
+         return Uri.fromFile(target.cacheFile);
+     }
+ 
+@@ -665,6 +687,12 @@ public final class BisubManager {
+             Log.i(TAG, "Subtitle track could not be parsed into any cues (format="
+                     + target.source.getFormat() + ", auto=" + target.source.isAutoGenerated()
+                     + "), skipping");
++            BisubLog.e("Translation: video " + target.videoId
++                    + " - subtitle track could not be parsed into any cues (format="
++                    + target.source.getFormat() + ", auto="
++                    + target.source.isAutoGenerated() + ", downloaded "
++                    + original.length() + " chars)");
++            BisubLog.persistLastFailure(appContext);
+             notifyFinished(target.cacheKey, false);
+             return;
+         }
+@@ -730,6 +758,9 @@ public final class BisubManager {
+             start = end;
+         }
+         pool.shutdown();
++        BisubLog.i("Translation: video " + target.videoId + " - " + cues.size()
++                + " cues, " + uniqueTexts.size() + " unique lines split into "
++                + futures.size() + " batch(es)");
+ 
+         // Results are merged strictly in submission order, even though the
+         // batches finish in a random order: the cache file is always a
+@@ -760,12 +791,16 @@ public final class BisubManager {
+             notifyProgress(target.cacheKey, translatedCount, toTranslate.size());
+             Log.i(TAG, "Bilingual subtitle progress: " + translatedCount + "/"
+                     + toTranslate.size() + " unique lines translated");
++            BisubLog.i("Translation: video " + target.videoId + " progress "
++                    + translatedCount + "/" + toTranslate.size() + " unique lines");
+         }
+ 
+         if (aborted.get()) {
+             // The provider rejected the requests (bad key, unknown model):
+             // do not mark the video as done, so the user can retry after
+             // fixing the configuration.
++            BisubLog.e("Translation: video " + target.videoId
++                    + " - the provider rejected the request, nothing was marked done");
+             throw new IOException("The provider rejected the translation request, "
+                     + "check the translation settings");
+         }
+@@ -774,6 +809,9 @@ public final class BisubManager {
+         notifyFinished(target.cacheKey, true);
+         Log.i(TAG, "Bilingual subtitles generated: " + translatedCount + "/"
+                 + toTranslate.size() + " lines translated (" + target.cacheFile.getName() + ")");
++        BisubLog.i("Translation: video " + target.videoId + " done - " + translatedCount
++                + "/" + toTranslate.size() + " lines translated, cache file "
++                + target.cacheFile.getName());
+         notifyReady(appContext, translatedCount, toTranslate.size());
+     }
+ 
+@@ -1032,17 +1070,24 @@ public final class BisubManager {
+                     aborted.set(true);
+                     Log.e(TAG, "Provider rejected the translation request, "
+                             + "stopping all batches: " + e.getMessage());
++                    BisubLog.e("Batch: the provider rejected the request, "
++                            + "stopping all batches: " + e.getMessage());
+                     return translated;
+                 } catch (final Exception e) {
+                     Log.w(TAG, "Translation attempt " + attempt + " of a "
+                             + batch.size() + "-line batch failed (" + remaining.size()
+                             + " lines still missing)", e);
++                    BisubLog.w("Batch: attempt " + attempt + " of " + batch.size()
++                            + " lines failed (" + remaining.size() + " still missing)", e);
+                 }
+             }
+             if (!remaining.isEmpty()) {
+                 Log.w(TAG, "Translation batch incomplete after " + BATCH_MAX_ATTEMPTS
+                         + " attempts, keeping the original text for " + remaining.size()
+                         + " of " + batch.size() + " lines");
++                BisubLog.w("Batch: incomplete after " + BATCH_MAX_ATTEMPTS
++                        + " attempts, keeping the original text for " + remaining.size()
++                        + " of " + batch.size() + " lines");
+             }
+             return translated;
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index c70ce0a27..b735c32f8 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -223,25 +223,38 @@ public final class SubtitleTranslator {
+                 .post(RequestBody.create(payload.toString(), JSON))
+                 .build();
+ 
++        BisubLog.i("Chat model: translating " + batch.size() + " lines to '"
++                + cfg.targetLanguage + "' via " + cfg.baseUrl
++                + " (model " + cfg.model + ", read timeout " + readTimeoutSeconds + "s)");
++        final long startedAt = System.currentTimeMillis();
+         try (Response response = client.newCall(request).execute()) {
+             final String body = response.body() == null ? "" : response.body().string();
++            final long elapsed = System.currentTimeMillis() - startedAt;
+             if (!response.isSuccessful()) {
+                 // 4xx (except 408/429) means the request itself is wrong:
+                 // wrong key, unknown model, malformed body. Retrying cannot
+                 // help, so stop the whole translation right away.
+                 if (response.code() >= 400 && response.code() < 500
+                         && response.code() != 408 && response.code() != 429) {
++                    BisubLog.e("Chat model: HTTP " + response.code() + " in " + elapsed
++                            + " ms" + describeErrorBody(body));
+                     throw new TranslationConfigException("Translation API returned HTTP "
+                             + response.code() + describeErrorBody(body));
+                 }
++                BisubLog.w("Chat model: HTTP " + response.code() + " in " + elapsed
++                        + " ms" + describeErrorBody(body));
+                 throw new IOException("Translation API returned HTTP " + response.code()
+                         + describeErrorBody(body));
+             }
++            BisubLog.i("Chat model: HTTP " + response.code() + " in " + elapsed
++                    + " ms (" + body.length() + " bytes)");
+             final String finishReason = extractFinishReason(body);
+             if (finishReason != null && !"stop".equals(finishReason)) {
+                 // A truncated reply (max_tokens, content filter) would parse
+                 // as an incomplete answer; treat it as a failure so the
+                 // caller retries the missing lines with a smaller batch.
++                BisubLog.w("Chat model: reply was not completed (finish_reason="
++                        + finishReason + ")");
+                 throw new IOException("Translation response was not completed "
+                         + "(finish_reason=" + finishReason + ")");
+             }
+@@ -300,6 +313,10 @@ public final class SubtitleTranslator {
+         }
+ 
+         final Map<Integer, String> translated;
++        final String engineTarget =
++                engineTargetCode(cfg.provider, cfg.targetLanguage);
++        BisubLog.i("Engine '" + cfg.provider + "': translating " + lines.size()
++                + " lines to '" + engineTarget + "'");
+         switch (String.valueOf(cfg.provider)) {
+             case "google":
+                 translated = translateGoogle(lines, cfg);
+@@ -320,6 +337,8 @@ public final class SubtitleTranslator {
+         for (final Map.Entry<Integer, String> entry : translated.entrySet()) {
+             result.put(batch.get(positions.get(entry.getKey())), entry.getValue());
+         }
++        BisubLog.i("Engine '" + cfg.provider + "': translated " + translated.size()
++                + " of " + lines.size() + " lines");
+         return result;
+     }
+ 
+@@ -366,8 +385,11 @@ public final class SubtitleTranslator {
+             }
+             final int[] bound = bounds.get(c);
+             final List<String> chunk = lines.subList(bound[0], bound[1]);
++            final String joined = String.join("\n", chunk);
++            BisubLog.i("google chunk " + (c + 1) + "/" + bounds.size() + ": "
++                    + chunk.size() + " lines, " + joined.length() + " chars");
+             final List<String> parsed = parseGoogleTranslatedLines(executeRequest(
+-                    googleRequest(String.join("\n", chunk), target)));
++                    googleRequest(joined, target)));
+             if (parsed.size() == chunk.size()) {
+                 for (int i = 0; i < chunk.size(); i++) {
+                     putIfMeaningful(result, bound[0] + i, parsed.get(i));
+@@ -376,6 +398,9 @@ public final class SubtitleTranslator {
+             }
+             Log.w(TAG, "Google reply had " + parsed.size() + " lines for "
+                     + chunk.size() + " inputs, retrying the chunk line by line");
++            BisubLog.w("google chunk " + (c + 1) + "/" + bounds.size()
++                    + ": reply had " + parsed.size() + " lines for " + chunk.size()
++                    + " inputs, retrying line by line");
+             for (int i = 0; i < chunk.size(); i++) {
+                 final List<String> single = parseGoogleTranslatedLines(executeRequest(
+                         googleRequest(chunk.get(i), target)));
+@@ -464,8 +489,12 @@ public final class SubtitleTranslator {
+             throws IOException, JSONException {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+         final Map<Integer, String> result = new HashMap<>();
+-        for (final int[] bound : chunkBounds(lines, 40, 20000, false)) {
++        final List<int[]> bounds = chunkBounds(lines, 40, 20000, false);
++        for (int c = 0; c < bounds.size(); c++) {
++            final int[] bound = bounds.get(c);
+             final List<String> chunk = lines.subList(bound[0], bound[1]);
++            BisubLog.i("microsoft chunk " + (c + 1) + "/" + bounds.size() + ": "
++                    + chunk.size() + " lines, " + totalLength(chunk) + " chars");
+             final JSONArray texts = new JSONArray();
+             for (final String line : chunk) {
+                 texts.put(line);
+@@ -521,8 +550,12 @@ public final class SubtitleTranslator {
+         final String endpoint = deepLEndpoint(cfg);
+         final String key = cfg.apiKey.trim();
+         final Map<Integer, String> result = new HashMap<>();
+-        for (final int[] bound : chunkBounds(lines, 50, 20000, false)) {
++        final List<int[]> bounds = chunkBounds(lines, 50, 20000, false);
++        for (int c = 0; c < bounds.size(); c++) {
++            final int[] bound = bounds.get(c);
+             final List<String> chunk = lines.subList(bound[0], bound[1]);
++            BisubLog.i("deepl chunk " + (c + 1) + "/" + bounds.size() + ": "
++                    + chunk.size() + " lines, " + totalLength(chunk) + " chars");
+             final JSONArray texts = new JSONArray();
+             for (final String line : chunk) {
+                 texts.put(line);
+@@ -570,8 +603,12 @@ public final class SubtitleTranslator {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+         final Map<Integer, String> result = new HashMap<>();
+         final String apiKey = cfg.apiKey == null ? "" : cfg.apiKey.trim();
+-        for (final int[] bound : chunkBounds(lines, 40, 1800, false)) {
++        final List<int[]> bounds = chunkBounds(lines, 40, 1800, false);
++        for (int c = 0; c < bounds.size(); c++) {
++            final int[] bound = bounds.get(c);
+             final List<String> chunk = lines.subList(bound[0], bound[1]);
++            BisubLog.i("libre chunk " + (c + 1) + "/" + bounds.size() + ": "
++                    + chunk.size() + " lines, " + totalLength(chunk) + " chars");
+             final JSONArray texts = new JSONArray();
+             for (final String line : chunk) {
+                 texts.put(line);
+@@ -590,6 +627,8 @@ public final class SubtitleTranslator {
+                     .build();
+             final JSONObject reply = new JSONObject(executeRequest(request));
+             if (!reply.optString("error", "").trim().isEmpty()) {
++                BisubLog.e("libre chunk " + (c + 1) + "/" + bounds.size()
++                        + ": server error: " + reply.optString("error").trim());
+                 throw new IOException("LibreTranslate error: "
+                         + reply.optString("error").trim());
+             }
+@@ -621,6 +660,18 @@ public final class SubtitleTranslator {
+         }
+     }
+ 
++    /**
++     * @param lines the lines to measure
++     * @return the total character count, for chunk size logging
++     */
++    private static int totalLength(@NonNull final List<String> lines) {
++        int total = 0;
++        for (final String line : lines) {
++            total += line.length();
++        }
++        return total;
++    }
++
+     /**
+      * Executes a traditional-engine request, retrying transient failures:
+      * network errors, timeouts and HTTP 408/429/5xx are retried twice
+@@ -634,24 +685,36 @@ public final class SubtitleTranslator {
+      */
+     @NonNull
+     private static String executeRequest(@NonNull final Request request) throws IOException {
++        final String target = request.method() + " " + request.url().host()
++                + request.url().encodedPath();
+         IOException lastFailure = null;
+         for (int attempt = 1; attempt <= 3; attempt++) {
++            final long startedAt = System.currentTimeMillis();
+             try (Response response = CLIENT.newCall(request).execute()) {
+                 final String body = response.body() == null ? "" : response.body().string();
++                final long elapsed = System.currentTimeMillis() - startedAt;
+                 if (response.isSuccessful()) {
++                    BisubLog.i("HTTP " + response.code() + " in " + elapsed + " ms ("
++                            + body.length() + " bytes) - " + target
++                            + " (attempt " + attempt + ")");
+                     return body;
+                 }
+                 final int code = response.code();
+                 if (code >= 400 && code < 500 && code != 408 && code != 429) {
++                    BisubLog.e("HTTP " + code + " in " + elapsed + " ms - " + target
++                            + " (attempt " + attempt + ")" + describeErrorBody(body));
+                     throw new TranslationConfigException("Translation API returned HTTP "
+                             + code + describeErrorBody(body));
+                 }
++                BisubLog.w("HTTP " + code + " in " + elapsed + " ms - " + target
++                        + " (attempt " + attempt + ")" + describeErrorBody(body));
+                 lastFailure = new IOException("Translation API returned HTTP " + code
+                         + describeErrorBody(body));
+             } catch (final IOException e) {
+                 if (e instanceof TranslationConfigException) {
+                     throw e;
+                 }
++                BisubLog.w("Network error on attempt " + attempt + " - " + target, e);
+                 lastFailure = e;
+             }
+             if (attempt < 3) {
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 89a6def76..064e3097d 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -1,5 +1,7 @@
+ package org.schabi.newpipe.settings;
+ 
++import android.content.ClipData;
++import android.content.ClipboardManager;
+ import android.content.Context;
+ import android.content.DialogInterface;
+ import android.content.SharedPreferences;
+@@ -29,6 +31,7 @@ import androidx.preference.SwitchPreferenceCompat;
+ import com.google.android.exoplayer2.text.Cue;
+ 
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubLog;
+ import org.schabi.newpipe.bisub.BisubManager;
+ import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.bisub.BisubStyle;
+@@ -114,6 +117,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         setupTestButton();
+         setupCaptionStyleButton();
+         setupCachedListButton();
++        setupDebugLogButton();
+         refreshProfileBindings();
+         prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
+     }
+@@ -579,6 +583,69 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         });
+     }
+ 
++    /**
++     * Opens the in-memory bisub debug log in a scrollable monospace viewer
++     * with buttons to copy it to the clipboard or clear it.
++     */
++    private void setupDebugLogButton() {
++        final Preference logPref = requirePreference(R.string.bisub_debug_log_key);
++        logPref.setOnPreferenceClickListener((final Preference p) -> {
++            showDebugLogDialog();
++            return true;
++        });
++    }
++
++    /**
++     * Shows the debug log entries, newest at the bottom, and offers copy,
++     * clear and dismiss actions.
++     */
++    private void showDebugLogDialog() {
++        final Context context = requireContext();
++        final List<BisubLog.Entry> entries = BisubLog.snapshot();
++        final String text = BisubLog.formatSnapshot(entries);
++        final TextView view = new TextView(context);
++        view.setTypeface(Typeface.MONOSPACE);
++        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
++        final int padding = Math.round(
++                16f * context.getResources().getDisplayMetrics().density);
++        view.setPadding(padding, padding / 2, padding, padding / 2);
++        view.setText(text.isEmpty() ? getString(R.string.bisub_debug_log_empty) : text);
++        final ScrollView scroller = new ScrollView(context);
++        scroller.addView(view);
++        scroller.post(() -> scroller.fullScroll(ScrollView.FOCUS_DOWN));
++        new AlertDialog.Builder(context)
++                .setTitle(getString(R.string.bisub_debug_log_title)
++                        + " (" + entries.size() + ")")
++                .setView(scroller)
++                .setPositiveButton(R.string.bisub_debug_log_copy,
++                        (final DialogInterface dialog, final int which) ->
++                                copyDebugLog(context))
++                .setNeutralButton(R.string.bisub_debug_log_clear,
++                        (final DialogInterface dialog, final int which) -> {
++                            BisubLog.clear();
++                            Toast.makeText(context, R.string.bisub_debug_log_cleared,
++                                    Toast.LENGTH_SHORT).show();
++                        })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private void copyDebugLog(@NonNull final Context context) {
++        final String text = BisubLog.formatSnapshot(BisubLog.snapshot());
++        if (text.isEmpty()) {
++            Toast.makeText(context, R.string.bisub_debug_log_empty,
++                    Toast.LENGTH_SHORT).show();
++            return;
++        }
++        final ClipboardManager clipboard = context.getSystemService(ClipboardManager.class);
++        if (clipboard != null) {
++            clipboard.setPrimaryClip(
++                    ClipData.newPlainText("bisub debug log", text));
++        }
++        Toast.makeText(context, R.string.bisub_debug_log_copied,
++                Toast.LENGTH_SHORT).show();
++    }
++
+     /**
+      * Loads the cache entries on a background thread and shows the list
+      * dialog on the UI thread.
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 23b4e847f..0cb453f07 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1291,4 +1291,12 @@
+     <string name="bisub_cached_delete_message">双语字幕文件将被删除，下次需要时会重新翻译。</string>
+     <string name="bisub_cached_deleted">已删除</string>
+     <string name="bisub_cached_delete_failed">删除失败</string>
++    <string name="bisub_debug_category_title">调试</string>
++    <string name="bisub_debug_log_title">查看调试日志</string>
++    <string name="bisub_debug_log_summary">记录每次翻译请求、HTTP 响应与错误详情；翻译失败时自动存档到 bisub/logs/last-failure.txt</string>
++    <string name="bisub_debug_log_empty">暂无日志。先触发一次翻译或连接测试。</string>
++    <string name="bisub_debug_log_copy">复制</string>
++    <string name="bisub_debug_log_clear">清空</string>
++    <string name="bisub_debug_log_copied">调试日志已复制到剪贴板</string>
++    <string name="bisub_debug_log_cleared">调试日志已清空</string>
+ </resources>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index bc7f390f6..4f5fd6c90 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1899,6 +1899,7 @@
+     <string name="bisub_test_connection_key">bisub_test_connection</string>
+     <string name="bisub_caption_style_key">bisub_caption_style</string>
+     <string name="bisub_cached_list_key">bisub_cached_list</string>
++    <string name="bisub_debug_log_key">bisub_debug_log</string>
+     <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
+     <string name="bisub_style_text_color_key">bisub_style_text_color</string>
+     <string name="bisub_style_background_key">bisub_style_background</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 47900259d..288f45414 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1295,4 +1295,12 @@
+     <string name="bisub_cached_delete_message">The bilingual subtitle file will be removed and translated again the next time you request it.</string>
+     <string name="bisub_cached_deleted">Deleted</string>
+     <string name="bisub_cached_delete_failed">Could not delete the file</string>
++    <string name="bisub_debug_category_title">Debug</string>
++    <string name="bisub_debug_log_title">View debug log</string>
++    <string name="bisub_debug_log_summary">Records every translation request, HTTP reply and error. A failed translation is also archived to bisub/logs/last-failure.txt</string>
++    <string name="bisub_debug_log_empty">No log entries yet. Trigger a translation or a connection test first.</string>
++    <string name="bisub_debug_log_copy">Copy</string>
++    <string name="bisub_debug_log_clear">Clear</string>
++    <string name="bisub_debug_log_copied">Debug log copied to the clipboard</string>
++    <string name="bisub_debug_log_cleared">Debug log cleared</string>
+ </resources>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index 8959366ca..f3bec8e1d 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -103,4 +103,16 @@
+         android:title="@string/bisub_cached_list_title"
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
++
++    <PreferenceCategory
++        android:title="@string/bisub_debug_category_title"
++        app:iconSpaceReserved="false">
++
++        <Preference
++            android:key="@string/bisub_debug_log_key"
++            android:summary="@string/bisub_debug_log_summary"
++            android:title="@string/bisub_debug_log_title"
++            app:iconSpaceReserved="false"
++            app:singleLineTitle="false" />
++    </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

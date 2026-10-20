@@ -1,7 +1,7 @@
 From 5d919da5d30c69e42b4359c8b4d5e8462279f155 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 09:37:50 +0800
-Subject: [PATCH 04/11] Add manual bilingual subtitle generation button on the
+Subject: [PATCH 04/12] Add manual bilingual subtitle generation button on the
  detail page
 
 First detail-controls row 'Bilingual' button driving

@@ -1,7 +1,7 @@
 From 342ead2ca4e216e9ae3b143e3f0101e83214f21f Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 11:36:08 +0800
-Subject: [PATCH 06/11] Make translation concurrency and batch size
+Subject: [PATCH 06/12] Make translation concurrency and batch size
  user-configurable
 
 Some providers reject high concurrency, and single huge requests suit

@@ -1,7 +1,7 @@
 From 85d4cdf83a30e652746806dfda05d69e43b9375f Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 12:35:45 +0800
-Subject: [PATCH 07/11] Size the subtitle background to the text (fit-content)
+Subject: [PATCH 07/12] Size the subtitle background to the text (fit-content)
  and slim the horizontal padding
 
 The background bar used to be a fixed-width container spanning nearly

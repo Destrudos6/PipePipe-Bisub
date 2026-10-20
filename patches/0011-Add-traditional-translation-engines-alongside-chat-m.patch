@@ -1,7 +1,7 @@
 From 3a041a2dc8ec8ffa33fe0ff03a3fa4c27b438bba Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 16:03:32 +0800
-Subject: [PATCH 11/11] Add traditional translation engines alongside chat
+Subject: [PATCH 11/12] Add traditional translation engines alongside chat
  models
 
 Following the engine setup of established open-source subtitle
