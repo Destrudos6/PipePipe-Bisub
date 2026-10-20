@@ -1,0 +1,313 @@
+From 342ead2ca4e216e9ae3b143e3f0101e83214f21f Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 11:36:08 +0800
+Subject: [PATCH 6/6] Make translation concurrency and batch size
+ user-configurable
+
+Some providers reject high concurrency, and single huge requests suit
+others better, so both knobs now live in the bisub settings screen:
+
+- Parallel requests (1-32, default 12): the batch pool is created per
+  translation with the configured size instead of a fixed 12-thread
+  static pool; shutdown only stops new submissions, in-flight batches
+  keep running
+- Lines per request (1-2000, default 40): 2000 equals the unique-line
+  cap, i.e. the whole video goes out in one request. Invalid or missing
+  values fall back to the defaults, values are clamped on load
+
+The read timeout of each request now grows with its batch size
+(max(60s, 2s per line)) because non-streaming chat completion
+endpoints only start replying once the whole answer is generated, and
+a whole-video request can legitimately take many minutes before the
+first byte arrives. The shared OkHttp connection pool is reused via
+newBuilder().
+---
+ .../schabi/newpipe/bisub/BisubManager.java    | 44 +++++++--------
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 56 ++++++++++++++++++-
+ .../newpipe/bisub/SubtitleTranslator.java     | 14 ++++-
+ app/src/main/res/values-zh-rCN/strings.xml    |  4 ++
+ app/src/main/res/values/settings_keys.xml     |  2 +
+ app/src/main/res/values/strings.xml           |  4 ++
+ app/src/main/res/xml/bisub_settings.xml       | 18 ++++++
+ 7 files changed, 115 insertions(+), 27 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index 5484101f4..ee99605cb 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -83,16 +83,7 @@ public final class BisubManager {
+      */
+     private static final long TOTAL_BUDGET_MS = 20 * 60_000;
+     /**
+-     * Subtitle lines per translation batch (one LLM request).
+-     */
+-    private static final int BATCH_SIZE = 40;
+-    /**
+-     * Parallel LLM requests. Twelve concurrent batches translate a two-hour
+-     * video in a few minutes; the missing-line retries in {@link BatchJob}
+-     * absorb the occasional rate limit of stricter providers.
+-     */
+-    private static final int BATCH_POOL_SIZE = 12;
+-    /**
++
+      * Delay before retrying a partially or fully failed batch.
+      */
+     private static final long BATCH_RETRY_DELAY_MS = 2_000;
+@@ -123,17 +114,7 @@ public final class BisubManager {
+     });
+ 
+     /**
+-     * Runs the individual translation batches in parallel. Daemon threads,
+-     * never interrupted by the player's RxJava disposal.
+-     */
+-    private static final ExecutorService SUBPOOL = Executors.newFixedThreadPool(
+-            BATCH_POOL_SIZE, runnable -> {
+-                final Thread thread = new Thread(runnable, "bisub-batch");
+-                thread.setDaemon(true);
+-                return thread;
+-            });
+ 
+-    /**
+      * Maps a cache key to the generation task currently producing it, so
+      * that repeated button taps and preloading never translate the same
+      * video twice.
+@@ -464,15 +445,30 @@ public final class BisubManager {
+         final List<String> toTranslate =
+                 uniqueTexts.subList(0, Math.min(uniqueTexts.size(), MAX_UNIQUE_LINES));
+ 
++        // The batch pool is created per translation with the concurrency the
++        // user configured, because providers differ wildly in how many
++        // parallel requests they tolerate. Daemon threads are never
++        // interrupted by the player's RxJava disposal. Shutdown only stops
++        // new submissions; queued and in-flight batches keep running.
++        final ExecutorService pool = Executors.newFixedThreadPool(
++                target.cfg.concurrency, runnable -> {
++                    final Thread thread = new Thread(runnable, "bisub-batch");
++                    thread.setDaemon(true);
++                    return thread;
++                });
++
+         // Submit every batch at once: the pool size caps the real
+         // parallelism and the queue order keeps the beginning of the video
+         // first in line, so progress reported to the user grows linearly.
++        // A batch size at the configured cap (2000) sends the whole video
++        // in a single request.
+         final List<Future<Map<String, String>>> futures = new ArrayList<>();
+-        for (int start = 0; start < toTranslate.size(); start += BATCH_SIZE) {
+-            final List<String> batch =
+-                    toTranslate.subList(start, Math.min(start + BATCH_SIZE, toTranslate.size()));
+-            futures.add(SUBPOOL.submit(new BatchJob(batch, target.cfg, deadline)));
++        for (int start = 0; start < toTranslate.size(); start += target.cfg.batchSize) {
++            final List<String> batch = toTranslate.subList(start,
++                    Math.min(start + target.cfg.batchSize, toTranslate.size()));
++            futures.add(pool.submit(new BatchJob(batch, target.cfg, deadline)));
+         }
++        pool.shutdown();
+ 
+         // Results are merged strictly in submission order, even though the
+         // batches finish in a random order: the cache file is always a
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index 08dc46222..a7353e695 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -21,6 +21,17 @@ public final class BisubPrefs {
+      * Immutable snapshot of all bisub-related settings.
+      */
+     public static final class Config {
++        /** Lower/upper bound and default of the parallel request setting. */
++        public static final int CONCURRENCY_MIN = 1;
++        public static final int CONCURRENCY_MAX = 32;
++        public static final int CONCURRENCY_DEFAULT = 12;
++        /** Lower/upper bound and default of the lines-per-request setting.
++         *  The cap equals the maximum number of unique lines per video, so a
++         *  value at the cap sends the whole video in one request. */
++        public static final int BATCH_SIZE_MIN = 1;
++        public static final int BATCH_SIZE_MAX = 2000;
++        public static final int BATCH_SIZE_DEFAULT = 40;
++
+         public final boolean enabled;
+         @Nullable public final String provider;
+         @Nullable public final String baseUrl;
+@@ -28,11 +39,15 @@ public final class BisubPrefs {
+         @Nullable public final String model;
+         @Nullable public final String targetLanguage;
+         @Nullable public final String sourceLanguage;
++        public final int concurrency;
++        public final int batchSize;
+ 
++        @SuppressWarnings("checkstyle:ParameterNumber")
+         private Config(final boolean enabled, @Nullable final String provider,
+                        @Nullable final String baseUrl, @Nullable final String apiKey,
+                        @Nullable final String model, @Nullable final String targetLanguage,
+-                       @Nullable final String sourceLanguage) {
++                       @Nullable final String sourceLanguage,
++                       final int concurrency, final int batchSize) {
+             this.enabled = enabled;
+             this.provider = provider;
+             this.baseUrl = baseUrl;
+@@ -40,6 +55,8 @@ public final class BisubPrefs {
+             this.model = model;
+             this.targetLanguage = targetLanguage;
+             this.sourceLanguage = sourceLanguage;
++            this.concurrency = concurrency;
++            this.batchSize = batchSize;
+         }
+ 
+         /**
+@@ -169,6 +186,41 @@ public final class BisubPrefs {
+                 prefs.getString(context.getString(R.string.bisub_api_key_key), null),
+                 prefs.getString(context.getString(R.string.bisub_model_key), null),
+                 prefs.getString(context.getString(R.string.bisub_target_lang_key), null),
+-                prefs.getString(context.getString(R.string.bisub_source_lang_key), null));
++                prefs.getString(context.getString(R.string.bisub_source_lang_key), null),
++                readIntInRange(prefs,
++                        context.getString(R.string.bisub_concurrency_key),
++                        Config.CONCURRENCY_DEFAULT, Config.CONCURRENCY_MIN,
++                        Config.CONCURRENCY_MAX),
++                readIntInRange(prefs,
++                        context.getString(R.string.bisub_batch_size_key),
++                        Config.BATCH_SIZE_DEFAULT, Config.BATCH_SIZE_MIN,
++                        Config.BATCH_SIZE_MAX));
++    }
++
++    /**
++     * Reads a numeric setting that the user may have typed as any text and
++     * clamps it into {@code [min, max]}, falling back to {@code fallback}
++     * when it is missing or not a number.
++     *
++     * @param prefs    the shared preferences to read from
++     * @param key      the preference key
++     * @param fallback value used when the setting is missing or unparsable
++     * @param min      lower bound, inclusive
++     * @param max      upper bound, inclusive
++     * @return the clamped value
++     */
++    private static int readIntInRange(@NonNull final SharedPreferences prefs,
++                                      @NonNull final String key, final int fallback,
++                                      final int min, final int max) {
++        final String raw = prefs.getString(key, null);
++        if (raw == null || raw.trim().isEmpty()) {
++            return fallback;
++        }
++        try {
++            final int value = Integer.parseInt(raw.trim());
++            return Math.max(min, Math.min(max, value));
++        } catch (final NumberFormatException e) {
++            return fallback;
++        }
+     }
+ }
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index e06cd4d80..af2a3c992 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -51,6 +51,13 @@ public final class SubtitleTranslator {
+      * single chat completion request. Batch scheduling (size, parallelism,
+      * retries, budget) is handled by the caller.
+      *
++     * <p>The read timeout grows with the batch size: non-streaming chat
++     * completion endpoints only start sending the response body once the
++     * whole reply has been generated, so a single request carrying the
++     * entire video (potentially thousands of lines) may legitimately take
++     * many minutes before the first byte arrives. The shared connection
++     * pool is reused via {@link OkHttpClient#newBuilder()}.</p>
++     *
+      * @param batch the unique subtitle texts of one batch
+      * @param cfg   the user configuration (must be usable)
+      * @return a map from original text to translated text; texts that the
+@@ -64,6 +71,11 @@ public final class SubtitleTranslator {
+             throws IOException, JSONException {
+         final Map<String, String> result = new HashMap<>();
+ 
++        final int readTimeoutSeconds = Math.max(PER_BATCH_TIMEOUT_SECONDS, batch.size() * 2);
++        final OkHttpClient client = CLIENT.newBuilder()
++                .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
++                .build();
++
+         final JSONObject payload = buildPayload(batch, cfg);
+         final Request request = new Request.Builder()
+                 .url(normalizeEndpoint(cfg.baseUrl))
+@@ -72,7 +84,7 @@ public final class SubtitleTranslator {
+                 .post(RequestBody.create(payload.toString(), JSON))
+                 .build();
+ 
+-        try (Response response = CLIENT.newCall(request).execute()) {
++        try (Response response = client.newCall(request).execute()) {
+             final String body = response.body() == null ? "" : response.body().string();
+             if (!response.isSuccessful()) {
+                 throw new IOException("Translation API returned HTTP " + response.code()
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 4fa7be84e..f63a5d46e 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1224,6 +1224,10 @@
+     <string name="bisub_target_lang_summary">字幕要翻译成的语言，如 Simplified Chinese</string>
+     <string name="bisub_source_lang_title">源字幕语言</string>
+     <string name="bisub_source_lang_summary">要翻译的字幕轨语言代码，如 en。留空则使用第一条可用字幕轨</string>
++    <string name="bisub_concurrency_title">并发请求数</string>
++    <string name="bisub_concurrency_summary">同时发送的翻译请求数量（1–32）。服务商不支持高并发时可调低</string>
++    <string name="bisub_batch_size_title">每批句数</string>
++    <string name="bisub_batch_size_summary">每个翻译请求包含的字幕句数（1–2000）。设为 2000 即整个视频一次性发送；过大的值可能超出模型的输出上限</string>
+     <string name="bisub_status_ready">已就绪 · 在视频页点按“双语字幕”按钮即可生成并缓存字幕</string>
+     <string name="bisub_status_incomplete">配置不完整：缺少 %1$s</string>
+     <string name="bisub_missing_base_url">API 地址</string>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 2658ed8fb..f705fb8be 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1891,6 +1891,8 @@
+     <string name="bisub_model_key">bisub_model</string>
+     <string name="bisub_target_lang_key">bisub_target_lang</string>
+     <string name="bisub_source_lang_key">bisub_source_lang</string>
++    <string name="bisub_concurrency_key">bisub_concurrency</string>
++    <string name="bisub_batch_size_key">bisub_batch_size</string>
+     <string name="bisub_test_connection_key">bisub_test_connection</string>
+     <string name="bisub_caption_style_key">bisub_caption_style</string>
+     <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index cfe0c7ee3..859ecb5a7 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1228,6 +1228,10 @@
+     <string name="bisub_target_lang_summary">Language to translate subtitles into, e.g. Simplified Chinese</string>
+     <string name="bisub_source_lang_title">Source subtitle language</string>
+     <string name="bisub_source_lang_summary">ISO code of the subtitle track to translate, e.g. en. Leave empty to use the first available track</string>
++    <string name="bisub_concurrency_title">Parallel requests</string>
++    <string name="bisub_concurrency_summary">How many batches the app may send at the same time (1–32). Lower it for providers that reject high concurrency</string>
++    <string name="bisub_batch_size_title">Lines per request</string>
++    <string name="bisub_batch_size_summary">How many subtitle lines go into one request (1–2000). 2000 sends the whole video in a single request; very large values may hit the model\'s output limit</string>
+     <string name="bisub_status_ready">Ready · tap the Bilingual button on a video page to generate and cache its subtitles</string>
+     <string name="bisub_status_incomplete">Incomplete configuration: missing %1$s</string>
+     <string name="bisub_missing_base_url">API base URL</string>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index 305682886..f026289d7 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -59,6 +59,24 @@
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
+ 
++    <EditTextPreference
++        android:defaultValue="12"
++        android:inputType="number"
++        android:key="@string/bisub_concurrency_key"
++        android:summary="@string/bisub_concurrency_summary"
++        android:title="@string/bisub_concurrency_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <EditTextPreference
++        android:defaultValue="40"
++        android:inputType="number"
++        android:key="@string/bisub_batch_size_key"
++        android:summary="@string/bisub_batch_size_summary"
++        android:title="@string/bisub_batch_size_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
+     <Preference
+         android:key="@string/bisub_test_connection_key"
+         android:summary="@string/bisub_test_connection_summary"
+-- 
+2.54.0.windows.1
+
