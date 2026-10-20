@@ -1,0 +1,456 @@
+From cf724ea5e6ab9b50d102049368696def1d7df84c Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 21:55:34 +0800
+Subject: [PATCH 3/4] Add a bilingual reader page for cached subtitles
+
+The cached subtitles were only viewable as raw VTT text in a dialog.
+They are a valuable learning resource, so tapping an entry keeps the
+quick dialog preview but now leads into a dedicated reader page
+showing the original and the translation as parallel lines.
+
+- Reader page pushed onto the settings stack from the cache list
+  (fade animation, back returns to the list)
+- Mode switcher at the top: bilingual, original only or translation
+  only, to re-read the transcript as a comprehension exercise
+- Deleting a cache entry moved to long-press on the list entry, since
+  the viewer dialog now leads with the reader action
+---
+ .../newpipe/settings/BisubCacheFragment.java  |  37 ++-
+ .../settings/BisubSubtitleReaderFragment.java | 229 ++++++++++++++++++
+ .../main/res/layout/fragment_bisub_reader.xml |  57 +++++
+ app/src/main/res/layout/item_bisub_reader.xml |  23 ++
+ app/src/main/res/values-zh-rCN/strings.xml    |   6 +
+ app/src/main/res/values/strings.xml           |   6 +
+ 6 files changed, 354 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+ create mode 100644 app/src/main/res/layout/fragment_bisub_reader.xml
+ create mode 100644 app/src/main/res/layout/item_bisub_reader.xml
+
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
+index b411e85dd..d1a4e8bfa 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
+@@ -167,16 +167,39 @@ public final class BisubCacheFragment extends Fragment {
+                 .setTitle(entry.title == null
+                         ? getString(R.string.bisub_cached_list_title) : entry.title)
+                 .setView(scroll)
+-                .setPositiveButton(R.string.bisub_cached_download,
++                .setPositiveButton(R.string.bisub_reader_open,
+                         (final DialogInterface dialog, final int which) ->
+-                                exportCachedSubtitle(entry))
+-                .setNeutralButton(R.string.bisub_cached_delete,
++                                openReader(entry))
++                .setNeutralButton(R.string.bisub_cached_download,
+                         (final DialogInterface dialog, final int which) ->
+-                                confirmDeleteCached(context, entry))
++                                exportCachedSubtitle(entry))
+                 .setNegativeButton(android.R.string.cancel, null)
+                 .show();
+     }
+ 
++    /**
++     * Opens the bilingual reader page for a cache entry, pushed on top of
++     * the cache list in the settings fragment holder.
++     *
++     * @param entry the cache entry to read
++     */
++    private void openReader(@NonNull final BisubManager.CachedSubtitle entry) {
++        final BisubSubtitleReaderFragment reader = new BisubSubtitleReaderFragment();
++        reader.setArguments(BisubSubtitleReaderFragment.buildArguments(
++                entry.file.getAbsolutePath(), entry.title));
++        if (getActivity() == null) {
++            return;
++        }
++        getActivity().getSupportFragmentManager()
++                .beginTransaction()
++                .setCustomAnimations(R.animator.custom_fade_in,
++                        R.animator.custom_fade_out,
++                        R.animator.custom_fade_in, R.animator.custom_fade_out)
++                .replace(R.id.settings_fragment_holder, reader)
++                .addToBackStack(null)
++                .commit();
++    }
++
+     /**
+      * Lets the user pick where the subtitle file is saved through the
+      * system save-as dialog, then copies the cached file there.
+@@ -411,6 +434,12 @@ public final class BisubCacheFragment extends Fragment {
+             loadThumbnail(entry.videoId);
+             itemView.setOnClickListener(view ->
+                     openCachedSubtitle(view.getContext(), entry));
++            // Deleting moved here (long press) because the viewer dialog
++            // now leads with the bilingual reader action.
++            itemView.setOnLongClickListener(view -> {
++                confirmDeleteCached(view.getContext(), entry);
++                return true;
++            });
+         }
+ 
+         /**
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+new file mode 100644
+index 000000000..c4cea4338
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+@@ -0,0 +1,229 @@
++package org.schabi.newpipe.settings;
++
++import android.content.Context;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.RadioGroup;
++import android.widget.TextView;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.fragment.app.Fragment;
++import androidx.recyclerview.widget.LinearLayoutManager;
++import androidx.recyclerview.widget.RecyclerView;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.VttParser;
++import org.schabi.newpipe.util.ThemeHelper;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Third-level reader page that shows one cached bilingual subtitle as a
++ * bilingual transcript.
++ *
++ * <p>The cached VTT stores each cue as two lines (original text, then
++ * translation); this page splits them back into parallel lines so the
++ * subtitle doubles as a learning resource after watching the video. A
++ * mode switcher at the top toggles between the bilingual view, the
++ * original only and the translation only, so the transcript can be read
++ * as a comprehension exercise: cover the translation first, then reveal
++ * it line by line.</p>
++ */
++public final class BisubSubtitleReaderFragment extends Fragment {
++
++    /** Shows both lines of every cue. */
++    public static final int MODE_BILINGUAL = 0;
++    /** Shows only the original-language line of every cue. */
++    public static final int MODE_ORIGINAL = 1;
++    /** Shows only the translated line of every cue. */
++    public static final int MODE_TRANSLATION = 2;
++
++    private static final String ARG_FILE_PATH = "filePath";
++    private static final String ARG_TITLE = "title";
++
++    private RecyclerView recyclerView;
++    private TextView emptyView;
++    private final BisubReaderAdapter adapter = new BisubReaderAdapter();
++    private int displayMode = MODE_BILINGUAL;
++
++    /**
++     * Builds the arguments of a reader page for one cache entry.
++     *
++     * @param filePath the absolute path of the cached VTT file
++     * @param title    the video title shown as the page title
++     * @return a ready-to-use arguments bundle
++     */
++    @NonNull
++    public static Bundle buildArguments(@NonNull final String filePath,
++                                        @Nullable final String title) {
++        final Bundle args = new Bundle();
++        args.putString(ARG_FILE_PATH, filePath);
++        args.putString(ARG_TITLE, title);
++        return args;
++    }
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull final LayoutInflater inflater,
++                             @Nullable final ViewGroup container,
++                             @Nullable final Bundle savedInstanceState) {
++        final View root =
++                inflater.inflate(R.layout.fragment_bisub_reader, container, false);
++        recyclerView = root.findViewById(R.id.bisub_reader_list);
++        emptyView = root.findViewById(R.id.bisub_reader_empty);
++        recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
++        recyclerView.setAdapter(adapter);
++
++        final RadioGroup modeGroup = root.findViewById(R.id.bisub_reader_mode_group);
++        modeGroup.setOnCheckedChangeListener((final RadioGroup group, final int id) -> {
++            if (id == R.id.bisub_reader_mode_original) {
++                displayMode = MODE_ORIGINAL;
++            } else if (id == R.id.bisub_reader_mode_translation) {
++                displayMode = MODE_TRANSLATION;
++            } else {
++                displayMode = MODE_BILINGUAL;
++            }
++            adapter.notifyDataSetChanged();
++        });
++        return root;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        final Bundle args = getArguments();
++        final String title = args == null ? null : args.getString(ARG_TITLE);
++        ThemeHelper.setTitleToAppCompatActivity(getActivity(),
++                title == null ? getString(R.string.bisub_reader_title) : title);
++        if (adapter.getItemCount() == 0) {
++            load();
++        }
++    }
++
++    /**
++     * Reads the cached file and parses it into parallel lines on a
++     * background thread, then swaps them into the list on the UI thread.
++     */
++    private void load() {
++        final Bundle args = getArguments();
++        final String filePath = args == null ? null : args.getString(ARG_FILE_PATH);
++        if (filePath == null) {
++            showEmpty();
++            return;
++        }
++        final Context context = getContext();
++        if (context == null) {
++            return;
++        }
++        new Thread(() -> {
++            final List<String[]> lines = new ArrayList<>();
++            try {
++                final byte[] bytes = Files.readAllBytes(new File(filePath).toPath());
++                final String content = new String(bytes, StandardCharsets.UTF_8);
++                for (final VttParser.Cue cue : VttParser.parse(content)) {
++                    if (cue.lines.isEmpty()) {
++                        continue;
++                    }
++                    final String original = cue.lines.get(0);
++                    final String translation = cue.lines.size() > 1
++                            ? cue.lines.get(1) : null;
++                    if ((original == null || original.isEmpty())
++                            && (translation == null || translation.isEmpty())) {
++                        continue;
++                    }
++                    lines.add(new String[]{
++                            original == null ? "" : original,
++                            translation == null ? "" : translation});
++                }
++            } catch (final IOException e) {
++                lines.clear();
++            }
++            if (getActivity() == null) {
++                return;
++            }
++            final List<String[]> loaded = new ArrayList<>(lines);
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                adapter.setLines(loaded);
++                if (loaded.isEmpty()) {
++                    showEmpty();
++                }
++            });
++        }).start();
++    }
++
++    private void showEmpty() {
++        emptyView.setVisibility(View.VISIBLE);
++        recyclerView.setVisibility(View.GONE);
++    }
++
++    private final class BisubReaderAdapter
++            extends RecyclerView.Adapter<BisubReaderHolder> {
++        private final List<String[]> lines = new ArrayList<>();
++
++        void setLines(@NonNull final List<String[]> newLines) {
++            lines.clear();
++            lines.addAll(newLines);
++            notifyDataSetChanged();
++        }
++
++        @NonNull
++        @Override
++        public BisubReaderHolder onCreateViewHolder(@NonNull final ViewGroup parent,
++                                                    final int viewType) {
++            return new BisubReaderHolder(LayoutInflater.from(parent.getContext())
++                    .inflate(R.layout.item_bisub_reader, parent, false));
++        }
++
++        @Override
++        public void onBindViewHolder(@NonNull final BisubReaderHolder holder,
++                                     final int position) {
++            holder.bind(lines.get(position));
++        }
++
++        @Override
++        public int getItemCount() {
++            return lines.size();
++        }
++    }
++
++    private final class BisubReaderHolder extends RecyclerView.ViewHolder {
++        private final TextView originalView;
++        private final TextView translationView;
++
++        BisubReaderHolder(@NonNull final View itemView) {
++            super(itemView);
++            originalView = itemView.findViewById(R.id.bisub_reader_original);
++            translationView = itemView.findViewById(R.id.bisub_reader_translation);
++        }
++
++        /**
++         * Fills one cue row and applies the display mode: bilingual shows
++         * both lines, the single modes hide the other one.
++         *
++         * @param line the original and translation of one cue
++         */
++        void bind(@NonNull final String[] line) {
++            final boolean showOriginal =
++                    displayMode == MODE_BILINGUAL || displayMode == MODE_ORIGINAL;
++            final boolean showTranslation =
++                    displayMode == MODE_BILINGUAL || displayMode == MODE_TRANSLATION;
++            originalView.setVisibility(
++                    showOriginal && !line[0].isEmpty() ? View.VISIBLE : View.GONE);
++            originalView.setText(line[0]);
++            translationView.setVisibility(
++                    showTranslation && !line[1].isEmpty() ? View.VISIBLE : View.GONE);
++            translationView.setText(line[1]);
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/fragment_bisub_reader.xml b/app/src/main/res/layout/fragment_bisub_reader.xml
+new file mode 100644
+index 000000000..7844f3a3a
+--- /dev/null
++++ b/app/src/main/res/layout/fragment_bisub_reader.xml
+@@ -0,0 +1,57 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical">
++
++    <RadioGroup
++        android:id="@+id/bisub_reader_mode_group"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="horizontal"
++        android:paddingHorizontal="16dp">
++
++        <RadioButton
++            android:id="@+id/bisub_reader_mode_bilingual"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginEnd="16dp"
++            android:checked="true"
++            android:text="@string/bisub_reader_mode_bilingual" />
++
++        <RadioButton
++            android:id="@+id/bisub_reader_mode_original"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginEnd="16dp"
++            android:text="@string/bisub_reader_mode_original" />
++
++        <RadioButton
++            android:id="@+id/bisub_reader_mode_translation"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:text="@string/bisub_reader_mode_translation" />
++    </RadioGroup>
++
++    <FrameLayout
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1">
++
++        <androidx.recyclerview.widget.RecyclerView
++            android:id="@+id/bisub_reader_list"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:clipToPadding="false"
++            android:paddingBottom="16dp" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:id="@+id/bisub_reader_empty"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:gravity="center"
++            android:padding="32dp"
++            android:text="@string/bisub_reader_empty"
++            android:visibility="gone" />
++    </FrameLayout>
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/item_bisub_reader.xml b/app/src/main/res/layout/item_bisub_reader.xml
+new file mode 100644
+index 000000000..6b305584d
+--- /dev/null
++++ b/app/src/main/res/layout/item_bisub_reader.xml
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:paddingHorizontal="20dp"
++    android:paddingVertical="10dp">
++
++    <org.schabi.newpipe.views.NewPipeTextView
++        android:id="@+id/bisub_reader_original"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:textColor="?android:attr/textColorPrimary"
++        android:textSize="15sp" />
++
++    <org.schabi.newpipe.views.NewPipeTextView
++        android:id="@+id/bisub_reader_translation"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="2dp"
++        android:textColor="?android:attr/textColorSecondary"
++        android:textSize="15sp" />
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 78f3f2319..b9dddb61a 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1295,6 +1295,12 @@
+     <string name="bisub_button_failed">重试</string>
+     <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
+     <string name="bisub_toast_failed">字幕翻译失败，请检查网络后重试</string>
++    <string name="bisub_reader_title">双语字幕</string>
++    <string name="bisub_reader_open">双语阅读</string>
++    <string name="bisub_reader_empty">该文件没有可读的字幕内容</string>
++    <string name="bisub_reader_mode_bilingual">双语</string>
++    <string name="bisub_reader_mode_original">仅原文</string>
++    <string name="bisub_reader_mode_translation">仅译文</string>
+     <string name="bisub_cached_list_title">已缓存字幕</string>
+     <string name="bisub_cached_list_summary">查看已翻译视频的缩略图与详情，支持导出和删除字幕文件</string>
+     <string name="bisub_cached_list_empty">还没有已翻译的双语字幕。打开视频页并点击“双语”按钮即可生成。</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f47b97baf..37f169e6c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1298,6 +1298,12 @@
+     <string name="bisub_button_failed">Retry</string>
+     <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
+     <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
++    <string name="bisub_reader_title">Bilingual subtitles</string>
++    <string name="bisub_reader_open">Read bilingually</string>
++    <string name="bisub_reader_empty">No readable cues in this file</string>
++    <string name="bisub_reader_mode_bilingual">Bilingual</string>
++    <string name="bisub_reader_mode_original">Original</string>
++    <string name="bisub_reader_mode_translation">Translation</string>
+     <string name="bisub_cached_list_title">Cached subtitles</string>
+     <string name="bisub_cached_list_summary">Browse the translated videos with thumbnails, inspect, export and delete their subtitle files</string>
+     <string name="bisub_cached_list_empty">No bilingual subtitles have been translated yet. Open a video page and tap the Bilingual button.</string>
+-- 
+2.54.0.windows.1
+
