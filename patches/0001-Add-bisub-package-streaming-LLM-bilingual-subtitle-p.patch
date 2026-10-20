@@ -1,7 +1,7 @@
 From 1fad60dc4c8b7c24d9f5e3acd5e266306743cb44 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 09:37:34 +0800
-Subject: [PATCH 1/6] Add bisub package: streaming LLM bilingual subtitle
+Subject: [PATCH 1/8] Add bisub package: streaming LLM bilingual subtitle
  pipeline
 
 Self-contained package (org.schabi.newpipe.bisub) with no new gradle

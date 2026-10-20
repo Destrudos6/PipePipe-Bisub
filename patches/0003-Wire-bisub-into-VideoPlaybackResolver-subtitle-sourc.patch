@@ -1,7 +1,7 @@
 From 5996d8362e7aba265d207fdcf2c427191de5d966 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 09:37:50 +0800
-Subject: [PATCH 3/6] Wire bisub into VideoPlaybackResolver subtitle source
+Subject: [PATCH 3/8] Wire bisub into VideoPlaybackResolver subtitle source
  selection
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

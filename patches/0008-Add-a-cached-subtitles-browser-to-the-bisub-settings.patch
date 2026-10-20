@@ -1,0 +1,632 @@
+From 5a7ef49f491d52e46d533613231b14a25ed3fc56 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 12:45:02 +0800
+Subject: [PATCH 8/8] Add a cached-subtitles browser to the bisub settings
+
+Every finished translation now writes a .meta sidecar next to its
+cache file, recording the video title and id, source and target
+language, model, cue count and timestamp (failures are logged and
+never fail the translation itself).
+
+The new "Cached subtitles" entry in the bisub settings lists the
+completed bilingual subtitle files, newest first, with title,
+language, model, line count and date. Entries from before the sidecar
+existed fall back to the file name and a cue count scanned from the
+file. Tapping an entry shows the full WebVTT text in a scrollable,
+text-selectable viewer, and a neutral button deletes the cache entry
+(after confirmation) so the video is translated again on demand.
+---
+ .../schabi/newpipe/bisub/BisubManager.java    | 224 +++++++++++++++++-
+ .../settings/BisubSettingsFragment.java       | 213 +++++++++++++++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  10 +
+ app/src/main/res/values/settings_keys.xml     |   1 +
+ app/src/main/res/values/strings.xml           |  10 +
+ app/src/main/res/xml/bisub_settings.xml       |   7 +
+ 6 files changed, 462 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index ee99605cb..b49fe65ca 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -10,6 +10,8 @@ import android.widget.Toast;
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ 
++import org.json.JSONException;
++import org.json.JSONObject;
+ import org.schabi.newpipe.DownloaderImpl;
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.extractor.downloader.Response;
+@@ -26,7 +28,7 @@ import java.nio.file.StandardCopyOption;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+ import java.util.ArrayList;
+-
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -220,15 +222,22 @@ public final class BisubManager {
+         @NonNull final File doneFile;
+         @NonNull final SubtitlesStream source;
+         @NonNull final BisubPrefs.Config cfg;
++        /** Display title of the video, recorded in the metadata sidecar. */
++        @Nullable final String videoTitle;
++        @NonNull final String videoId;
+ 
++        @SuppressWarnings("checkstyle:ParameterNumber")
+         CacheTarget(@NonNull final String cacheKey, @NonNull final File cacheFile,
+                     @NonNull final File doneFile, @NonNull final SubtitlesStream source,
+-                    @NonNull final BisubPrefs.Config cfg) {
++                    @NonNull final BisubPrefs.Config cfg,
++                    @Nullable final String videoTitle, @NonNull final String videoId) {
+             this.cacheKey = cacheKey;
+             this.cacheFile = cacheFile;
+             this.doneFile = doneFile;
+             this.source = source;
+             this.cfg = cfg;
++            this.videoTitle = videoTitle;
++            this.videoId = videoId;
+         }
+     }
+ 
+@@ -274,7 +283,8 @@ public final class BisubManager {
+         final File cacheFile = new File(new File(appContext.getFilesDir(), CACHE_DIR),
+                 fileName + ".vtt");
+         final File doneFile = new File(cacheFile.getParentFile(), fileName + ".done");
+-        return new CacheTarget(cacheKey, cacheFile, doneFile, source, cfg);
++        return new CacheTarget(cacheKey, cacheFile, doneFile, source, cfg,
++                info.getName(), info.getId());
+     }
+ 
+     /**
+@@ -383,6 +393,213 @@ public final class BisubManager {
+         return Uri.fromFile(target.cacheFile);
+     }
+ 
++    /**
++     * One completed bilingual subtitle file in the cache, together with the
++     * metadata recorded when it was generated. Entries without a metadata
++     * sidecar (files written before the sidecar existed) fall back to the
++     * file name and a cue count scanned from the file itself.
++     */
++    public static final class CachedSubtitle {
++        /** The bilingual WebVTT file on disk. */
++        @NonNull public final File file;
++        /** Video title, or {@code null} when unknown. */
++        @Nullable public final String title;
++        /** Video id, or {@code null} when unknown. */
++        @Nullable public final String videoId;
++        /** Language tag of the translated source track, or {@code null}. */
++        @Nullable public final String sourceLanguage;
++        /** Target language of the translation, or {@code null}. */
++        @Nullable public final String targetLanguage;
++        /** Model that translated the file, or {@code null}. */
++        @Nullable public final String model;
++        /** Number of cues in the file. */
++        public final int cueCount;
++        /** When the file was last written, in epoch milliseconds. */
++        public final long timestamp;
++
++        @SuppressWarnings("checkstyle:ParameterNumber")
++        CachedSubtitle(@NonNull final File file, @Nullable final String title,
++                       @Nullable final String videoId, @Nullable final String sourceLanguage,
++                       @Nullable final String targetLanguage, @Nullable final String model,
++                       final int cueCount, final long timestamp) {
++            this.file = file;
++            this.title = title;
++            this.videoId = videoId;
++            this.sourceLanguage = sourceLanguage;
++            this.targetLanguage = targetLanguage;
++            this.model = model;
++            this.cueCount = cueCount;
++            this.timestamp = timestamp;
++        }
++    }
++
++    /**
++     * Lists the completed bilingual subtitle files in the cache, newest
++     * first. Files that are still being translated have no done marker yet
++     * and are skipped. Only reads disk; call from a background thread.
++     *
++     * @return the cache entries, possibly empty, never {@code null}
++     */
++    @NonNull
++    public List<CachedSubtitle> listCachedSubtitles() {
++        final File dir = new File(appContext.getFilesDir(), CACHE_DIR);
++        final File[] files = dir.listFiles();
++        final List<CachedSubtitle> entries = new ArrayList<>();
++        if (files == null) {
++            return entries;
++        }
++        for (final File file : files) {
++            if (file.getName().endsWith(".vtt") && sibling(file, ".done").exists()) {
++                entries.add(describeCachedSubtitle(file));
++            }
++        }
++        Collections.sort(entries, (final CachedSubtitle a, final CachedSubtitle b) ->
++                Long.compare(b.timestamp, a.timestamp));
++        return entries;
++    }
++
++    /**
++     * Reads the full text of a cached bilingual subtitle file. Only reads
++     * disk; call from a background thread.
++     *
++     * @param entry the cache entry to read
++     * @return the file content, or {@code null} when reading fails
++     */
++    @Nullable
++    public String readCachedSubtitle(@NonNull final CachedSubtitle entry) {
++        try {
++            return new String(Files.readAllBytes(entry.file.toPath()),
++                    StandardCharsets.UTF_8);
++        } catch (final IOException e) {
++            Log.w(TAG, "Could not read the cached subtitle " + entry.file.getName(), e);
++            return null;
++        }
++    }
++
++    /**
++     * Deletes a cached bilingual subtitle file together with its done
++     * marker and metadata sidecar, so the video is translated again the
++     * next time it is requested.
++     *
++     * @param entry the cache entry to delete
++     * @return whether the subtitle file is gone
++     */
++    public boolean deleteCachedSubtitle(@NonNull final CachedSubtitle entry) {
++        sibling(entry.file, ".done").delete();
++        sibling(entry.file, ".meta").delete();
++        return entry.file.delete() || !entry.file.exists();
++    }
++
++    /**
++     * Builds the description of one cache entry from its metadata sidecar,
++     * with fallbacks for entries that have none.
++     *
++     * @param vttFile a bilingual subtitle file with a done marker
++     * @return the entry description
++     */
++    @NonNull
++    private static CachedSubtitle describeCachedSubtitle(@NonNull final File vttFile) {
++        String title = null;
++        String videoId = null;
++        String sourceLanguage = null;
++        String targetLanguage = null;
++        String model = null;
++        int cueCount = 0;
++        final File metaFile = sibling(vttFile, ".meta");
++        if (metaFile.exists()) {
++            try {
++                final JSONObject meta = new JSONObject(new String(
++                        Files.readAllBytes(metaFile.toPath()), StandardCharsets.UTF_8));
++                title = optNonEmpty(meta, "title");
++                videoId = optNonEmpty(meta, "videoId");
++                sourceLanguage = optNonEmpty(meta, "sourceLanguage");
++                targetLanguage = optNonEmpty(meta, "targetLanguage");
++                model = optNonEmpty(meta, "model");
++                cueCount = meta.optInt("cues", 0);
++            } catch (final IOException | JSONException e) {
++                Log.w(TAG, "Could not read the metadata of " + vttFile.getName(), e);
++            }
++        }
++        if (cueCount <= 0) {
++            cueCount = countCueTimings(vttFile);
++        }
++        return new CachedSubtitle(vttFile, title, videoId, sourceLanguage,
++                targetLanguage, model, cueCount, vttFile.lastModified());
++    }
++
++    /**
++     * Writes the metadata sidecar of a just-finished translation: video
++     * title and id, languages, model, cue and line counts. The sidecar is
++     * purely informational (the cache list shows it), so a failure here
++     * must never fail the translation itself.
++     *
++     * @param target     the target that was produced
++     * @param translated number of unique lines that were translated
++     * @param cueCount   number of cues in the composed file
++     */
++    private static void writeMetaQuietly(@NonNull final CacheTarget target,
++                                         final int translated, final int cueCount) {
++        try {
++            final JSONObject meta = new JSONObject();
++            meta.put("title", target.videoTitle == null ? "" : target.videoTitle);
++            meta.put("videoId", target.videoId);
++            meta.put("sourceLanguage", target.source.getLanguageTag());
++            meta.put("targetLanguage", target.cfg.targetLanguage);
++            meta.put("model", target.cfg.model);
++            meta.put("autoGenerated", target.source.isAutoGenerated());
++            meta.put("cues", cueCount);
++            meta.put("translated", translated);
++            meta.put("time", System.currentTimeMillis());
++            atomicWriteCache(sibling(target.cacheFile, ".meta"), meta.toString());
++        } catch (final JSONException | IOException e) {
++            Log.w(TAG, "Could not write the subtitle metadata sidecar", e);
++        }
++    }
++
++    @Nullable
++    private static String optNonEmpty(@NonNull final JSONObject meta,
++                                      @NonNull final String name) {
++        final String value = meta.optString(name, null);
++        return value == null || value.trim().isEmpty() ? null : value;
++    }
++
++    /**
++     * Counts the cue timing lines of a WebVTT file without a full parse,
++     * as a fallback line count for entries without a metadata sidecar.
++     *
++     * @param vttFile the subtitle file to scan
++     * @return the number of cue timing separators, or {@code 0} on errors
++     */
++    private static int countCueTimings(@NonNull final File vttFile) {
++        try {
++            final String content = new String(Files.readAllBytes(vttFile.toPath()),
++                    StandardCharsets.UTF_8);
++            int count = 0;
++            int index = 0;
++            while ((index = content.indexOf("-->", index)) >= 0) {
++                count++;
++                index += 3;
++            }
++            return count;
++        } catch (final IOException e) {
++            Log.w(TAG, "Could not scan " + vttFile.getName(), e);
++            return 0;
++        }
++    }
++
++    /**
++     * @param vttFile a bilingual subtitle cache file
++     * @param suffix  the sibling extension, e.g. {@code ".done"}
++     * @return the file with the same base name and the given suffix
++     */
++    @NonNull
++    private static File sibling(@NonNull final File vttFile, @NonNull final String suffix) {
++        final String name = vttFile.getName();
++        final int dot = name.lastIndexOf('.');
++        final String base = dot < 0 ? name : name.substring(0, dot);
++        return new File(vttFile.getParentFile(), base + suffix);
++    }
++
+     /**
+      * Registers a listener for a cache key and immediately replays the last
+      * known progress of an in-flight translation to it.
+@@ -501,6 +718,7 @@ public final class BisubManager {
+                     + toTranslate.size() + " unique lines translated");
+         }
+ 
++        writeMetaQuietly(target, translatedCount, cues.size());
+         atomicWriteCache(target.doneFile, "");
+         notifyFinished(target.cacheKey, true);
+         Log.i(TAG, "Bilingual subtitles generated: " + translatedCount + "/"
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 9fe2ea935..e49f337ad 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -1,12 +1,20 @@
+ package org.schabi.newpipe.settings;
+ 
+ import android.content.Context;
++import android.content.DialogInterface;
+ import android.content.SharedPreferences;
++import android.graphics.Typeface;
+ import android.os.Bundle;
++import android.text.TextUtils;
++import android.util.TypedValue;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.widget.RadioGroup;
++import android.widget.ScrollView;
+ import android.widget.SeekBar;
++import android.widget.SimpleAdapter;
++import android.widget.TextView;
++import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -20,13 +28,19 @@ import androidx.preference.SwitchPreferenceCompat;
+ import com.google.android.exoplayer2.text.Cue;
+ 
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubManager;
+ import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.bisub.BisubStyle;
+ import org.schabi.newpipe.bisub.BisubSubtitleView;
+ import org.schabi.newpipe.bisub.SubtitleTranslator;
+ 
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.Date;
+ import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ 
+ /**
+@@ -87,6 +101,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         setupApiKeySummary();
+         setupTestButton();
+         setupCaptionStyleButton();
++        setupCachedListButton();
+         prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
+     }
+ 
+@@ -263,6 +278,204 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         });
+     }
+ 
++    /**
++     * Opens the list of completed bilingual subtitle files. The list reads
++     * the cache directory on a background thread (older entries have their
++     * cue count scanned from the file itself), so opening it stays smooth
++     * even with many cached files.
++     */
++    private void setupCachedListButton() {
++        final Preference cachedPref = requirePreference(R.string.bisub_cached_list_key);
++        cachedPref.setOnPreferenceClickListener((final Preference p) -> {
++            showCachedSubtitles();
++            return true;
++        });
++    }
++
++    /**
++     * Loads the cache entries on a background thread and shows the list
++     * dialog on the UI thread.
++     */
++    private void showCachedSubtitles() {
++        final Context context = requireContext();
++        new Thread(() -> {
++            final List<BisubManager.CachedSubtitle> entries =
++                    BisubManager.getInstance(context).listCachedSubtitles();
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                showCachedListDialog(context, entries);
++            });
++        }).start();
++    }
++
++    /**
++     * Shows the pickable list of cached bilingual subtitles. Tapping an
++     * entry opens its full text in a scrollable viewer.
++     *
++     * @param context a context to build the dialog with
++     * @param entries the cache entries, newest first
++     */
++    private void showCachedListDialog(@NonNull final Context context,
++                                      @NonNull final List<BisubManager.CachedSubtitle>
++                                              entries) {
++        if (entries.isEmpty()) {
++            new AlertDialog.Builder(context)
++                    .setTitle(R.string.bisub_cached_list_title)
++                    .setMessage(R.string.bisub_cached_list_empty)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show();
++            return;
++        }
++        final List<Map<String, String>> rows = new ArrayList<>();
++        for (final BisubManager.CachedSubtitle entry : entries) {
++            rows.add(cachedEntryRow(entry));
++        }
++        final SimpleAdapter adapter = new SimpleAdapter(context, rows,
++                android.R.layout.simple_list_item_2,
++                new String[]{"title", "subtitle"},
++                new int[]{android.R.id.text1, android.R.id.text2});
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_cached_list_title)
++                .setAdapter(adapter, (final DialogInterface dialog, final int which) ->
++                        openCachedSubtitle(context, entries.get(which)))
++                .setPositiveButton(android.R.string.ok, null)
++                .show();
++    }
++
++    /**
++     * Builds the two-line label of a list entry: the video title (or file
++     * name as a fallback) and a detail line with language, model, line
++     * count and date.
++     *
++     * @param entry the cache entry to describe
++     * @return a row for {@link SimpleAdapter} with keys "title"/"subtitle"
++     */
++    @NonNull
++    private Map<String, String> cachedEntryRow(
++            @NonNull final BisubManager.CachedSubtitle entry) {
++        final Map<String, String> row = new HashMap<>();
++        row.put("title", entry.title == null ? entry.file.getName() : entry.title);
++        final List<String> details = new ArrayList<>();
++        if (!isBlank(entry.targetLanguage)) {
++            details.add(entry.targetLanguage);
++        }
++        if (!isBlank(entry.model)) {
++            details.add(entry.model);
++        }
++        details.add(getString(R.string.bisub_cached_lines_count, entry.cueCount));
++        details.add(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
++                .format(new Date(entry.timestamp)));
++        row.put("subtitle", TextUtils.join(" · ", details));
++        return row;
++    }
++
++    /**
++     * Reads one cached subtitle file on a background thread and opens the
++     * viewer with its full text.
++     *
++     * @param context a context to build the dialog with
++     * @param entry   the cache entry to open
++     */
++    private void openCachedSubtitle(@NonNull final Context context,
++                                    @NonNull final BisubManager.CachedSubtitle entry) {
++        new Thread(() -> {
++            final String content =
++                    BisubManager.getInstance(context).readCachedSubtitle(entry);
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                showCachedViewerDialog(context, entry, content);
++            });
++        }).start();
++    }
++
++    /**
++     * Shows the full text of a cached bilingual subtitle file in a
++     * scrollable, text-selectable viewer, with a neutral button to delete
++     * the file.
++     *
++     * @param context a context to build the dialog with
++     * @param entry   the cache entry being viewed
++     * @param content the file content, or {@code null} when reading failed
++     */
++    private void showCachedViewerDialog(@NonNull final Context context,
++                                        @NonNull final BisubManager.CachedSubtitle entry,
++                                        @Nullable final String content) {
++        final TextView text = new TextView(context);
++        text.setText(content == null
++                ? getString(R.string.bisub_cached_read_failed) : content);
++        text.setTextIsSelectable(true);
++        text.setTypeface(Typeface.MONOSPACE);
++        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
++        final int padding = Math.round(16f
++                * context.getResources().getDisplayMetrics().density);
++        text.setPadding(padding, padding, padding, padding);
++        final ScrollView scroll = new ScrollView(context);
++        scroll.addView(text);
++        new AlertDialog.Builder(context)
++                .setTitle(entry.title == null
++                        ? getString(R.string.bisub_cached_list_title) : entry.title)
++                .setView(scroll)
++                .setPositiveButton(android.R.string.ok, null)
++                .setNeutralButton(R.string.bisub_cached_delete,
++                        (final DialogInterface dialog, final int which) ->
++                                confirmDeleteCached(context, entry))
++                .show();
++    }
++
++    /**
++     * Asks for confirmation before a cached subtitle file is deleted.
++     *
++     * @param context a context to build the dialog with
++     * @param entry   the cache entry to delete
++     */
++    private void confirmDeleteCached(@NonNull final Context context,
++                                     @NonNull final BisubManager.CachedSubtitle entry) {
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_cached_delete_title)
++                .setMessage(R.string.bisub_cached_delete_message)
++                .setPositiveButton(R.string.bisub_cached_delete,
++                        (final DialogInterface dialog, final int which) ->
++                                deleteCachedSubtitle(context, entry))
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    /**
++     * Deletes a cache entry on a background thread, reports the result in
++     * a toast and reopens the (refreshed) list.
++     *
++     * @param context a context for the manager and the toast
++     * @param entry   the cache entry to delete
++     */
++    private void deleteCachedSubtitle(@NonNull final Context context,
++                                      @NonNull final BisubManager.CachedSubtitle entry) {
++        new Thread(() -> {
++            final boolean deleted =
++                    BisubManager.getInstance(context).deleteCachedSubtitle(entry);
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                Toast.makeText(context, deleted ? R.string.bisub_cached_deleted
++                        : R.string.bisub_cached_delete_failed, Toast.LENGTH_SHORT).show();
++                showCachedSubtitles();
++            });
++        }).start();
++    }
++
+     /**
+      * Text colors offered in the style editor, in the same order as the
+      * radio buttons in {@code dialog_bisub_style.xml}.
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index b62266345..518c11031 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1263,4 +1263,14 @@
+     <string name="bisub_button_failed">重试</string>
+     <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
+     <string name="bisub_toast_failed">字幕翻译失败，请检查网络后重试</string>
++    <string name="bisub_cached_list_title">已缓存字幕</string>
++    <string name="bisub_cached_list_summary">浏览、查看和删除已翻译的双语字幕文件</string>
++    <string name="bisub_cached_list_empty">还没有已翻译的双语字幕。打开视频页并点击“双语”按钮即可生成。</string>
++    <string name="bisub_cached_lines_count">%1$d 句</string>
++    <string name="bisub_cached_read_failed">无法读取字幕文件。</string>
++    <string name="bisub_cached_delete">删除</string>
++    <string name="bisub_cached_delete_title">删除已缓存的字幕？</string>
++    <string name="bisub_cached_delete_message">双语字幕文件将被删除，下次需要时会重新翻译。</string>
++    <string name="bisub_cached_deleted">已删除</string>
++    <string name="bisub_cached_delete_failed">删除失败</string>
+ </resources>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index f705fb8be..a249b514d 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1895,6 +1895,7 @@
+     <string name="bisub_batch_size_key">bisub_batch_size</string>
+     <string name="bisub_test_connection_key">bisub_test_connection</string>
+     <string name="bisub_caption_style_key">bisub_caption_style</string>
++    <string name="bisub_cached_list_key">bisub_cached_list</string>
+     <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
+     <string name="bisub_style_text_color_key">bisub_style_text_color</string>
+     <string name="bisub_style_background_key">bisub_style_background</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 817331631..298fb0643 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1268,4 +1268,14 @@
+     <string name="bisub_button_failed">Retry</string>
+     <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
+     <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
++    <string name="bisub_cached_list_title">Cached subtitles</string>
++    <string name="bisub_cached_list_summary">Browse, inspect and delete the bilingual subtitle files translated so far</string>
++    <string name="bisub_cached_list_empty">No bilingual subtitles have been translated yet. Open a video page and tap the Bilingual button.</string>
++    <string name="bisub_cached_lines_count">%1$d lines</string>
++    <string name="bisub_cached_read_failed">Could not read the subtitle file.</string>
++    <string name="bisub_cached_delete">Delete</string>
++    <string name="bisub_cached_delete_title">Delete cached subtitles?</string>
++    <string name="bisub_cached_delete_message">The bilingual subtitle file will be removed and translated again the next time you request it.</string>
++    <string name="bisub_cached_deleted">Deleted</string>
++    <string name="bisub_cached_delete_failed">Could not delete the file</string>
+ </resources>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index f026289d7..afffeedf7 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -90,4 +90,11 @@
+         android:title="@string/bisub_caption_style_title"
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
++
++    <Preference
++        android:key="@string/bisub_cached_list_key"
++        android:summary="@string/bisub_cached_list_summary"
++        android:title="@string/bisub_cached_list_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
+ </PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

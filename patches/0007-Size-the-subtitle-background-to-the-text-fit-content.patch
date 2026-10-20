@@ -1,0 +1,232 @@
+From 85d4cdf83a30e652746806dfda05d69e43b9375f Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 12:35:45 +0800
+Subject: [PATCH 7/8] Size the subtitle background to the text (fit-content)
+ and slim the horizontal padding
+
+The background bar used to be a fixed-width container spanning nearly
+the whole screen width, which looked grossly oversized for short cues.
+It is now a fit-content block like an inline-block div around the text:
+
+- Both layers wrap at the user-adjustable maximum width (no longer
+  multiplied by the overall scale), then the bar is sized to the widest
+  line actually used plus padding, hugging short cues tightly
+- Both layers are re-laid out at that shared content width, so they
+  stay perfectly centered inside the bar
+- The padding setting now means the vertical padding (the gap between
+  the text and the border above and below); the horizontal padding is
+  half of it, because the bar hugs the text closely on the left and
+  right
+- The outline width of the no-background mode follows each layer's
+  actual (auto-shrunk) font size
+---
+ .../newpipe/bisub/BisubSubtitleView.java      | 115 ++++++++++--------
+ app/src/main/res/values-zh-rCN/strings.xml    |   2 +-
+ app/src/main/res/values/strings.xml           |   2 +-
+ 3 files changed, 67 insertions(+), 52 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+index ac09cda42..dc995fed6 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+@@ -27,17 +27,18 @@ import java.util.List;
+  * tightly around each cue line: no padding and no rounded corners can be
+  * expressed through {@code CaptionStyleCompat}. This view instead renders
+  * the bilingual cues itself, so the in-app style fully controls the
+- * appearance: one overall size for the whole block (the background bar,
+- * the font size of both language lines, padding and corner radius all
+- * follow it), text color, translucent/opaque/none background (with a
+- * black outline in the "none" case), background padding, rounded corners,
+- * the wrap width and the vertical position of the subtitle block.</p>
++ * appearance: one overall size for the whole block (the font size of both
++ * language layers, padding and corner radius all follow it), text color,
++ * translucent/opaque/none background (with a black outline in the "none"
++ * case), background padding, rounded corners, the wrap width and the
++ * vertical position of the subtitle block.</p>
+  *
+- * <p>The layout is a fixed-width container, like a div with a set width
+- * containing two centered text layers: the background bar's width is
+- * derived from the overall size and the wrap width only, never from the
+- * text. Growing the size re-wraps both layers inside the bar (centered),
+- * it can never stretch or shrink the background.</p>
++ * <p>The layout is a fit-content block, like an inline-block div around
++ * the text: both layers wrap at the user-adjustable maximum width, then
++ * the background bar is sized to the widest line actually used plus
++ * padding — it hugs short cues tightly instead of spanning the whole
++ * bottom of the screen. Both layers are re-laid out at that shared
++ * content width so they stay centered inside the bar.</p>
+  *
+  * <p>The bilingual VTT written by {@link VttParser} uses exactly two lines
+  * per cue (original text, then translation), which is how this view tells
+@@ -130,23 +131,20 @@ public final class BisubSubtitleView extends View {
+         }
+         final float density = getResources().getDisplayMetrics().density;
+         // The overall scale resizes the whole block like resizing the
+-        // outer component: the background bar, the base font size,
+-        // padding, corners and cue gaps all follow it.
+-        final float padPx = style.paddingDp * density * baseScale;
++        // outer component: the base font size, padding, corners and cue
++        // gaps all follow it, and the background grows with the text.
++        final float padYPx = style.paddingDp * density * baseScale;
++        // Horizontal padding is half the vertical one: the bar hugs the
++        // text closely on the left and right, like an inline-block whose
++        // padding is mainly there for the lines above and below.
++        final float padXPx = padYPx / 2f;
+         final float radiusPx = style.cornerRadiusDp * density * baseScale;
+         final float cueGapPx = 12 * density * baseScale;
+-        // The background is a fixed-width container: its width depends
+-        // only on the overall scale and the user-adjustable wrap width
+-        // (0.5-1.0 of the view width), never on the text. Font sizes are
+-        // relative to that fixed bar: growing a language layer just
+-        // re-wraps it inside the bar, it can never stretch or shrink the
+-        // background (which is what "fit the background to the widest
+-        // line" did before).
+-        final float blockWidth = Math.min(
+-                width * Math.max(0.5f, Math.min(1.0f, style.maxWidthPercent))
+-                        * baseScale,
+-                width);
+-        final float layoutWidth = Math.max(1f, blockWidth - 2 * padPx);
++        // Long cues wrap at most at this width; the background itself is
++        // sized by the text that is actually shown (fit-content), so it
++        // only spans the wrap width when the text really needs it.
++        final float wrapWidth = Math.max(1f,
++                width * Math.max(0.5f, Math.min(1.0f, style.maxWidthPercent)));
+ 
+         if (preview) {
+             final float scale = Math.min(viewWidth / width, viewHeight / height);
+@@ -174,21 +172,37 @@ public final class BisubSubtitleView extends View {
+ 
+             final float textSize = baseTextSize * baseScale;
+ 
+-            // Both text layers live inside the fixed-width bar: each one
+-            // is laid out with the full layout width and centered on it
+-            // by ALIGN_CENTER, exactly like text-align: center inside a
+-            // fixed-width container. No per-layer re-wrapping, no shared
+-            // width measuring: the layers can never influence the bar.
+-            final StaticLayout originalLayout =
+-                    fitLayout(original, textSize, layoutWidth);
++            // Step 1: fit each layer inside the wrap width (shrinking
++            // long unbreakable tokens) and measure how wide it is.
++            final float originalSize = fitTextSize(original, textSize, wrapWidth);
++            final float translationSize = translation != null
++                    ? fitTextSize(translation, textSize, wrapWidth) : 0f;
++            final StaticLayout originalProbe = layout(original, originalSize, wrapWidth);
++            final StaticLayout translationProbe = translation != null
++                    ? layout(translation, translationSize, wrapWidth) : null;
++
++            // Step 2: size the bar to the widest line actually used plus
++            // horizontal padding (CSS fit-content + padding). Long cues
++            // still wrap at the wrap width, so the bar never spans the
++            // whole screen unless the text needs it.
++            float contentWidth = measureWidth(originalProbe);
++            if (translationProbe != null) {
++                contentWidth = Math.max(contentWidth, measureWidth(translationProbe));
++            }
++            contentWidth = Math.min(Math.max(1f, contentWidth), wrapWidth);
++
++            // Step 3: rebuild both layers at the shared content width so
++            // every line centers inside the final bar: both layers share
++            // the same midpoint, like two lines inside one component.
++            final StaticLayout originalLayout = layout(original, originalSize, contentWidth);
+             final StaticLayout translationLayout = translation != null
+-                    ? fitLayout(translation, textSize, layoutWidth)
+-                    : null;
++                    ? layout(translation, translationSize, contentWidth) : null;
+ 
+             final float gapPx = textSize * 0.25f;
+             final float blockHeight = originalLayout.getHeight()
+                     + (translationLayout != null
+-                        ? translationLayout.getHeight() + gapPx : 0) + 2 * padPx;
++                        ? translationLayout.getHeight() + gapPx : 0) + 2 * padYPx;
++            final float blockWidth = contentWidth + 2 * padXPx;
+             final float center = width / 2f;
+             final float left = center - blockWidth / 2f;
+             // Keep oversized blocks (large scales) on screen instead of
+@@ -213,13 +227,13 @@ public final class BisubSubtitleView extends View {
+                 }
+             }
+ 
+-            float y = top + padPx;
+-            y = drawLayout(canvas, originalLayout, left + padPx, y,
+-                    style.backgroundMode == BisubStyle.BG_NONE, textSize);
++            float y = top + padYPx;
++            y = drawLayout(canvas, originalLayout, left + padXPx, y,
++                    style.backgroundMode == BisubStyle.BG_NONE, originalSize);
+             if (translationLayout != null) {
+-                drawLayout(canvas, translationLayout, left + padPx, y + gapPx,
++                drawLayout(canvas, translationLayout, left + padXPx, y + gapPx,
+                         style.backgroundMode == BisubStyle.BG_NONE,
+-                        textSize);
++                        translationSize);
+             }
+ 
+             bottom = top - cueGapPx;
+@@ -244,20 +258,21 @@ public final class BisubSubtitleView extends View {
+     }
+ 
+     /**
+-     * Builds a layout that fits the given width: a line holding a single
+-     * unbreakable token (long word, URL) wider than the available width
+-     * is not wrapped by {@link StaticLayout} but overflows it, so the
+-     * font size is stepped down until every line fits. This keeps text
+-     * inside the background block at any font scale.
++     * Computes the font size at which the text fits the given width: a
++     * line holding a single unbreakable token (long word, URL) wider than
++     * the available width is not wrapped by {@link StaticLayout} but
++     * overflows it, so the font size is stepped down until every line
++     * fits. This keeps text inside the background block at any font
++     * scale. The caller then builds the final layout itself, at the width
++     * the whole block ends up using.
+      *
+      * @param text     the text to lay out
+      * @param textSize the desired font size in px
+      * @param maxWidth the available width in px
+-     * @return a layout whose widest line does not exceed {@code maxWidth}
++     * @return the font size in px at which the widest line fits
+      */
+-    @NonNull
+-    private StaticLayout fitLayout(@NonNull final String text, final float textSize,
+-                                   final float maxWidth) {
++    private float fitTextSize(@NonNull final String text, final float textSize,
++                              final float maxWidth) {
+         float size = textSize;
+         StaticLayout result = layout(text, size, maxWidth);
+         for (int attempt = 0; attempt < 3; attempt++) {
+@@ -268,7 +283,7 @@ public final class BisubSubtitleView extends View {
+             size *= Math.max(0.5f, maxWidth / measured * 0.98f);
+             result = layout(text, size, maxWidth);
+         }
+-        return result;
++        return size;
+     }
+ 
+     private static float measureWidth(@NonNull final StaticLayout layout) {
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index f63a5d46e..b62266345 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1246,7 +1246,7 @@
+     <string name="bisub_style_base_size">字幕大小</string>
+     <string name="bisub_style_text_color">文字颜色</string>
+     <string name="bisub_style_background">背景</string>
+-    <string name="bisub_style_padding">内边距</string>
++    <string name="bisub_style_padding">上下内边距</string>
+     <string name="bisub_style_corner_radius">圆角半径</string>
+     <string name="bisub_style_max_width">文字最大宽度</string>
+     <string name="bisub_style_position">垂直位置</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 859ecb5a7..817331631 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1251,7 +1251,7 @@
+     <string name="bisub_style_base_size">Subtitle size</string>
+     <string name="bisub_style_text_color">Text color</string>
+     <string name="bisub_style_background">Background</string>
+-    <string name="bisub_style_padding">Padding</string>
++    <string name="bisub_style_padding">Vertical padding</string>
+     <string name="bisub_style_corner_radius">Corner radius</string>
+     <string name="bisub_style_max_width">Maximum text width</string>
+     <string name="bisub_style_position">Vertical position</string>
+-- 
+2.54.0.windows.1
+

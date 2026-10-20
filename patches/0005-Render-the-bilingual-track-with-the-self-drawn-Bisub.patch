@@ -1,7 +1,7 @@
 From d6fbdaaec2285fcee3a017adc9999a97815ccadb Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 09:37:50 +0800
-Subject: [PATCH 5/6] Render the bilingual track with the self-drawn
+Subject: [PATCH 5/8] Render the bilingual track with the self-drawn
  BisubSubtitleView in the player
 
 - player.xml: add BisubSubtitleView layered above the exo SubtitleView
