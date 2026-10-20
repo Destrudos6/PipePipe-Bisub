@@ -1,7 +1,7 @@
 From 5a7ef49f491d52e46d533613231b14a25ed3fc56 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 12:45:02 +0800
-Subject: [PATCH 08/10] Add a cached-subtitles browser to the bisub settings
+Subject: [PATCH 08/11] Add a cached-subtitles browser to the bisub settings
 
 Every finished translation now writes a .meta sidecar next to its
 cache file, recording the video title and id, source and target
