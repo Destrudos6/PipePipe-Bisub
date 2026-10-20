@@ -47,7 +47,7 @@ PipePipe 设置 → **Bilingual subtitles**：
 ## 本地构建
 
 ```bash
-./build.sh                # 基线 v5.5.0-beta3 + extractor 73442076 构建
+./build.sh                # 基线 client b7cd5a34c + extractor 73442076 构建
 ./build.sh dev main       # 跟随上游 dev/main
 ./build.sh dev main --keep-source   # 保留源码目录以便调试
 ```

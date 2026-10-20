@@ -14,9 +14,9 @@
 
 set -euo pipefail
 
-CLIENT_URL="https://github.com/InfinityLoop1308/PipePipeClient.git"
-EXTRACTOR_URL="https://github.com/InfinityLoop1308/PipePipeExtractor.git"
-DEFAULT_CLIENT_REF="v5.5.0-beta3"
+CLIENT_URL="https://codeberg.org/NullPointerException/PipePipeClient.git"
+EXTRACTOR_URL="https://codeberg.org/NullPointerException/PipePipeExtractor.git"
+DEFAULT_CLIENT_REF="b7cd5a34cfa5cbf52474dd075fe82e414d162fae"
 DEFAULT_EXTRACTOR_REF="73442076c671ae09bd5c0f9635932a5a67bdd609"
 
 CLIENT_REF="${1:-$DEFAULT_CLIENT_REF}"

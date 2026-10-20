@@ -9,7 +9,7 @@ on:
       client_ref:
         description: 'PipePipeClient branch/tag/commit to build from'
         required: false
-        default: 'v5.5.0-beta3'
+        default: "b7cd5a34cfa5cbf52474dd075fe82e414d162fae"
       extractor_ref:
         description: 'PipePipeExtractor branch/tag/commit (must be compatible with the client ref)'
         required: false
@@ -39,13 +39,13 @@ jobs:
       # under the same parent directory.
       - name: Clone upstream PipePipeClient
         run: |
-          git clone https://github.com/InfinityLoop1308/PipePipeClient.git src/PipePipeClient
+          git clone https://codeberg.org/NullPointerException/PipePipeClient.git src/PipePipeClient
           cd src/PipePipeClient
           git checkout "$CLIENT_REF"
 
       - name: Clone upstream PipePipeExtractor
         run: |
-          git clone https://github.com/InfinityLoop1308/PipePipeExtractor.git src/PipePipeExtractor
+          git clone https://codeberg.org/NullPointerException/PipePipeExtractor.git src/PipePipeExtractor
           cd src/PipePipeExtractor
           git checkout "$EXTRACTOR_REF"
 
