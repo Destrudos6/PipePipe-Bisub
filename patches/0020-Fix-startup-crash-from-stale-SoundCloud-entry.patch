@@ -1,0 +1,133 @@
+From 41c82ed7c64bc0118bf99d7829d0aeae15e297e3 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 21:11:16 +0800
+Subject: [PATCH] Fix startup crash from stale SoundCloud entry in service_list
+ array
+
+The service_list string array still contained @string/soundcloud after
+the services were removed, so FeedImportExportItem crashed with
+RuntimeException (There's no service with the name = SoundCloud) while
+binding the subscriptions import/export card at startup.
+
+- Remove the stale @string/soundcloud item from service_list
+- Remove now-unreferenced soundcloud/peertube strings and preference keys
+- Drop dead SoundCloud branches in ServiceHelper import instructions
+- Make FeedImportExportItem skip invalid service names instead of
+  throwing, to prevent future startup crashes of the same kind
+---
+ .../local/subscription/item/FeedImportExportItem.kt      | 5 ++++-
+ .../main/java/org/schabi/newpipe/util/ServiceHelper.java | 9 +--------
+ app/src/main/res/values/donottranslate.xml               | 2 --
+ app/src/main/res/values/settings_keys.xml                | 5 -----
+ 4 files changed, 5 insertions(+), 16 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/local/subscription/item/FeedImportExportItem.kt b/app/src/main/java/org/schabi/newpipe/local/subscription/item/FeedImportExportItem.kt
+index 1d49de069..39b721169 100644
+--- a/app/src/main/java/org/schabi/newpipe/local/subscription/item/FeedImportExportItem.kt
++++ b/app/src/main/java/org/schabi/newpipe/local/subscription/item/FeedImportExportItem.kt
+@@ -2,6 +2,7 @@ package org.schabi.newpipe.local.subscription.item
+ 
+ import android.graphics.Color
+ import android.graphics.PorterDuff
++import android.util.Log
+ import android.view.View
+ import android.view.ViewGroup
+ import android.widget.ImageView
+@@ -32,6 +33,7 @@ class FeedImportExportItem(
+     companion object {
+         const val REFRESH_EXPANDED_STATUS = 123
+         const val PAYLOAD_UPDATE_SEARCH = "update_search"
++        private const val TAG = "FeedImportExportItem"
+     }
+ 
+     override fun bind(viewBinding: FeedImportExportGroupBinding, position: Int, payloads: MutableList<Any>) {
+@@ -145,7 +147,8 @@ class FeedImportExportItem(
+ 
+                 itemView.setOnClickListener { onImportFromServiceSelected(service.serviceId) }
+             } catch (e: ExtractionException) {
+-                throw RuntimeException("Services array contains an entry that it's not a valid service name ($serviceName)", e)
++                Log.e(TAG, "Services array contains an entry that is not a valid service "
++                        + "name ($serviceName), skipping", e)
+             }
+         }
+     }
+diff --git a/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java b/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
+index 8e189d46a..bd018433e 100644
+--- a/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
++++ b/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
+@@ -168,8 +168,6 @@ public final class ServiceHelper {
+         switch (serviceId) {
+             case 0:
+                 return R.string.import_youtube_instructions;
+-            case 1:
+-                return R.string.import_soundcloud_instructions;
+             default:
+                 return -1;
+         }
+@@ -184,12 +182,7 @@ public final class ServiceHelper {
+      */
+     @StringRes
+     public static int getImportInstructionsHint(final int serviceId) {
+-        switch (serviceId) {
+-            case 1:
+-                return R.string.import_soundcloud_instructions_hint;
+-            default:
+-                return -1;
+-        }
++        return -1;
+     }
+ 
+     public static int getSelectedServiceId(final Context context) {
+diff --git a/app/src/main/res/values/donottranslate.xml b/app/src/main/res/values/donottranslate.xml
+index 95f3e7a85..b7ac405a8 100644
+--- a/app/src/main/res/values/donottranslate.xml
++++ b/app/src/main/res/values/donottranslate.xml
+@@ -3,7 +3,6 @@
+     <string name="fdroid_vlc_url">https://f-droid.org/packages/org.videolan.vlc/</string>
+     <string name="rss_button_title">RSS</string>
+     <string name="kore_package">org.xbmc.kore</string>
+-    <string name="peertube_instance_list_url">https://joinpeertube.org/instances#instances-list</string>
+     <string name="notification_channel_id">PipePipe</string>
+     <string name="app_update_notification_channel_id">PipePipeAppUpdate</string>
+     <string name="hash_channel_id">PipePipeHash</string>
+@@ -23,7 +22,6 @@
+     <string name="privacy_policy_url">https://newpipe.net/legal/privacy/</string>
+     <string name="service_kiosk_string">%1$s/%2$s</string>
+     <string name="youtube">YouTube</string>
+-    <string name="soundcloud">SoundCloud</string>
+     <string name="preferred_open_action_share_menu_title">@string/app_name</string>
+     <string name="leakcanary">LeakCanary</string>
+     <string name="caption_file_name">%1$s-%2$s</string>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 8a6da3dcd..2ebf3e18d 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -6,7 +6,6 @@
+     <!-- Service -->
+     <string-array name="service_list">
+         <item>@string/youtube</item>
+-        <item>@string/soundcloud</item>
+     </string-array>
+     <string name="current_service_key">service</string>
+     <string name="default_service_value">@string/youtube</string>
+@@ -304,9 +303,6 @@
+     <string name="stream_info_selected_tab_key">stream_info_selected_tab</string>
+     <string name="show_hold_to_append_key">show_hold_to_append</string>
+     <string name="content_language_key">content_language</string>
+-    <string name="peertube_instance_setup_key">peertube_instance_setup</string>
+-    <string name="peertube_selected_instance_key">peertube_selected_instance</string>
+-    <string name="peertube_instance_list_key">peertube_instance_list</string>
+     <string name="content_country_key">content_country</string>
+     <string name="show_auto_translated_subtitles_key">show_auto_translated_subtitles</string>
+     <string name="show_age_restricted_content">show_age_restricted_content</string>
+@@ -1790,7 +1786,6 @@
+     <string name="import_subscriptions_key">import_subscriptions</string>
+     <string name="export_subscriptions_key">export_subscriptions</string>
+     <string name="import_youtube_subscriptions_key">import_youtube_subscriptions</string>
+-    <string name="import_soundcloud_subscriptions_key">import_soundcloud_subscriptions</string>
+     <string name="clear_subscriptions_key">clear_subscriptions</string>
+     <string name="rotate_fullscreen_to_video_orientation_key">rotate_fullscreen_to_video_orientation</string>
+     <string name="rotation_controls_fullscreen_key" translatable="false">rotation_controls_fullscreen</string>
+-- 
+2.54.0.windows.1
+
