@@ -1,0 +1,859 @@
+From 31f59db866fb42630a5c950008fd46bb77ae179d Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 13:54:18 +0800
+Subject: [PATCH 9/9] Support multiple translation provider profiles
+
+The single provider/model configuration becomes a list of named
+profiles (provider preset, base URL, API key, model, parallel
+requests and lines per request), stored as JSON in the shared
+preferences. A new "Translation profile" entry at the top of the
+bisub settings switches between them with one tap: every connection
+field below the picker rebinds to the selected profile, and edits
+there write back into it. Adding a profile starts from a copy of the
+current one, so switching to another model of the same provider is
+just a rename plus a new model name; profiles can be deleted after
+confirmation.
+
+The first run migrates the legacy single-provider settings into a
+profile named after the provider preset, so nothing is lost. The
+parallel request and batch size settings now belong to the profile,
+because providers differ in how much concurrency and how large
+requests they tolerate. Switching to a profile with a different
+model retranslates videos on demand (the cache key includes the
+model); files translated with the old model stay on disk and remain
+visible in the cache browser.
+---
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 340 +++++++++++++++++-
+ .../settings/BisubSettingsFragment.java       | 289 ++++++++++++++-
+ app/src/main/res/values-zh-rCN/strings.xml    |  12 +
+ app/src/main/res/values/settings_keys.xml     |   3 +
+ app/src/main/res/values/strings.xml           |  11 +
+ app/src/main/res/xml/bisub_settings.xml       |   6 +
+ 6 files changed, 636 insertions(+), 25 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index a7353e695..7f33b5118 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -2,13 +2,20 @@ package org.schabi.newpipe.bisub;
+ 
+ import android.content.Context;
+ import android.content.SharedPreferences;
++import android.util.Log;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ import androidx.preference.PreferenceManager;
+ 
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
+ import org.schabi.newpipe.R;
+ 
++import java.util.ArrayList;
++import java.util.List;
++
+ /**
+  * Reads and validates the bilingual subtitle ("bisub") user configuration
+  * from the default shared preferences.
+@@ -72,6 +79,107 @@ public final class BisubPrefs {
+         }
+     }
+ 
++    /**
++     * One saved translation provider configuration: everything the
++     * translation pipeline needs to call one model (plus the request
++     * tuning, which differs per provider). Users keep several of these
++     * (one per provider, or one per model) and switch between them in
++     * the bisub settings.
++     */
++    public static final class ProviderProfile {
++        /** Stable unique id used to reference the active profile. */
++        @NonNull public final String id;
++        /** User-chosen display name shown in the profile picker. */
++        @NonNull public final String name;
++        /** Provider preset value (a value of bisub_provider_values). */
++        @Nullable public final String provider;
++        @Nullable public final String baseUrl;
++        @Nullable public final String apiKey;
++        @Nullable public final String model;
++        public final int concurrency;
++        public final int batchSize;
++
++        @SuppressWarnings("checkstyle:ParameterNumber")
++        public ProviderProfile(@NonNull final String id, @NonNull final String name,
++                               @Nullable final String provider,
++                               @Nullable final String baseUrl, @Nullable final String apiKey,
++                               @Nullable final String model, final int concurrency,
++                               final int batchSize) {
++            this.id = id;
++            this.name = name;
++            this.provider = provider;
++            this.baseUrl = baseUrl;
++            this.apiKey = apiKey;
++            this.model = model;
++            this.concurrency = concurrency;
++            this.batchSize = batchSize;
++        }
++
++        /**
++         * @param provider the new provider preset value
++         * @param baseUrl  the new API base URL
++         * @param model    the new model name
++         * @return a copy with the connection fields replaced
++         */
++        @NonNull
++        public ProviderProfile withConnection(@Nullable final String provider,
++                                              @Nullable final String baseUrl,
++                                              @Nullable final String model) {
++            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++                    concurrency, batchSize);
++        }
++
++        /**
++         * @param apiKey the new API key
++         * @return a copy with the API key replaced
++         */
++        @NonNull
++        public ProviderProfile withApiKey(@Nullable final String apiKey) {
++            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++                    concurrency, batchSize);
++        }
++
++        /**
++         * @param concurrency the new parallel request count
++         * @param batchSize   the new lines-per-request count
++         * @return a copy with the request tuning replaced
++         */
++        @NonNull
++        public ProviderProfile withTuning(final int concurrency, final int batchSize) {
++            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++                    concurrency, batchSize);
++        }
++
++        @NonNull
++        private JSONObject toJson() throws JSONException {
++            final JSONObject json = new JSONObject();
++            json.put("id", id);
++            json.put("name", name);
++            json.put("provider", provider == null ? "" : provider);
++            json.put("baseUrl", baseUrl == null ? "" : baseUrl);
++            json.put("apiKey", apiKey == null ? "" : apiKey);
++            json.put("model", model == null ? "" : model);
++            json.put("concurrency", concurrency);
++            json.put("batchSize", batchSize);
++            return json;
++        }
++
++        @Nullable
++        private static ProviderProfile fromJson(@NonNull final JSONObject json) {
++            final String id = json.optString("id", null);
++            final String name = json.optString("name", null);
++            if (isBlank(id) || isBlank(name)) {
++                return null;
++            }
++            return new ProviderProfile(id, name, nonBlankOrNull(json.optString("provider", null)),
++                    nonBlankOrNull(json.optString("baseUrl", null)),
++                    nonBlankOrNull(json.optString("apiKey", null)),
++                    nonBlankOrNull(json.optString("model", null)),
++                    json.optInt("concurrency", Config.CONCURRENCY_DEFAULT),
++                    json.optInt("batchSize", Config.BATCH_SIZE_DEFAULT));
++        }
++    }
++
+     /**
+      * Immutable snapshot of the in-app bilingual subtitle style. It replaces
+      * the Android system caption style (which is unreachable on systems that
+@@ -170,7 +278,9 @@ public final class BisubPrefs {
+     }
+ 
+     /**
+-     * Loads the current bisub configuration.
++     * Loads the current bisub configuration. The connection fields come
++     * from the active provider profile; the enable switch and the
++     * languages are global.
+      *
+      * @param context any context; only the application context is retained indirectly
+      * @return a snapshot of the current settings
+@@ -179,22 +289,232 @@ public final class BisubPrefs {
+     public static Config load(@NonNull final Context context) {
+         final SharedPreferences prefs =
+                 PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        final ProviderProfile active = getActiveProfile(context);
+         return new Config(
+                 prefs.getBoolean(context.getString(R.string.bisub_enable_key), false),
+-                prefs.getString(context.getString(R.string.bisub_provider_key), null),
+-                prefs.getString(context.getString(R.string.bisub_base_url_key), null),
+-                prefs.getString(context.getString(R.string.bisub_api_key_key), null),
+-                prefs.getString(context.getString(R.string.bisub_model_key), null),
++                active == null ? null : active.provider,
++                active == null ? null : active.baseUrl,
++                active == null ? null : active.apiKey,
++                active == null ? null : active.model,
+                 prefs.getString(context.getString(R.string.bisub_target_lang_key), null),
+                 prefs.getString(context.getString(R.string.bisub_source_lang_key), null),
+-                readIntInRange(prefs,
+-                        context.getString(R.string.bisub_concurrency_key),
++                active == null ? Config.CONCURRENCY_DEFAULT
++                        : clampInt(active.concurrency, Config.CONCURRENCY_MIN,
++                        Config.CONCURRENCY_MAX, Config.CONCURRENCY_DEFAULT),
++                active == null ? Config.BATCH_SIZE_DEFAULT
++                        : clampInt(active.batchSize, Config.BATCH_SIZE_MIN,
++                        Config.BATCH_SIZE_MAX, Config.BATCH_SIZE_DEFAULT));
++    }
++
++    /**
++     * Loads every saved provider profile, migrating the legacy
++     * single-provider settings the first time this runs.
++     *
++     * @param context any context
++     * @return the profiles, possibly empty, never {@code null}
++     */
++    @NonNull
++    public static List<ProviderProfile> loadProfiles(@NonNull final Context context) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        final List<ProviderProfile> profiles = new ArrayList<>();
++        final String raw = prefs.getString(context.getString(R.string.bisub_profiles_key), null);
++        if (raw != null) {
++            try {
++                final JSONArray array = new JSONArray(raw);
++                for (int i = 0; i < array.length(); i++) {
++                    final ProviderProfile profile =
++                            ProviderProfile.fromJson(array.optJSONObject(i));
++                    if (profile != null) {
++                        profiles.add(profile);
++                    }
++                }
++            } catch (final JSONException e) {
++                Log.w("BisubPrefs", "Could not parse the provider profiles", e);
++            }
++        } else {
++            migrateLegacyProfile(context, prefs, profiles);
++        }
++        return profiles;
++    }
++
++    /**
++     * Persists the provider profile list.
++     *
++     * @param context  any context
++     * @param profiles the profiles to store
++     */
++    public static void saveProfiles(@NonNull final Context context,
++                                    @NonNull final List<ProviderProfile> profiles) {
++        final JSONArray array = new JSONArray();
++        for (final ProviderProfile profile : profiles) {
++            try {
++                array.put(profile.toJson());
++            } catch (final JSONException e) {
++                Log.w("BisubPrefs", "Could not serialize a provider profile", e);
++            }
++        }
++        PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext())
++                .edit()
++                .putString(context.getString(R.string.bisub_profiles_key), array.toString())
++                .apply();
++    }
++
++    /**
++     * @param context any context
++     * @return the id of the active profile, or {@code null} when unset
++     */
++    @Nullable
++    public static String getActiveProfileId(@NonNull final Context context) {
++        return PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext())
++                .getString(context.getString(R.string.bisub_active_profile_key), null);
++    }
++
++    /**
++     * Selects the active provider profile.
++     *
++     * @param context any context
++     * @param id      the profile id to activate
++     */
++    public static void setActiveProfileId(@NonNull final Context context,
++                                          @Nullable final String id) {
++        PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext())
++                .edit()
++                .putString(context.getString(R.string.bisub_active_profile_key), id)
++                .apply();
++    }
++
++    /**
++     * @param context any context
++     * @return the active profile, the first one when none is selected
++     *         explicitly, or {@code null} when there are no profiles
++     */
++    @Nullable
++    public static ProviderProfile getActiveProfile(@NonNull final Context context) {
++        final List<ProviderProfile> profiles = loadProfiles(context);
++        final String activeId = getActiveProfileId(context);
++        if (activeId != null) {
++            for (final ProviderProfile profile : profiles) {
++                if (profile.id.equals(activeId)) {
++                    return profile;
++                }
++            }
++        }
++        return profiles.isEmpty() ? null : profiles.get(0);
++    }
++
++    /**
++     * Replaces one profile (or appends it when its id is unknown).
++     *
++     * @param context any context
++     * @param updated the profile with the same id as the one to replace
++     */
++    public static void replaceProfile(@NonNull final Context context,
++                                      @NonNull final ProviderProfile updated) {
++        final List<ProviderProfile> profiles = loadProfiles(context);
++        for (int i = 0; i < profiles.size(); i++) {
++            if (profiles.get(i).id.equals(updated.id)) {
++                profiles.set(i, updated);
++                saveProfiles(context, profiles);
++                return;
++            }
++        }
++        profiles.add(updated);
++        saveProfiles(context, profiles);
++        setActiveProfileId(context, updated.id);
++    }
++
++    /**
++     * Adds a profile and makes it the active one.
++     *
++     * @param context any context
++     * @param profile the profile to add
++     */
++    public static void addProfile(@NonNull final Context context,
++                                  @NonNull final ProviderProfile profile) {
++        final List<ProviderProfile> profiles = loadProfiles(context);
++        profiles.add(profile);
++        saveProfiles(context, profiles);
++        setActiveProfileId(context, profile.id);
++    }
++
++    /**
++     * Deletes a profile. When the active one is deleted, the first
++     * remaining profile takes over (or none, when the list becomes empty).
++     *
++     * @param context any context
++     * @param id      the id of the profile to delete
++     */
++    public static void deleteProfile(@NonNull final Context context,
++                                     @NonNull final String id) {
++        final List<ProviderProfile> profiles = loadProfiles(context);
++        for (int i = 0; i < profiles.size(); i++) {
++            if (profiles.get(i).id.equals(id)) {
++                profiles.remove(i);
++                break;
++            }
++        }
++        saveProfiles(context, profiles);
++        if (id.equals(getActiveProfileId(context))) {
++            setActiveProfileId(context, profiles.isEmpty() ? null : profiles.get(0).id);
++        }
++    }
++
++    /**
++     * Creates the first profile out of the legacy single-provider
++     * preference keys, so an update never loses an existing setup.
++     *
++     * @param context  any context
++     * @param prefs    the default shared preferences
++     * @param profiles the (empty) list to append the legacy profile to
++     */
++    private static void migrateLegacyProfile(@NonNull final Context context,
++                                             @NonNull final SharedPreferences prefs,
++                                             @NonNull final List<ProviderProfile> profiles) {
++        final String baseUrl = prefs.getString(
++                context.getString(R.string.bisub_base_url_key), null);
++        final String apiKey = prefs.getString(
++                context.getString(R.string.bisub_api_key_key), null);
++        final String model = prefs.getString(
++                context.getString(R.string.bisub_model_key), null);
++        if (isBlank(baseUrl) && isBlank(apiKey) && isBlank(model)) {
++            return;
++        }
++        final String provider = prefs.getString(
++                context.getString(R.string.bisub_provider_key), null);
++        profiles.add(new ProviderProfile("legacy", legacyName(provider), provider,
++                baseUrl, apiKey, model,
++                readIntInRange(prefs, context.getString(R.string.bisub_concurrency_key),
+                         Config.CONCURRENCY_DEFAULT, Config.CONCURRENCY_MIN,
+                         Config.CONCURRENCY_MAX),
+-                readIntInRange(prefs,
+-                        context.getString(R.string.bisub_batch_size_key),
++                readIntInRange(prefs, context.getString(R.string.bisub_batch_size_key),
+                         Config.BATCH_SIZE_DEFAULT, Config.BATCH_SIZE_MIN,
+-                        Config.BATCH_SIZE_MAX));
++                        Config.BATCH_SIZE_MAX)));
++        saveProfiles(context, profiles);
++        setActiveProfileId(context, "legacy");
++    }
++
++    @NonNull
++    private static String legacyName(@Nullable final String provider) {
++        if (isBlank(provider) || "custom".equals(provider)) {
++            return "Default";
++        }
++        return provider.substring(0, 1).toUpperCase(java.util.Locale.ROOT)
++                + provider.substring(1);
++    }
++
++    private static boolean isBlank(@Nullable final String s) {
++        return s == null || s.trim().isEmpty();
++    }
++
++    @Nullable
++    private static String nonBlankOrNull(@Nullable final String s) {
++        return isBlank(s) ? null : s;
++    }
++
++    private static int clampInt(final int value, final int min, final int max,
++                                final int fallback) {
++        return value < min || value > max ? fallback : value;
+     }
+ 
+     /**
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index e49f337ad..2f86d9966 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -9,6 +9,7 @@ import android.text.TextUtils;
+ import android.util.TypedValue;
+ import android.view.LayoutInflater;
+ import android.view.View;
++import android.widget.EditText;
+ import android.widget.RadioGroup;
+ import android.widget.ScrollView;
+ import android.widget.SeekBar;
+@@ -42,6 +43,7 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.UUID;
+ 
+ /**
+  * Settings fragment for the bilingual subtitle (bisub) feature.
+@@ -97,18 +99,22 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+ 
+         prefs = PreferenceManager.getDefaultSharedPreferences(requireContext());
+ 
++        setupProfileButton();
+         setupProviderPreset();
+         setupApiKeySummary();
++        setupConnectionBindings();
++        setupNumericBindings();
+         setupTestButton();
+         setupCaptionStyleButton();
+         setupCachedListButton();
++        refreshProfileBindings();
+         prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
+     }
+ 
+     @Override
+     public void onResume() {
+         super.onResume();
+-        refreshEnableSummary();
++        refreshProfileBindings();
+     }
+ 
+     @Override
+@@ -119,17 +125,268 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         }
+     }
+ 
++    /**
++     * Opens the provider profile picker: tap an entry to switch every
++     * connection field at once, or add/delete profiles with the dialog
++     * buttons. Adding starts from a copy of the currently selected
++     * profile, so switching to another model of the same provider is just
++     * "add, rename, edit the model name".
++     */
++    private void setupProfileButton() {
++        final Preference profilePref = requirePreference(R.string.bisub_profile_key);
++        profilePref.setOnPreferenceClickListener((final Preference p) -> {
++            showProfilePicker();
++            return true;
++        });
++    }
++
++    private void showProfilePicker() {
++        final Context context = requireContext();
++        final List<BisubPrefs.ProviderProfile> profiles = BisubPrefs.loadProfiles(context);
++        if (profiles.isEmpty()) {
++            showProfileAddDialog();
++            return;
++        }
++        final BisubPrefs.ProviderProfile active = BisubPrefs.getActiveProfile(context);
++        int checked = 0;
++        final String[] labels = new String[profiles.size()];
++        for (int i = 0; i < profiles.size(); i++) {
++            final BisubPrefs.ProviderProfile profile = profiles.get(i);
++            labels[i] = isBlank(profile.model)
++                    ? profile.name : profile.name + " · " + profile.model;
++            if (active != null && profile.id.equals(active.id)) {
++                checked = i;
++            }
++        }
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_profile_title)
++                .setSingleChoiceItems(labels, checked,
++                        (final DialogInterface dialog, final int which) -> {
++                            BisubPrefs.setActiveProfileId(context,
++                                    profiles.get(which).id);
++                            refreshProfileBindings();
++                            dialog.dismiss();
++                        })
++                .setPositiveButton(R.string.bisub_profile_add,
++                        (final DialogInterface dialog, final int which) ->
++                                showProfileAddDialog())
++                .setNeutralButton(R.string.bisub_profile_delete,
++                        (final DialogInterface dialog, final int which) ->
++                                showProfileDeleteDialog())
++                .show();
++    }
++
++    private void showProfileAddDialog() {
++        final Context context = requireContext();
++        final EditText nameInput = new EditText(context);
++        nameInput.setHint(R.string.bisub_profile_add_hint);
++        final int padding = Math.round(
++                16f * context.getResources().getDisplayMetrics().density);
++        nameInput.setPadding(padding, padding / 2, padding, padding / 2);
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_profile_add_title)
++                .setMessage(R.string.bisub_profile_add_copies)
++                .setView(nameInput)
++                .setPositiveButton(android.R.string.ok,
++                        (final DialogInterface dialog, final int which) -> {
++                            final String name = nameInput.getText().toString().trim();
++                            if (name.isEmpty()) {
++                                Toast.makeText(context, R.string.bisub_profile_name_required,
++                                        Toast.LENGTH_SHORT).show();
++                                return;
++                            }
++                            final BisubPrefs.ProviderProfile active =
++                                    BisubPrefs.getActiveProfile(context);
++                            BisubPrefs.addProfile(context, new BisubPrefs.ProviderProfile(
++                                    UUID.randomUUID().toString(), name,
++                                    active == null ? "custom" : active.provider,
++                                    active == null ? null : active.baseUrl,
++                                    active == null ? null : active.apiKey,
++                                    active == null ? null : active.model,
++                                    active == null ? BisubPrefs.Config.CONCURRENCY_DEFAULT
++                                            : active.concurrency,
++                                    active == null ? BisubPrefs.Config.BATCH_SIZE_DEFAULT
++                                            : active.batchSize));
++                            refreshProfileBindings();
++                        })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private void showProfileDeleteDialog() {
++        final Context context = requireContext();
++        final List<BisubPrefs.ProviderProfile> profiles = BisubPrefs.loadProfiles(context);
++        if (profiles.isEmpty()) {
++            Toast.makeText(context, R.string.bisub_profile_none, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        final String[] labels = new String[profiles.size()];
++        for (int i = 0; i < profiles.size(); i++) {
++            labels[i] = profiles.get(i).name;
++        }
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_profile_delete_title)
++                .setItems(labels, (final DialogInterface dialog, final int which) -> {
++                    final BisubPrefs.ProviderProfile victim = profiles.get(which);
++                    new AlertDialog.Builder(context)
++                            .setTitle(R.string.bisub_profile_delete_title)
++                            .setMessage(getString(R.string.bisub_profile_delete_confirm,
++                                    victim.name))
++                            .setPositiveButton(R.string.bisub_profile_delete,
++                                    (final DialogInterface inner, final int w) -> {
++                                        BisubPrefs.deleteProfile(context, victim.id);
++                                        refreshProfileBindings();
++                                    })
++                            .setNegativeButton(android.R.string.cancel, null)
++                            .show();
++                })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    /**
++     * Rebinds every connection-related preference to the active profile:
++     * the profile summary, the provider preset, the base URL, API key,
++     * model and the request tuning. Editing any of them writes back into
++     * the profile, so the plain preference fields below the picker always
++     * show (and edit) the active profile only.
++     */
++    private void refreshProfileBindings() {
++        final BisubPrefs.ProviderProfile active = BisubPrefs.getActiveProfile(
++                requireContext());
++        final Preference profilePref = requirePreference(R.string.bisub_profile_key);
++        profilePref.setSummary(active == null
++                ? getString(R.string.bisub_profile_none)
++                : getString(R.string.bisub_profile_summary_format, active.name,
++                        active.model == null ? "" : active.model));
++
++        final ListPreference providerPref =
++                (ListPreference) requirePreference(R.string.bisub_provider_key);
++        providerPref.setValue(active == null || isBlank(active.provider)
++                ? "custom" : active.provider);
++
++        final EditTextPreference baseUrlPref =
++                (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
++        baseUrlPref.setText(active == null ? null : active.baseUrl);
++        final EditTextPreference modelPref =
++                (EditTextPreference) requirePreference(R.string.bisub_model_key);
++        modelPref.setText(active == null ? null : active.model);
++        final EditTextPreference apiKeyPref =
++                (EditTextPreference) requirePreference(R.string.bisub_api_key_key);
++        apiKeyPref.setText(active == null ? null : active.apiKey);
++        apiKeyPref.setSummary(active != null && !isBlank(active.apiKey)
++                ? getString(R.string.bisub_api_key_set)
++                : getString(R.string.bisub_api_key_unset));
++
++        final EditTextPreference concurrencyPref =
++                (EditTextPreference) requirePreference(R.string.bisub_concurrency_key);
++        concurrencyPref.setText(String.valueOf(active == null
++                ? BisubPrefs.Config.CONCURRENCY_DEFAULT : active.concurrency));
++        final EditTextPreference batchSizePref =
++                (EditTextPreference) requirePreference(R.string.bisub_batch_size_key);
++        batchSizePref.setText(String.valueOf(active == null
++                ? BisubPrefs.Config.BATCH_SIZE_DEFAULT : active.batchSize));
++
++        refreshEnableSummary();
++    }
++
++    /**
++     * Edits typed into the base URL and model fields write back into the
++     * active profile (the shared preferences under them are only a shadow
++     * for the dialog pre-fill).
++     */
++    private void setupConnectionBindings() {
++        final EditTextPreference baseUrlPref =
++                (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
++        baseUrlPref.setOnPreferenceChangeListener((final Preference p,
++                                                   final Object newValue) -> {
++            applyToActive(String.valueOf(newValue), null);
++            return true;
++        });
++        final EditTextPreference modelPref =
++                (EditTextPreference) requirePreference(R.string.bisub_model_key);
++        modelPref.setOnPreferenceChangeListener((final Preference p,
++                                                 final Object newValue) -> {
++            applyToActive(null, String.valueOf(newValue));
++            return true;
++        });
++    }
++
++    private void applyToActive(@Nullable final String newBaseUrl,
++                               @Nullable final String newModel) {
++        final BisubPrefs.ProviderProfile active =
++                BisubPrefs.getActiveProfile(requireContext());
++        if (active == null) {
++            return;
++        }
++        BisubPrefs.replaceProfile(requireContext(), active.withConnection(
++                active.provider,
++                newBaseUrl == null ? active.baseUrl : newBaseUrl,
++                newModel == null ? active.model : newModel));
++    }
++
++    /**
++     * The request tuning preferences also belong to the active profile:
++     * providers differ in how much concurrency and how large requests
++     * they tolerate.
++     */
++    private void setupNumericBindings() {
++        final EditTextPreference concurrencyPref =
++                (EditTextPreference) requirePreference(R.string.bisub_concurrency_key);
++        concurrencyPref.setOnPreferenceChangeListener((final Preference p,
++                                                       final Object newValue) -> {
++            applyTuning(parseIntInRange(String.valueOf(newValue),
++                    BisubPrefs.Config.CONCURRENCY_DEFAULT, BisubPrefs.Config.CONCURRENCY_MIN,
++                    BisubPrefs.Config.CONCURRENCY_MAX), null);
++            return true;
++        });
++        final EditTextPreference batchSizePref =
++                (EditTextPreference) requirePreference(R.string.bisub_batch_size_key);
++        batchSizePref.setOnPreferenceChangeListener((final Preference p,
++                                                     final Object newValue) -> {
++            applyTuning(null, parseIntInRange(String.valueOf(newValue),
++                    BisubPrefs.Config.BATCH_SIZE_DEFAULT, BisubPrefs.Config.BATCH_SIZE_MIN,
++                    BisubPrefs.Config.BATCH_SIZE_MAX));
++            return true;
++        });
++    }
++
++    private void applyTuning(@Nullable final Integer newConcurrency,
++                             @Nullable final Integer newBatchSize) {
++        final BisubPrefs.ProviderProfile active =
++                BisubPrefs.getActiveProfile(requireContext());
++        if (active == null) {
++            return;
++        }
++        BisubPrefs.replaceProfile(requireContext(), active.withTuning(
++                newConcurrency == null ? active.concurrency : newConcurrency,
++                newBatchSize == null ? active.batchSize : newBatchSize));
++    }
++
++    private static int parseIntInRange(@Nullable final String raw, final int fallback,
++                                       final int min, final int max) {
++        if (raw == null || raw.trim().isEmpty()) {
++            return fallback;
++        }
++        try {
++            return Math.max(min, Math.min(max, Integer.parseInt(raw.trim())));
++        } catch (final NumberFormatException e) {
++            return fallback;
++        }
++    }
++
+     private void setupProviderPreset() {
+         final ListPreference providerPref =
+                 (ListPreference) requirePreference(R.string.bisub_provider_key);
+         providerPref.setOnPreferenceChangeListener((final Preference p,
+                                                     final Object newValue) -> {
+-            final String[] preset = PROVIDER_PRESETS.get(String.valueOf(newValue));
+-            if (preset != null) {
+-                final SharedPreferences.Editor editor = prefs.edit();
+-                editor.putString(getString(R.string.bisub_base_url_key), preset[0]);
+-                editor.putString(getString(R.string.bisub_model_key), preset[1]);
+-                editor.apply();
++            final String provider = String.valueOf(newValue);
++            final String[] preset = PROVIDER_PRESETS.get(provider);
++            final BisubPrefs.ProviderProfile active =
++                    BisubPrefs.getActiveProfile(requireContext());
++            if (preset != null && active != null) {
++                BisubPrefs.replaceProfile(requireContext(), active.withConnection(
++                        provider, preset[0], preset[1]));
+                 // Also refresh the visible preferences immediately
+                 final EditTextPreference baseUrlPref =
+                         (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
+@@ -146,17 +403,17 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+     private void setupApiKeySummary() {
+         final EditTextPreference apiKeyPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_api_key_key);
+-        apiKeyPref.setSummary(isBlank(prefs.getString(
+-                getString(R.string.bisub_api_key_key), null))
+-                ? getString(R.string.bisub_api_key_unset)
+-                : getString(R.string.bisub_api_key_set));
+-
+         apiKeyPref.setOnPreferenceChangeListener((final Preference p,
+                                                   final Object newValue) -> {
+             final String value = newValue == null ? null : String.valueOf(newValue);
+             p.setSummary(isBlank(value)
+                     ? getString(R.string.bisub_api_key_unset)
+                     : getString(R.string.bisub_api_key_set));
++            final BisubPrefs.ProviderProfile active =
++                    BisubPrefs.getActiveProfile(requireContext());
++            if (active != null) {
++                BisubPrefs.replaceProfile(requireContext(), active.withApiKey(value));
++            }
+             return true;
+         });
+     }
+@@ -186,13 +443,15 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+      *         or {@code 0} when the configuration is complete
+      */
+     private int findMissingFieldResId() {
+-        if (isBlank(prefs.getString(getString(R.string.bisub_base_url_key), null))) {
++        final BisubPrefs.ProviderProfile active =
++                BisubPrefs.getActiveProfile(requireContext());
++        if (active == null || isBlank(active.baseUrl)) {
+             return R.string.bisub_missing_base_url;
+         }
+-        if (isBlank(prefs.getString(getString(R.string.bisub_api_key_key), null))) {
++        if (isBlank(active.apiKey)) {
+             return R.string.bisub_missing_api_key;
+         }
+-        if (isBlank(prefs.getString(getString(R.string.bisub_model_key), null))) {
++        if (isBlank(active.model)) {
+             return R.string.bisub_missing_model;
+         }
+         if (isBlank(prefs.getString(getString(R.string.bisub_target_lang_key), null))) {
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 518c11031..1aab0e4b3 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1204,6 +1204,18 @@
+ <string name="audio_quality_medium">中（约 128 kbps）</string>
+     <!-- Bilingual subtitles (bisub) -->
+     <string name="bisub_settings_title">双语字幕</string>
++
++    <string name="bisub_profile_title">翻译配置</string>
++    <string name="bisub_profile_summary_format">%1$s · %2$s</string>
++    <string name="bisub_profile_none">还没有配置，先添加一个才能开始翻译</string>
++    <string name="bisub_profile_add">添加</string>
++    <string name="bisub_profile_add_title">新增配置</string>
++    <string name="bisub_profile_add_hint">名称，如 DeepSeek、GLM</string>
++    <string name="bisub_profile_add_copies">新配置以当前选中的配置为模板创建；同一提供商换模型只需改名并填新模型名</string>
++    <string name="bisub_profile_name_required">请输入名称</string>
++    <string name="bisub_profile_delete">删除</string>
++    <string name="bisub_profile_delete_title">删除配置</string>
++    <string name="bisub_profile_delete_confirm">删除“%1$s”？用它翻译过的缓存字幕仍会保留。</string>
+     <string name="bisub_enable_title">启用双语字幕</string>
+     <string name="bisub_enable_summary">在视频页显示“双语字幕”按钮，按需生成并缓存翻译字幕</string>
+     <string name="bisub_provider_title">提供商</string>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index a249b514d..15abee983 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1885,6 +1885,9 @@
+     <string name="lock_screen_button_key" translatable="false">lock_screen_button</string>
+     <!-- Bilingual subtitles (bisub) -->
+     <string name="bisub_enable_key">bisub_enable</string>
++    <string name="bisub_profile_key">bisub_profile</string>
++    <string name="bisub_profiles_key">bisub_profiles</string>
++    <string name="bisub_active_profile_key">bisub_active_profile</string>
+     <string name="bisub_provider_key">bisub_provider</string>
+     <string name="bisub_base_url_key">bisub_base_url</string>
+     <string name="bisub_api_key_key">bisub_api_key</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 298fb0643..eb4d1c617 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1210,6 +1210,17 @@
+     <string name="bisub_settings_title">Bilingual subtitles</string>
+     <string name="bisub_enable_title">Enable bilingual subtitles</string>
+     <string name="bisub_enable_summary">Show a Bilingual button on video pages that generates translated subtitles on demand</string>
++    <string name="bisub_profile_title">Translation profile</string>
++    <string name="bisub_profile_summary_format">%1$s · %2$s</string>
++    <string name="bisub_profile_none">No profile yet — add one to start translating</string>
++    <string name="bisub_profile_add">Add</string>
++    <string name="bisub_profile_add_title">Add profile</string>
++    <string name="bisub_profile_add_hint">Name, e.g. DeepSeek or GLM</string>
++    <string name="bisub_profile_add_copies">The new profile starts as a copy of the currently selected one, so switching to another model of the same provider only needs a rename and a new model name</string>
++    <string name="bisub_profile_name_required">Please enter a name</string>
++    <string name="bisub_profile_delete">Delete</string>
++    <string name="bisub_profile_delete_title">Delete profile</string>
++    <string name="bisub_profile_delete_confirm">Delete “%1$s”? Cached translations made with it stay on disk.</string>
+     <string name="bisub_provider_title">Provider</string>
+     <string name="bisub_provider_custom">Custom</string>
+     <string name="bisub_provider_openai">OpenAI</string>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index afffeedf7..8959366ca 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -12,6 +12,12 @@
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
+ 
++    <Preference
++        android:key="@string/bisub_profile_key"
++        android:title="@string/bisub_profile_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
+     <ListPreference
+         android:defaultValue="custom"
+         android:entries="@array/bisub_provider_descriptions"
+-- 
+2.54.0.windows.1
+
