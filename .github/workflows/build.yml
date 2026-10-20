@@ -56,12 +56,23 @@ jobs:
           java-version: '25'
           cache: 'gradle'
 
-      - name: Apply bisub patches
+      - name: Apply bisub patches (client)
         run: |
           cd src/PipePipeClient
           git config user.name "bisub-bot"
           git config user.email "bot@users.noreply.github.com"
           git am "$GITHUB_WORKSPACE"/patches/*.patch
+
+      - name: Apply bisub patches (extractor)
+        run: |
+          cd src/PipePipeExtractor
+          git config user.name "bisub-bot"
+          git config user.email "bot@users.noreply.github.com"
+          if ls "$GITHUB_WORKSPACE"/patches-extractor/*.patch >/dev/null 2>&1; then
+            git am "$GITHUB_WORKSPACE"/patches-extractor/*.patch
+          else
+            echo "No extractor patches present, skipping"
+          fi
 
       - name: Build debug APK
         working-directory: src/PipePipeClient
@@ -103,6 +114,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Patch application or build failed against upstream',
-              body: `The bisub build failed. Either the patches no longer apply against the requested PipePipeClient ref, or the patched code has compile errors.\n\nCheck the run: ${runUrl}\n\nIf a patch failed to apply, the resolver/player hooks (0003/0005) most likely need a manual update — PipePipe refactors its player controllers frequently. See README for instructions.`,
+              body: `The bisub build failed. Either the patches no longer apply against the requested PipePipeClient/PipePipeExtractor ref, or the patched code has compile errors.\n\nCheck the run: ${runUrl}\n\nIf a patch failed to apply, the resolver/player hooks (0003/0005) most likely need a manual update — PipePipe refactors its player controllers frequently. See README for instructions. Extractor patches live in patches-extractor/ and must stay compatible with the client patches (0019+ remove four services on both sides).`,
               labels: ['patch-broken']
             });
