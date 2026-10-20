@@ -1,0 +1,97 @@
+From 4e1e429215a2d90a7638cb837c3445da3ad56e03 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 07:57:40 +0800
+Subject: [PATCH] Show the BiPipe logo on a white splash screen
+
+The opening theme's window background still drew the legacy
+PipePipe vector logo over the theme color, so cold starts kept
+showing the old branding. Replace the logo with the BiPipe
+launcher icon and use a plain white backdrop in all four splash
+background variants, including the dark-mode ones, so the splash
+matches the adaptive icon presentation on Android 12+.
+---
+ app/src/main/res/drawable-night-v23/splash_background.xml | 4 ++--
+ app/src/main/res/drawable-night/splash_background.xml     | 4 ++--
+ app/src/main/res/drawable-v23/splash_background.xml       | 4 ++--
+ app/src/main/res/drawable/splash_background.xml           | 4 ++--
+ 4 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/main/res/drawable-night-v23/splash_background.xml b/app/src/main/res/drawable-night-v23/splash_background.xml
+index 893fd598e..facead2a7 100644
+--- a/app/src/main/res/drawable-night-v23/splash_background.xml
++++ b/app/src/main/res/drawable-night-v23/splash_background.xml
+@@ -2,11 +2,11 @@
+ <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+ 
+     <item
+-        android:drawable="@color/main_theme_color"/>
++        android:drawable="@color/white"/>
+ 
+     <item
+         android:width="80dp"
+         android:height="80dp"
+         android:gravity="center"
+-        android:drawable="@drawable/ic_pipepipe"/>
++        android:drawable="@mipmap/ic_launcher"/>
+ </layer-list>
+\ No newline at end of file
+diff --git a/app/src/main/res/drawable-night/splash_background.xml b/app/src/main/res/drawable-night/splash_background.xml
+index d5198536f..0088279a8 100644
+--- a/app/src/main/res/drawable-night/splash_background.xml
++++ b/app/src/main/res/drawable-night/splash_background.xml
+@@ -2,11 +2,11 @@
+ <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+ 
+     <item
+-        android:drawable="@color/dark_youtube_primary_color"/>
++        android:drawable="@color/white"/>
+ 
+     <item>
+         <bitmap
+-            android:src="@drawable/ic_pipepipe"
++            android:src="@mipmap/ic_launcher"
+             android:gravity="center_vertical|center_horizontal" />
+     </item>
+ </layer-list>
+\ No newline at end of file
+diff --git a/app/src/main/res/drawable-v23/splash_background.xml b/app/src/main/res/drawable-v23/splash_background.xml
+index 893fd598e..facead2a7 100644
+--- a/app/src/main/res/drawable-v23/splash_background.xml
++++ b/app/src/main/res/drawable-v23/splash_background.xml
+@@ -2,11 +2,11 @@
+ <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+ 
+     <item
+-        android:drawable="@color/main_theme_color"/>
++        android:drawable="@color/white"/>
+ 
+     <item
+         android:width="80dp"
+         android:height="80dp"
+         android:gravity="center"
+-        android:drawable="@drawable/ic_pipepipe"/>
++        android:drawable="@mipmap/ic_launcher"/>
+ </layer-list>
+\ No newline at end of file
+diff --git a/app/src/main/res/drawable/splash_background.xml b/app/src/main/res/drawable/splash_background.xml
+index a6d4997e6..0088279a8 100644
+--- a/app/src/main/res/drawable/splash_background.xml
++++ b/app/src/main/res/drawable/splash_background.xml
+@@ -2,11 +2,11 @@
+ <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+ 
+     <item
+-        android:drawable="@color/main_theme_color"/>
++        android:drawable="@color/white"/>
+ 
+     <item>
+         <bitmap
+-            android:src="@drawable/ic_pipepipe"
++            android:src="@mipmap/ic_launcher"
+             android:gravity="center_vertical|center_horizontal" />
+     </item>
+ </layer-list>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+
