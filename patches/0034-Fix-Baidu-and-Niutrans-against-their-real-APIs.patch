@@ -1,0 +1,509 @@
+From 701a04631f732d0ce30be7f1969466825a003345 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 14:07:23 +0800
+Subject: [PATCH] Fix the Baidu and Niutrans engines against their real APIs
+
+The first implementation was written from stale knowledge of the
+vendors' v1 endpoints. Checking against the actual API documents
+corrects both engines:
+
+Niutrans speaks the v2 text translation API
+(api.niutrans.com/v2/text/translate), not the legacy
+NiuTransServer/translationX endpoint: requests carry appId, srcText
+(camelCase), a millisecond timestamp and an authStr permission
+digest - the API key plus every sent parameter, sorted by name in
+ASCII order, joined as key=value pairs and hashed with MD5. The
+credentials are appId#apikey (both come from the Niutrans console),
+the reply field is tgtText, error replies carry errorCode/errorMsg
+(10001 = QPS exceeded, dropped for a retry), and the free tier
+allows five concurrent requests, which becomes the engine's default
+concurrency. Chunks grow to 4000 of the 5000 allowed characters.
+
+Baidu now calls the LLM text translation API
+(fanyi-api.baidu.com/ait/api/aiTextTranslate) the documents
+describe, keeping the sign authentication (appid#secret): the q
+parameter is limited to 6000 characters with 2000 recommended for
+quality and latency, so chunks are back to 1800 characters. The LLM
+model tends to merge the joined lines into one reply entry, which
+is split back apart to keep the line alignment, and the rate-limit
+error codes 54005 (long-query flood, 3 s pause) and 59004 join the
+retried ones.
+---
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  |  12 +-
+ .../newpipe/bisub/SubtitleTranslator.java     | 244 +++++++++++-------
+ .../settings/BisubSettingsFragment.java       |   3 +
+ app/src/main/res/values-zh-rCN/strings.xml    |   1 +
+ app/src/main/res/values/strings.xml           |   1 +
+ 5 files changed, 157 insertions(+), 104 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index 6422d3601..b83d6c707 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -79,10 +79,10 @@ public final class BisubPrefs {
+                 return false;
+             }
+             if (SubtitleTranslator.isTraditionalEngine(provider)) {
+-                if ("deepl".equals(provider) || "niutrans".equals(provider)) {
++                if ("deepl".equals(provider)) {
+                     return !isNullOrBlank(apiKey);
+                 }
+-                if ("baidu".equals(provider)) {
++                if ("baidu".equals(provider) || "niutrans".equals(provider)) {
+                     return !isNullOrBlank(apiKey) && apiKey.trim().contains("#");
+                 }
+                 if ("libre".equals(provider)) {
+@@ -104,16 +104,16 @@ public final class BisubPrefs {
+      * @return the recommended parallel request count for that engine,
+      *         based on its documented rate limits: the Baidu standard
+      *         tier allows one request per second and the Niutrans free
+-     *         tier about two, so their defaults stay at or below that.
+-     *         Everything else keeps the generic default. Users may still
+-     *         raise the value for paid tiers.
++     *         tier five concurrent requests. Everything else keeps the
++     *         generic default. Users may still raise the value for
++     *         paid tiers.
+      */
+     public static int defaultConcurrencyFor(@Nullable final String provider) {
+         if ("baidu".equals(provider)) {
+             return 1;
+         }
+         if ("niutrans".equals(provider)) {
+-            return 2;
++            return 5;
+         }
+         return Config.CONCURRENCY_DEFAULT;
+     }
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index 4d9ce504b..9fa947b96 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -19,6 +19,7 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.TreeMap;
+ import java.util.concurrent.TimeUnit;
+ 
+ import okhttp3.FormBody;
+@@ -653,16 +654,20 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Translates the lines with the Baidu general translation API. The
++     * Translates the lines with the Baidu LLM text translation API. The
+      * credentials are stored as {@code appid#secret} in the API key
+      * field, and every request is signed with
+-     * {@code MD5(appid + q + salt + secret)}. Multiple lines are joined
+-     * with newlines into one request (the reply carries one
+-     * {@code trans_result} entry per line, which keeps the alignment
+-     * exact). The standard (free) tier is limited to one request per
+-     * second, so chunks wait 1050&nbsp;ms in between and the default
+-     * concurrency of this engine is one; a rate-limit reply (54003) is
+-     * retried with a pause instead of failing the translation.
++     * {@code MD5(appid + q + salt + secret)} (the API also accepts
++     * Bearer keys, but the sign scheme works with the classic appid and
++     * secret pair every Baidu account has). Multiple lines are joined
++     * with newlines into one request; the reply normally carries one
++     * {@code trans_result} entry per line, and a single multi-line
++     * entry is split back apart, which keeps the alignment exact. The
++     * API recommends keeping one request below 2000 characters (the
++     * hard limit is 6000), so chunks stay at 1800. Rate-limit replies
++     * (54003, 59004, 54005) are retried with a pause instead of failing
++     * the translation, and the default concurrency of this engine stays
++     * at one.
+      *
+      * @param lines the sanitized subtitle lines
+      * @param cfg   the user configuration
+@@ -675,12 +680,15 @@ public final class SubtitleTranslator {
+                                                        @NonNull final Config cfg)
+             throws IOException, JSONException {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+-        final String[] credentials = splitBaiduCredentials(cfg.apiKey);
++        final String[] credentials = splitCompoundKey(cfg.apiKey,
++                "The Baidu API key field must hold \"appid#secret\", "
++                        + "as shown in the Baidu console");
+         final String appId = credentials[0];
+         final String secret = credentials[1];
+         final Map<Integer, String> result = new HashMap<>();
+-        // The q parameter is limited to 6000 UTF-8 bytes; stay below it.
+-        final List<int[]> bounds = chunkBoundsBytes(lines, 40, 5800);
++        // The API recommends at most 2000 characters per request for
++        // quality and latency; the hard q limit is 6000 characters.
++        final List<int[]> bounds = chunkBounds(lines, 40, 1800, false);
+         for (int c = 0; c < bounds.size(); c++) {
+             if (c > 0) {
+                 sleepQuietly(1050);
+@@ -717,11 +725,12 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Sends one signed request to the Baidu API and returns the
+-     * translated {@code dst} values, one per input line. A rate-limit
+-     * reply (error 54003, "access frequency too high") is retried once
+-     * after a pause; configuration errors (bad signature, closed
+-     * service, exhausted quota) fail fast.
++     * Sends one signed request to the Baidu LLM translation API and
++     * returns the translated {@code dst} values, one per input line. A
++     * reply with a single multi-line entry is split back apart. Rate
++     * limit and busy replies (54003, 59004, 54005) are retried after a
++     * pause; configuration errors (bad signature, closed service,
++     * exhausted quota) fail fast.
+      *
+      * @param chunk  the lines of this request
+      * @param target the engine target language code
+@@ -749,7 +758,7 @@ public final class SubtitleTranslator {
+                     .add("sign", md5Hex(appId + joined + salt + secret))
+                     .build();
+             final Request request = new Request.Builder()
+-                    .url("https://fanyi-api.baidu.com/api/trans/vip/translate")
++                    .url("https://fanyi-api.baidu.com/ait/api/aiTextTranslate")
+                     .post(form)
+                     .build();
+             final JSONObject reply = new JSONObject(executeRequest(request));
+@@ -762,11 +771,21 @@ public final class SubtitleTranslator {
+                         parsed.add(items.getJSONObject(i).optString("dst", ""));
+                     }
+                 }
++                // The LLM model tends to merge the joined lines into one
++                // reply entry; split it back so the line alignment holds.
++                if (parsed.size() == 1 && chunk.size() > 1
++                        && parsed.get(0).contains("\n")) {
++                    final String merged = parsed.get(0);
++                    parsed.clear();
++                    for (final String part : merged.split("\n", -1)) {
++                        parsed.add(part);
++                    }
++                }
+                 return parsed;
+             }
+             final String message = reply.optString("error_msg", errorCode);
+-            if ("54003".equals(errorCode) || "52001".equals(errorCode)
+-                    || "52002".equals(errorCode)) {
++            if ("54003".equals(errorCode) || "59004".equals(errorCode)
++                    || "52001".equals(errorCode) || "52002".equals(errorCode)) {
+                 // Rate limit / busy: pause and let the next attempt run.
+                 BisubLog.w("baidu error " + errorCode + " (" + message
+                         + ") on attempt " + attempt + ", pausing");
+@@ -776,6 +795,16 @@ public final class SubtitleTranslator {
+                 }
+                 throw new IOException("Baidu API is busy (error " + errorCode + ")");
+             }
++            if ("54005".equals(errorCode)) {
++                // Long-query flood: the API asks to wait 3 seconds.
++                BisubLog.w("baidu error 54005 (" + message + ") on attempt "
++                        + attempt + ", waiting 3 s");
++                if (attempt < 3) {
++                    sleepQuietly(3100L * attempt);
++                    continue;
++                }
++                throw new IOException("Baidu API is busy (error 54005)");
++            }
+             BisubLog.e("baidu error " + errorCode + ": " + message);
+             throw new TranslationConfigException("Baidu API error " + errorCode
+                     + ": " + message);
+@@ -784,22 +813,24 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Splits the API key field into the Baidu credentials. The field
+-     * holds {@code appid#secret}; the separator may not appear in either
+-     * part.
++     * Splits a compound API key field into its two parts. The Baidu
++     * engine stores {@code appid#secret} and the Niutrans engine
++     * {@code appId#apikey} in the shared API key field; the separator
++     * may not appear in either part.
+      *
+-     * @param apiKey the raw API key field value
+-     * @return {@code [appid, secret]}
++     * @param apiKey  the raw API key field value
++     * @param message the error message for a malformed value
++     * @return {@code [first part, second part]}
+      * @throws TranslationConfigException when the format is wrong
+      */
+     @NonNull
+-    private static String[] splitBaiduCredentials(@Nullable final String apiKey)
++    private static String[] splitCompoundKey(@Nullable final String apiKey,
++                                             @NonNull final String message)
+             throws TranslationConfigException {
+         final String value = apiKey == null ? "" : apiKey.trim();
+         final int separator = value.indexOf('#');
+         if (separator <= 0 || separator >= value.length() - 1) {
+-            throw new TranslationConfigException("The Baidu API key field must hold "
+-                    + "\"appid#secret\", as shown in the Baidu console");
++            throw new TranslationConfigException(message);
+         }
+         return new String[]{value.substring(0, separator).trim(),
+                 value.substring(separator + 1).trim()};
+@@ -828,13 +859,15 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Translates the lines with the Niutrans text translation API. One
+-     * request carries the newline-joined lines and the reply preserves
+-     * the line structure, so the alignment stays exact; a reply with a
+-     * different line count falls back to line-by-line requests. The
+-     * free tier is rate limited to roughly two requests per second, so
+-     * the default concurrency of this engine is two and chunks pause
+-     * briefly in between.
++     * Translates the lines with the Niutrans text translation API (v2).
++     * The credentials are stored as {@code appId#apikey} in the API key
++     * field; every request is authenticated with an {@code authStr}
++     * digest (see {@link #niutransAuthStr}). One request carries the
++     * newline-joined lines and the reply preserves the line structure,
++     * so the alignment stays exact; a reply with a different line count
++     * falls back to line-by-line requests. The free tier allows five
++     * concurrent requests, which is also this engine's default
++     * concurrency, and each request carries at most 5000 characters.
+      *
+      * @param lines the sanitized subtitle lines
+      * @param cfg   the user configuration
+@@ -847,10 +880,14 @@ public final class SubtitleTranslator {
+                                                           @NonNull final Config cfg)
+             throws IOException, JSONException {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+-        final String apiKey = cfg.apiKey == null ? "" : cfg.apiKey.trim();
++        final String[] credentials = splitCompoundKey(cfg.apiKey,
++                "The Niutrans API key field must hold \"appId#apikey\", "
++                        + "as shown in the Niutrans console");
++        final String appId = credentials[0];
++        final String apiKey = credentials[1];
+         final Map<Integer, String> result = new HashMap<>();
+-        // Stay well below the per-request text length limit.
+-        final List<int[]> bounds = chunkBounds(lines, 40, 2800, false);
++        // The request length limit is 5000 characters; stay below it.
++        final List<int[]> bounds = chunkBounds(lines, 40, 4000, false);
+         for (int c = 0; c < bounds.size(); c++) {
+             if (c > 0) {
+                 sleepQuietly(100);
+@@ -859,7 +896,8 @@ public final class SubtitleTranslator {
+             final List<String> chunk = lines.subList(bound[0], bound[1]);
+             BisubLog.i("niutrans chunk " + (c + 1) + "/" + bounds.size() + ": "
+                     + chunk.size() + " lines, " + totalLength(chunk) + " chars");
+-            final List<String> parsed = niutransTranslateChunk(chunk, target, apiKey);
++            final List<String> parsed =
++                    niutransTranslateChunk(chunk, target, appId, apiKey);
+             if (parsed.size() == chunk.size()) {
+                 for (int i = 0; i < chunk.size(); i++) {
+                     putIfMeaningful(result, bound[0] + i, parsed.get(i));
+@@ -875,7 +913,7 @@ public final class SubtitleTranslator {
+                 sleepQuietly(100);
+                 final List<String> single = niutransTranslateChunk(
+                         Collections.singletonList(chunk.get(i)),
+-                        target, apiKey);
++                        target, appId, apiKey);
+                 if (!single.isEmpty()) {
+                     putIfMeaningful(result, bound[0] + i, single.get(0));
+                 }
+@@ -885,12 +923,17 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Sends one request to the Niutrans translation endpoint and splits
+-     * the {@code tgt_text} reply back into lines.
++     * Sends one signed request to the Niutrans v2 translation endpoint
++     * and splits the {@code tgtText} reply back into lines. Error code
++     * 10001 (QPS exceeded) drops the chunk with an {@link IOException}
++     * so the caller's retry logic re-sends it later; every other error
++     * code means the configuration or the request is wrong and fails
++     * fast.
+      *
+-     * @param chunk   the lines of this request
+-     * @param target  the engine target language code
+-     * @param apiKey  the Niutrans API key
++     * @param chunk  the lines of this request
++     * @param target the engine target language code
++     * @param appId  the Niutrans application id
++     * @param apiKey the Niutrans API key
+      * @return the translations, possibly fewer than requested
+      * @throws IOException   on network errors, HTTP errors or timeouts
+      * @throws JSONException when a response cannot be parsed
+@@ -898,35 +941,40 @@ public final class SubtitleTranslator {
+     @NonNull
+     private static List<String> niutransTranslateChunk(@NonNull final List<String> chunk,
+                                                        @NonNull final String target,
++                                                       @NonNull final String appId,
+                                                        @NonNull final String apiKey)
+             throws IOException, JSONException {
++        final String srcText = String.join("\n", chunk);
++        final String timestamp = String.valueOf(System.currentTimeMillis());
++        final String authStr = niutransAuthStr(apiKey, appId, srcText, timestamp, target);
+         final JSONObject payload = new JSONObject();
+         payload.put("from", "auto");
+         payload.put("to", target);
+-        payload.put("apikey", apiKey);
+-        payload.put("src_text", String.join("\n", chunk));
++        payload.put("appId", appId);
++        payload.put("srcText", srcText);
++        payload.put("timestamp", timestamp);
++        payload.put("authStr", authStr);
+         final Request request = new Request.Builder()
+-                .url("https://api.niutrans.com/NiuTransServer/translationX")
++                .url("https://api.niutrans.com/v2/text/translate")
+                 .post(RequestBody.create(payload.toString(), JSON))
+                 .build();
+         final JSONObject reply = new JSONObject(executeRequest(request));
+-        final String error = reply.optString("error_msg",
+-                reply.optString("error", ""));
+-        if (!error.trim().isEmpty() && reply.optString("tgt_text", "").isEmpty()) {
+-            final String lower = error.toLowerCase(Locale.ROOT);
+-            if (lower.contains("rate") || lower.contains("limit")
+-                    || lower.contains("frequency") || lower.contains("频率")
+-                    || lower.contains("频繁")) {
+-                // Rate limit: drop the chunk, the caller's retry logic
++        final String errorCode = reply.optString("errorCode", "");
++        if (!errorCode.trim().isEmpty()) {
++            final String errorMsg = reply.optString("errorMsg", errorCode);
++            if ("10001".equals(errorCode)) {
++                // QPS exceeded: drop the chunk, the caller's retry logic
+                 // re-sends it later.
+-                BisubLog.w("niutrans rate limit: " + error.trim());
+-                throw new IOException("Niutrans rate limit: " + error.trim());
++                BisubLog.w("niutrans error " + errorCode + " (" + errorMsg
++                        + "), dropping the chunk for a retry");
++                throw new IOException("Niutrans rate limit: " + errorMsg);
+             }
+-            BisubLog.e("niutrans error: " + error.trim());
+-            throw new TranslationConfigException("Niutrans API error: " + error.trim());
++            BisubLog.e("niutrans error " + errorCode + ": " + errorMsg);
++            throw new TranslationConfigException("Niutrans API error " + errorCode
++                    + ": " + errorMsg);
+         }
+         final List<String> parsed = new ArrayList<>();
+-        final String translated = reply.optString("tgt_text", "");
++        final String translated = reply.optString("tgtText", "");
+         if (!translated.isEmpty()) {
+             for (final String part : translated.split("\n", -1)) {
+                 parsed.add(part);
+@@ -935,6 +983,44 @@ public final class SubtitleTranslator {
+         return parsed;
+     }
+ 
++    /**
++     * Computes the Niutrans {@code authStr} permission string: the API
++     * key plus every sent parameter, sorted by parameter name in ASCII
++     * order, joined as {@code key=value} pairs and hashed with MD5. The
++     * {@code authStr} itself and empty fields never take part in the
++     * digest, and the values are used verbatim (no URL encoding), per
++     * the API documentation.
++     *
++     * @param apiKey    the Niutrans API key (not sent, but signed)
++     * @param appId     the Niutrans application id
++     * @param srcText   the joined text of this request
++     * @param timestamp the current time in milliseconds
++     * @param target    the target language code
++     * @return the 32-character lowercase MD5 digest
++     */
++    @NonNull
++    private static String niutransAuthStr(@NonNull final String apiKey,
++                                          @NonNull final String appId,
++                                          @NonNull final String srcText,
++                                          @NonNull final String timestamp,
++                                          @NonNull final String target) {
++        final Map<String, String> params = new TreeMap<>();
++        params.put("apikey", apiKey);
++        params.put("appId", appId);
++        params.put("from", "auto");
++        params.put("srcText", srcText);
++        params.put("timestamp", timestamp);
++        params.put("to", target);
++        final StringBuilder builder = new StringBuilder();
++        for (final Map.Entry<String, String> entry : params.entrySet()) {
++            if (builder.length() > 0) {
++                builder.append('&');
++            }
++            builder.append(entry.getKey()).append('=').append(entry.getValue());
++        }
++        return md5Hex(builder.toString());
++    }
++
+     /**
+      * Adds a translation to the result unless it is blank, so that blank
+      * replies stay absent and are re-sent by the caller's retry logic.
+@@ -1078,45 +1164,7 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Splits the lines into chunks whose UTF-8 encoded size stays below
+-     * a byte limit, for engines that cap the request body in bytes (the
+-     * Baidu {@code q} parameter accepts at most 6000 bytes). Characters
+-     * beyond ASCII are conservatively counted as three bytes, which is
+-     * the exact size of most non-Latin scripts and a safe upper bound
+-     * for the rest.
+-     *
+-     * @param lines    the sanitized subtitle lines
+-     * @param maxLines maximum number of lines per request
+-     * @param maxBytes maximum UTF-8 bytes per request
+-     * @return [start, end) bounds into {@code lines}, in order
+-     */
+-    @NonNull
+-    private static List<int[]> chunkBoundsBytes(@NonNull final List<String> lines,
+-                                                final int maxLines, final int maxBytes) {
+-        final List<int[]> bounds = new ArrayList<>();
+-        int start = 0;
+-        while (start < lines.size()) {
+-            int end = start;
+-            int bytes = 0;
+-            while (end < lines.size()) {
+-                final String line = lines.get(end);
+-                int lineBytes = 0;
+-                for (int i = 0; i < line.length(); i++) {
+-                    lineBytes += line.charAt(i) > 127 ? 3 : 1;
+-                }
+-                if (end > start && (end - start >= maxLines || bytes + lineBytes > maxBytes)) {
+-                    break;
+-                }
+-                bytes += lineBytes;
+-                end++;
+-            }
+-            bounds.add(new int[]{start, end});
+-            start = end;
+-        }
+-        return bounds;
+-    }
+ 
+-    /**
+      * Normalizes the user-entered target language into an internal
+      * lower-case code ({@code zh-CN}, {@code zh-TW}, {@code en}, ...).
+      * Unknown values pass through unchanged, so users may enter a
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 7d1d2244c..26b3eca15 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -303,6 +303,9 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         apiKeyPref.setText(active == null ? null : active.apiKey);
+         if ("baidu".equals(provider) && (active == null || isBlank(active.apiKey))) {
+             apiKeyPref.setSummary(getString(R.string.bisub_api_key_baidu_hint));
++        } else if ("niutrans".equals(provider)
++                && (active == null || isBlank(active.apiKey))) {
++            apiKeyPref.setSummary(getString(R.string.bisub_api_key_niutrans_hint));
+         } else {
+             apiKeyPref.setSummary(active != null && !isBlank(active.apiKey)
+                     ? getString(R.string.bisub_api_key_set)
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 098fef93a..43aa8daf8 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1238,6 +1238,7 @@
+     <string name="bisub_api_key_unset">未设置</string>
+     <string name="bisub_api_key_set">已设置</string>
+     <string name="bisub_api_key_baidu_hint">格式：appid#密钥（在百度翻译开放平台控制台获取）</string>
++    <string name="bisub_api_key_niutrans_hint">格式：appId#API-KEY（在小牛翻译云平台控制台“API应用”中获取）</string>
+     <string name="bisub_model_title">模型名称</string>
+     <string name="bisub_model_summary">模型名称，如 deepseek-chat</string>
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index a654359bb..03370d737 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1240,6 +1240,7 @@
+     <string name="bisub_api_key_unset">Not set</string>
+     <string name="bisub_api_key_set">Set</string>
+     <string name="bisub_api_key_baidu_hint">Format: appid#secret (from the Baidu console)</string>
++    <string name="bisub_api_key_niutrans_hint">Format: appId#apikey (from the Niutrans console, API applications)</string>
+     <string name="bisub_model_title">Model</string>
+     <string name="bisub_model_summary">Model name, e.g. deepseek-chat</string>
+ 
+-- 
+2.54.0.windows.1
+
