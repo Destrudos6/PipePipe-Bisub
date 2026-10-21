@@ -1,0 +1,201 @@
+From 355d0acb85834b72542058f26ee5ea40a470eb33 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 12:08:52 +0800
+Subject: [PATCH] Fix WebDAV backup listing and add a backup confirmation
+
+Uploading backups to WebDAV servers like NutStore worked, but the
+restore listing always came back empty. The multistatus parser
+compared raw element names from XmlPullParser against plain local
+names, while namespace processing is disabled - so the qualified
+names the servers actually send ("d:response", "d:href", ...) never
+matched and no file was ever picked up. Strip the namespace prefix
+before comparing, in both the WebDAV and the S3 list parsers (the
+S3 one defensively: ListObjectsV2 responses are usually unprefixed).
+
+"Back up now" also asks for confirmation before uploading, showing
+the retention count: after clearing local data, an accidental tap
+would otherwise push an empty backup to the top of the restore
+list.
+---
+ .../newpipe/bisub/backup/S3Backend.java       | 23 ++++++++++++++++--
+ .../newpipe/bisub/backup/WebDavBackend.java   | 24 +++++++++++++++++--
+ .../newpipe/settings/CloudBackupFragment.java | 13 ++++++++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  1 +
+ app/src/main/res/values-zh-rTW/strings.xml    |  1 +
+ app/src/main/res/values/strings.xml           |  1 +
+ 6 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
+index ddb64ff45..e439ddb76 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
+@@ -1,6 +1,7 @@
+ package org.schabi.newpipe.bisub.backup;
+ 
+ import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import org.xmlpull.v1.XmlPullParser;
+ 
+@@ -263,7 +264,7 @@ final class S3Backend implements RemoteBackend {
+             int event = parser.getEventType();
+             while (event != XmlPullParser.END_DOCUMENT) {
+                 if (event == XmlPullParser.START_TAG) {
+-                    final String tag = parser.getName();
++                    final String tag = localName(parser.getName());
+                     if ("Contents".equals(tag)) {
+                         key = null;
+                         size = 0L;
+@@ -279,7 +280,8 @@ final class S3Backend implements RemoteBackend {
+                     } else if ("LastModified".equals(tag)) {
+                         modified = parseIsoTime(parser.nextText().trim());
+                     }
+-                } else if (event == XmlPullParser.END_TAG && "Contents".equals(parser.getName())
++                } else if (event == XmlPullParser.END_TAG
++                        && "Contents".equals(localName(parser.getName()))
+                         && key != null && key.length() > prefix.length()) {
+                     final String name = key.substring(prefix.length());
+                     if (name.endsWith(".zip") && !name.contains("/")) {
+@@ -294,6 +296,23 @@ final class S3Backend implements RemoteBackend {
+         }
+     }
+ 
++    /**
++     * Strips a namespace prefix from a raw element name before comparing
++     * it against the plain local names, so S3-compatible services that
++     * namespace their ListObjectsV2 responses parse as well.
++     *
++     * @param raw the raw element name from {@link XmlPullParser#getName()}
++     * @return the local name without namespace prefix
++     */
++    @NonNull
++    private static String localName(@Nullable final String raw) {
++        if (raw == null) {
++            return "";
++        }
++        final int colon = raw.indexOf(':');
++        return colon >= 0 ? raw.substring(colon + 1) : raw;
++    }
++
+     private static long parseIsoTime(@NonNull final String value) {
+         try {
+             final SimpleDateFormat format =
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
+index abd55ba90..9eff6f8b2 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
+@@ -1,6 +1,7 @@
+ package org.schabi.newpipe.bisub.backup;
+ 
+ import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import org.xmlpull.v1.XmlPullParser;
+ 
+@@ -166,7 +167,7 @@ final class WebDavBackend implements RemoteBackend {
+             int event = parser.getEventType();
+             while (event != XmlPullParser.END_DOCUMENT) {
+                 if (event == XmlPullParser.START_TAG) {
+-                    final String tag = parser.getName();
++                    final String tag = localName(parser.getName());
+                     if ("response".equals(tag)) {
+                         href = null;
+                         size = -1L;
+@@ -183,7 +184,7 @@ final class WebDavBackend implements RemoteBackend {
+                         modified = parseHttpDate(parser.nextText().trim());
+                     }
+                 } else if (event == XmlPullParser.END_TAG
+-                        && "response".equals(parser.getName())) {
++                        && "response".equals(localName(parser.getName()))) {
+                     if (href != null && size >= 0) {
+                         final String name = fileNameOf(href);
+                         if (name.endsWith(".zip")) {
+@@ -199,6 +200,25 @@ final class WebDavBackend implements RemoteBackend {
+         }
+     }
+ 
++    /**
++     * Strips the namespace prefix of a raw element name. WebDAV servers
++     * prefix the multistatus elements with whatever they like ("d:",
++     * "D:", ...), and with namespace processing disabled XmlPullParser
++     * reports those qualified names verbatim, so the prefix must be
++     * removed before comparing against the plain local names.
++     *
++     * @param raw the raw element name from {@link XmlPullParser#getName()}
++     * @return the local name without namespace prefix
++     */
++    @NonNull
++    private static String localName(@Nullable final String raw) {
++        if (raw == null) {
++            return "";
++        }
++        final int colon = raw.indexOf(':');
++        return colon >= 0 ? raw.substring(colon + 1) : raw;
++    }
++
+     private static String fileNameOf(@NonNull final String href) {
+         final String decoded;
+         try {
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+index c2c065651..59841e811 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+@@ -200,6 +200,19 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+                     R.string.bisub_cloud_backup_not_configured, Toast.LENGTH_SHORT).show();
+             return;
+         }
++        // Confirmation guard: a backup of freshly cleared (empty) local data
++        // would otherwise quietly take the place of the real backup at the
++        // top of the restore list. The retention count makes the trade-off
++        // explicit instead.
++        new AlertDialog.Builder(requireContext())
++                .setTitle(R.string.bisub_cloud_backup_now_title)
++                .setMessage(getString(R.string.bisub_cloud_backup_confirm, config.retention))
++                .setNegativeButton(R.string.cancel, null)
++                .setPositiveButton(R.string.ok, (dialog, which) -> performBackupNow())
++                .show();
++    }
++
++    private void performBackupNow() {
+         showBusyDialog(getString(R.string.bisub_cloud_backup_running));
+         final Context context = requireContext();
+         disposables.add(Completable.fromAction(() ->
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index acd7a4808..dfe392a4f 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1347,6 +1347,7 @@
+     <string name="bisub_cloud_backup_test_title">测试连接</string>
+     <string name="bisub_cloud_backup_test_summary">检查服务器与凭据</string>
+     <string name="bisub_cloud_backup_now_title">立即备份</string>
++    <string name="bisub_cloud_backup_confirm">现在上传一份当前本地数据的新备份？云端最多保留 %1$d 份备份，超出时自动删除最旧的。</string>
+     <string name="bisub_cloud_backup_never">尚未备份</string>
+     <string name="bisub_cloud_backup_last_backup">上次备份：%s</string>
+     <string name="bisub_cloud_backup_restore_title">从云端恢复</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index c590fefbd..414119435 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1181,6 +1181,7 @@
+     <string name="bisub_cloud_backup_test_title">測試連線</string>
+     <string name="bisub_cloud_backup_test_summary">檢查伺服器與憑證</string>
+     <string name="bisub_cloud_backup_now_title">立即備份</string>
++    <string name="bisub_cloud_backup_confirm">現在上傳一份目前本機資料的新備份？雲端最多保留 %1$d 份備份，超出時自動刪除最舊的。</string>
+     <string name="bisub_cloud_backup_never">尚未備份</string>
+     <string name="bisub_cloud_backup_last_backup">上次備份：%s</string>
+     <string name="bisub_cloud_backup_restore_title">從雲端還原</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index b6df9c2ff..3c60dd57f 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1350,6 +1350,7 @@
+     <string name="bisub_cloud_backup_test_title">Test connection</string>
+     <string name="bisub_cloud_backup_test_summary">Check the server and the credentials</string>
+     <string name="bisub_cloud_backup_now_title">Back up now</string>
++    <string name="bisub_cloud_backup_confirm">Upload a new backup of the current local data now? The server keeps at most %1$d backups; older ones are deleted automatically.</string>
+     <string name="bisub_cloud_backup_never">Never backed up</string>
+     <string name="bisub_cloud_backup_last_backup">Last backup: %s</string>
+     <string name="bisub_cloud_backup_restore_title">Restore from cloud</string>
+-- 
+2.54.0.windows.1
+
