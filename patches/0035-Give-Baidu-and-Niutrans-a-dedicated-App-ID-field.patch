@@ -1,0 +1,519 @@
+From 36a82f93511a906c579a3d5100eb00e98493d0cf Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 15:27:44 +0800
+Subject: [PATCH] Give Baidu and Niutrans a dedicated App ID field
+
+The two new engines kept both credentials joined as "appid#secret"
+in the single API key field, which failed in practice: switching
+from another engine left the old key in place (shown as "set" while
+every request failed the usability check), the format hint only
+appeared while the field was empty, and Niutrans users had nowhere
+to learn that an App ID was expected at all.
+
+Profiles now carry a real appId field next to the API key: the
+settings show a dedicated "App ID" input for the two engines, the
+usability check and the master-switch summary name the exact field
+that is missing, and the connection-test failure message does too.
+Switching the engine clears the credentials, since they never carry
+over and a stale key only reads as configured. Profiles stored with
+the old joined format are migrated automatically on load.
+
+The engines read the two fields directly; the compound-key splitter
+is gone.
+---
+ .../org/schabi/newpipe/bisub/BisubPrefs.java  | 60 +++++++++---
+ .../newpipe/bisub/SubtitleTranslator.java     | 42 ++++----
+ .../settings/BisubSettingsFragment.java       | 96 +++++++++++++++----
+ app/src/main/res/values-zh-rCN/strings.xml    |  7 +-
+ app/src/main/res/values/settings_keys.xml     |  1 +
+ app/src/main/res/values/strings.xml           |  7 +-
+ app/src/main/res/xml/bisub_settings.xml       |  7 ++
+ 7 files changed, 160 insertions(+), 60 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+index b83d6c707..36c784ab7 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubPrefs.java
+@@ -42,6 +42,9 @@ public final class BisubPrefs {
+         public final boolean enabled;
+         @Nullable public final String provider;
+         @Nullable public final String baseUrl;
++        /** Application id of engines that need two credentials
++         *  (Baidu, Niutrans). */
++        @Nullable public final String appId;
+         @Nullable public final String apiKey;
+         @Nullable public final String model;
+         @Nullable public final String targetLanguage;
+@@ -51,13 +54,15 @@ public final class BisubPrefs {
+ 
+         @SuppressWarnings("checkstyle:ParameterNumber")
+         private Config(final boolean enabled, @Nullable final String provider,
+-                       @Nullable final String baseUrl, @Nullable final String apiKey,
++                       @Nullable final String baseUrl, @Nullable final String appId,
++                       @Nullable final String apiKey,
+                        @Nullable final String model, @Nullable final String targetLanguage,
+                        @Nullable final String sourceLanguage,
+                        final int concurrency, final int batchSize) {
+             this.enabled = enabled;
+             this.provider = provider;
+             this.baseUrl = baseUrl;
++            this.appId = appId;
+             this.apiKey = apiKey;
+             this.model = model;
+             this.targetLanguage = targetLanguage;
+@@ -69,9 +74,9 @@ public final class BisubPrefs {
+         /**
+          * @return true when every field required to call the translation
+          *         engine of this profile is present. The free Google and
+-         *         Microsoft engines need nothing, DeepL and Niutrans need
+-         *         their key, Baidu its {@code appid#secret} pair and
+-         *         LibreTranslate its server address; the chat models need
++         *         Microsoft engines need nothing, DeepL its key,
++         *         LibreTranslate its server address, Baidu and Niutrans
++         *         their application id and key; the chat models need
+          *         the full base URL, key and model name.
+          */
+         public boolean isUsable() {
+@@ -83,7 +88,7 @@ public final class BisubPrefs {
+                     return !isNullOrBlank(apiKey);
+                 }
+                 if ("baidu".equals(provider) || "niutrans".equals(provider)) {
+-                    return !isNullOrBlank(apiKey) && apiKey.trim().contains("#");
++                    return !isNullOrBlank(appId) && !isNullOrBlank(apiKey);
+                 }
+                 if ("libre".equals(provider)) {
+                     return !isNullOrBlank(baseUrl);
+@@ -144,6 +149,7 @@ public final class BisubPrefs {
+         /** Provider preset value (a value of bisub_provider_values). */
+         @Nullable public final String provider;
+         @Nullable public final String baseUrl;
++        @Nullable public final String appId;
+         @Nullable public final String apiKey;
+         @Nullable public final String model;
+         public final int concurrency;
+@@ -152,13 +158,15 @@ public final class BisubPrefs {
+         @SuppressWarnings("checkstyle:ParameterNumber")
+         public ProviderProfile(@NonNull final String id, @NonNull final String name,
+                                @Nullable final String provider,
+-                               @Nullable final String baseUrl, @Nullable final String apiKey,
++                               @Nullable final String baseUrl, @Nullable final String appId,
++                               @Nullable final String apiKey,
+                                @Nullable final String model, final int concurrency,
+                                final int batchSize) {
+             this.id = id;
+             this.name = name;
+             this.provider = provider;
+             this.baseUrl = baseUrl;
++            this.appId = appId;
+             this.apiKey = apiKey;
+             this.model = model;
+             this.concurrency = concurrency;
+@@ -175,7 +183,19 @@ public final class BisubPrefs {
+         public ProviderProfile withConnection(@Nullable final String provider,
+                                               @Nullable final String baseUrl,
+                                               @Nullable final String model) {
+-            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++            return new ProviderProfile(id, name, provider, baseUrl, appId, apiKey, model,
++                    concurrency, batchSize);
++        }
++
++        /**
++         * @param appId the new application id
++         * @param apiKey the new API key
++         * @return a copy with the application credentials replaced
++         */
++        @NonNull
++        public ProviderProfile withAppCredentials(@Nullable final String appId,
++                                                  @Nullable final String apiKey) {
++            return new ProviderProfile(id, name, provider, baseUrl, appId, apiKey, model,
+                     concurrency, batchSize);
+         }
+ 
+@@ -185,7 +205,7 @@ public final class BisubPrefs {
+          */
+         @NonNull
+         public ProviderProfile withApiKey(@Nullable final String apiKey) {
+-            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++            return new ProviderProfile(id, name, provider, baseUrl, appId, apiKey, model,
+                     concurrency, batchSize);
+         }
+ 
+@@ -196,7 +216,7 @@ public final class BisubPrefs {
+          */
+         @NonNull
+         public ProviderProfile withTuning(final int concurrency, final int batchSize) {
+-            return new ProviderProfile(id, name, provider, baseUrl, apiKey, model,
++            return new ProviderProfile(id, name, provider, baseUrl, appId, apiKey, model,
+                     concurrency, batchSize);
+         }
+ 
+@@ -207,6 +227,7 @@ public final class BisubPrefs {
+             json.put("name", name);
+             json.put("provider", provider == null ? "" : provider);
+             json.put("baseUrl", baseUrl == null ? "" : baseUrl);
++            json.put("appId", appId == null ? "" : appId);
+             json.put("apiKey", apiKey == null ? "" : apiKey);
+             json.put("model", model == null ? "" : model);
+             json.put("concurrency", concurrency);
+@@ -222,9 +243,25 @@ public final class BisubPrefs {
+                 return null;
+             }
+             final String providerValue = nonBlankOrNull(json.optString("provider", null));
++            String appId = nonBlankOrNull(json.optString("appId", null));
++            String apiKey = nonBlankOrNull(json.optString("apiKey", null));
++            // Migration: the Baidu and Niutrans engines used to keep both
++            // credentials joined as "appid#apikey" in the single API key
++            // field. Split such values into the dedicated App ID field so
++            // existing setups keep working after the upgrade.
++            if (appId == null && apiKey != null && apiKey.contains("#")
++                    && ("baidu".equals(providerValue)
++                        || "niutrans".equals(providerValue))) {
++                final int separator = apiKey.indexOf('#');
++                if (separator > 0 && separator < apiKey.length() - 1) {
++                    appId = apiKey.substring(0, separator).trim();
++                    apiKey = apiKey.substring(separator + 1).trim();
++                }
++            }
+             return new ProviderProfile(id, name, providerValue,
+                     nonBlankOrNull(json.optString("baseUrl", null)),
+-                    nonBlankOrNull(json.optString("apiKey", null)),
++                    appId,
++                    apiKey,
+                     nonBlankOrNull(json.optString("model", null)),
+                     json.has("concurrency")
+                             ? json.optInt("concurrency", Config.CONCURRENCY_DEFAULT)
+@@ -427,6 +464,7 @@ public final class BisubPrefs {
+                 prefs.getBoolean(context.getString(R.string.bisub_enable_key), false),
+                 profile == null ? null : profile.provider,
+                 profile == null ? null : profile.baseUrl,
++                profile == null ? null : profile.appId,
+                 profile == null ? null : profile.apiKey,
+                 profile == null ? null : profile.model,
+                 prefs.getString(context.getString(R.string.bisub_target_lang_key), null),
+@@ -616,7 +654,7 @@ public final class BisubPrefs {
+         final String provider = prefs.getString(
+                 context.getString(R.string.bisub_provider_key), null);
+         profiles.add(new ProviderProfile("legacy", legacyName(provider), provider,
+-                baseUrl, apiKey, model,
++                baseUrl, null, apiKey, model,
+                 readIntInRange(prefs, context.getString(R.string.bisub_concurrency_key),
+                         Config.CONCURRENCY_DEFAULT, Config.CONCURRENCY_MIN,
+                         Config.CONCURRENCY_MAX),
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index 9fa947b96..5db03aa6c 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -680,11 +680,10 @@ public final class SubtitleTranslator {
+                                                        @NonNull final Config cfg)
+             throws IOException, JSONException {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+-        final String[] credentials = splitCompoundKey(cfg.apiKey,
+-                "The Baidu API key field must hold \"appid#secret\", "
+-                        + "as shown in the Baidu console");
+-        final String appId = credentials[0];
+-        final String secret = credentials[1];
++        final String appId = requireCredential(cfg.appId,
++                "The Baidu App ID is missing in the bisub settings");
++        final String secret = requireCredential(cfg.apiKey,
++                "The Baidu secret key is missing in the bisub settings");
+         final Map<Integer, String> result = new HashMap<>();
+         // The API recommends at most 2000 characters per request for
+         // quality and latency; the hard q limit is 6000 characters.
+@@ -813,27 +812,19 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Splits a compound API key field into its two parts. The Baidu
+-     * engine stores {@code appid#secret} and the Niutrans engine
+-     * {@code appId#apikey} in the shared API key field; the separator
+-     * may not appear in either part.
+-     *
+-     * @param apiKey  the raw API key field value
+-     * @param message the error message for a malformed value
+-     * @return {@code [first part, second part]}
+-     * @throws TranslationConfigException when the format is wrong
++     * @param value   the credential value from the configuration
++     * @param message the error message when the credential is missing
++     * @return the trimmed credential
++     * @throws TranslationConfigException when the credential is blank
+      */
+     @NonNull
+-    private static String[] splitCompoundKey(@Nullable final String apiKey,
+-                                             @NonNull final String message)
++    private static String requireCredential(@Nullable final String value,
++                                            @NonNull final String message)
+             throws TranslationConfigException {
+-        final String value = apiKey == null ? "" : apiKey.trim();
+-        final int separator = value.indexOf('#');
+-        if (separator <= 0 || separator >= value.length() - 1) {
++        if (value == null || value.trim().isEmpty()) {
+             throw new TranslationConfigException(message);
+         }
+-        return new String[]{value.substring(0, separator).trim(),
+-                value.substring(separator + 1).trim()};
++        return value.trim();
+     }
+ 
+     /**
+@@ -880,11 +871,10 @@ public final class SubtitleTranslator {
+                                                           @NonNull final Config cfg)
+             throws IOException, JSONException {
+         final String target = engineTargetCode(cfg.provider, cfg.targetLanguage);
+-        final String[] credentials = splitCompoundKey(cfg.apiKey,
+-                "The Niutrans API key field must hold \"appId#apikey\", "
+-                        + "as shown in the Niutrans console");
+-        final String appId = credentials[0];
+-        final String apiKey = credentials[1];
++        final String appId = requireCredential(cfg.appId,
++                "The Niutrans App ID is missing in the bisub settings");
++        final String apiKey = requireCredential(cfg.apiKey,
++                "The Niutrans API key is missing in the bisub settings");
+         final Map<Integer, String> result = new HashMap<>();
+         // The request length limit is 5000 characters; stay below it.
+         final List<int[]> bounds = chunkBounds(lines, 40, 4000, false);
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 26b3eca15..60be13be6 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -109,6 +109,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         setupProfileButton();
+         setupProviderPreset();
+         setupApiKeySummary();
++        setupAppIdBinding();
+         setupConnectionBindings();
+         setupNumericBindings();
+         setupTestButton();
+@@ -211,6 +212,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                                     UUID.randomUUID().toString(), name,
+                                     active == null ? "custom" : active.provider,
+                                     active == null ? null : active.baseUrl,
++                                    active == null ? null : active.appId,
+                                     active == null ? null : active.apiKey,
+                                     active == null ? null : active.model,
+                                     active == null ? BisubPrefs.Config.CONCURRENCY_DEFAULT
+@@ -283,10 +285,14 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         // needs its server address (plus an optional key), and the chat
+         // models need the full base URL, key and model name.
+         final boolean showBaseUrl = !traditional || "libre".equals(provider);
++        final boolean showAppId = "baidu".equals(provider) || "niutrans".equals(provider);
+         final boolean showApiKey = !traditional || "deepl".equals(provider)
+-                || "libre".equals(provider) || "baidu".equals(provider)
+-                || "niutrans".equals(provider);
++                || "libre".equals(provider) || showAppId;
+         final boolean showModel = !traditional;
++        final EditTextPreference appIdPref =
++                (EditTextPreference) requirePreference(R.string.bisub_app_id_key);
++        appIdPref.setVisible(showAppId);
++        appIdPref.setText(active == null ? null : active.appId);
+         final EditTextPreference baseUrlPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_base_url_key);
+         baseUrlPref.setVisible(showBaseUrl);
+@@ -301,16 +307,8 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 (EditTextPreference) requirePreference(R.string.bisub_api_key_key);
+         apiKeyPref.setVisible(showApiKey);
+         apiKeyPref.setText(active == null ? null : active.apiKey);
+-        if ("baidu".equals(provider) && (active == null || isBlank(active.apiKey))) {
+-            apiKeyPref.setSummary(getString(R.string.bisub_api_key_baidu_hint));
+-        } else if ("niutrans".equals(provider)
+-                && (active == null || isBlank(active.apiKey))) {
+-            apiKeyPref.setSummary(getString(R.string.bisub_api_key_niutrans_hint));
+-        } else {
+-            apiKeyPref.setSummary(active != null && !isBlank(active.apiKey)
+-                    ? getString(R.string.bisub_api_key_set)
+-                    : getString(R.string.bisub_api_key_unset));
+-        }
++        apiKeyPref.setSummary(apiKeySummaryFor(provider,
++                active == null ? null : active.apiKey));
+ 
+         final EditTextPreference concurrencyPref =
+                 (EditTextPreference) requirePreference(R.string.bisub_concurrency_key);
+@@ -424,9 +422,13 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 // tier allows only one request per second): the engine
+                 // limits differ, so the previous engine's values would
+                 // mostly be wrong. Users can still raise them afterwards
+-                // for paid tiers.
++                // for paid tiers. The credentials are cleared as well:
++                // they never carry over between engines, and a stale key
++                // from the previous engine would show up as "set" while
++                // every request fails.
+                 BisubPrefs.replaceProfile(requireContext(), active.withConnection(
+-                        provider, preset[0], preset[1]).withTuning(
++                        provider, preset[0], preset[1])
++                        .withAppCredentials(null, null).withTuning(
+                         BisubPrefs.defaultConcurrencyFor(provider),
+                         BisubPrefs.defaultBatchSizeFor(provider)));
+                 // Re-read the active profile so every visible preference,
+@@ -445,18 +447,61 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         apiKeyPref.setOnPreferenceChangeListener((final Preference p,
+                                                   final Object newValue) -> {
+             final String value = newValue == null ? null : String.valueOf(newValue);
++            final BisubPrefs.ProviderProfile active =
++                    BisubPrefs.getActiveProfile(requireContext());
++            p.setSummary(apiKeySummaryFor(active == null ? null : active.provider, value));
++            if (active != null) {
++                BisubPrefs.replaceProfile(requireContext(), active.withApiKey(value));
++            }
++            return true;
++        });
++    }
++
++    /**
++     * Binds the App ID field (Baidu and Niutrans credentials) to the
++     * active profile, mirroring the API key field.
++     */
++    private void setupAppIdBinding() {
++        final EditTextPreference appIdPref =
++                (EditTextPreference) requirePreference(R.string.bisub_app_id_key);
++        appIdPref.setOnPreferenceChangeListener((final Preference p,
++                                                 final Object newValue) -> {
++            final String value = newValue == null ? null : String.valueOf(newValue);
+             p.setSummary(isBlank(value)
+                     ? getString(R.string.bisub_api_key_unset)
+                     : getString(R.string.bisub_api_key_set));
+             final BisubPrefs.ProviderProfile active =
+                     BisubPrefs.getActiveProfile(requireContext());
+             if (active != null) {
+-                BisubPrefs.replaceProfile(requireContext(), active.withApiKey(value));
++                BisubPrefs.replaceProfile(requireContext(), active.withAppCredentials(
++                        value, active.apiKey));
+             }
+             return true;
+         });
+     }
+ 
++    /**
++     * @param provider the provider preset value of the active profile
++     * @param value    the current API key value
++     * @return the summary of the API key field: an engine-specific hint
++     *         while the key is empty (where to find it), otherwise
++     *         whether it is set
++     */
++    @NonNull
++    private String apiKeySummaryFor(@Nullable final String provider,
++                                    @Nullable final String value) {
++        if (!isBlank(value)) {
++            return getString(R.string.bisub_api_key_set);
++        }
++        if ("baidu".equals(provider)) {
++            return getString(R.string.bisub_api_key_baidu_hint);
++        }
++        if ("niutrans".equals(provider)) {
++            return getString(R.string.bisub_api_key_niutrans_hint);
++        }
++        return getString(R.string.bisub_api_key_unset);
++    }
++
+     /**
+      * Updates the master switch summary so the user can immediately see
+      * whether bisub is enabled and whether the configuration is complete.
+@@ -480,9 +525,10 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+     /**
+      * @return the string resource of the first missing required field,
+      *         or {@code 0} when the configuration is complete. The free
+-     *         Google/Microsoft engines need nothing, DeepL needs its key,
+-     *         LibreTranslate its server address and the chat models the
+-     *         full base URL, key and model name.
++     *         Google/Microsoft engines need nothing, DeepL its key,
++     *         LibreTranslate its server address, Baidu and Niutrans
++     *         their app id and key, and the chat models the full base
++     *         URL, key and model name.
+      */
+     private int findMissingFieldResId() {
+         final BisubPrefs.ProviderProfile active =
+@@ -497,6 +543,14 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+             if ("deepl".equals(active.provider) && isBlank(active.apiKey)) {
+                 return R.string.bisub_missing_api_key;
+             }
++            if ("baidu".equals(active.provider) || "niutrans".equals(active.provider)) {
++                if (isBlank(active.appId)) {
++                    return R.string.bisub_missing_app_id;
++                }
++                if (isBlank(active.apiKey)) {
++                    return R.string.bisub_missing_api_key;
++                }
++            }
+         } else {
+             if (isBlank(active.baseUrl)) {
+                 return R.string.bisub_missing_base_url;
+@@ -530,7 +584,11 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         final Context context = requireContext();
+         final BisubPrefs.Config cfg = BisubPrefs.load(context);
+         if (!cfg.isUsable()) {
+-            showTestResult(context, false, getString(R.string.bisub_test_missing_config));
++            final int missingResId = findMissingFieldResId();
++            showTestResult(context, false, missingResId != 0
++                    ? getString(R.string.bisub_status_incomplete,
++                            getString(missingResId))
++                    : getString(R.string.bisub_test_missing_config));
+             return;
+         }
+ 
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 43aa8daf8..6243b69e6 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1237,8 +1237,11 @@
+     <string name="bisub_api_key_title">API 密钥</string>
+     <string name="bisub_api_key_unset">未设置</string>
+     <string name="bisub_api_key_set">已设置</string>
+-    <string name="bisub_api_key_baidu_hint">格式：appid#密钥（在百度翻译开放平台控制台获取）</string>
+-    <string name="bisub_api_key_niutrans_hint">格式：appId#API-KEY（在小牛翻译云平台控制台“API应用”中获取）</string>
++    <string name="bisub_api_key_baidu_hint">百度翻译开放平台“开发者信息”页的密钥</string>
++    <string name="bisub_api_key_niutrans_hint">小牛翻译云平台控制台“API应用”中的 API-KEY</string>
++    <string name="bisub_app_id_title">App ID</string>
++    <string name="bisub_app_id_summary">百度翻译与小牛翻译需要在 API 密钥之外填写</string>
++    <string name="bisub_missing_app_id">App ID</string>
+     <string name="bisub_model_title">模型名称</string>
+     <string name="bisub_model_summary">模型名称，如 deepseek-chat</string>
+ 
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 47c4ec7b5..9d7641afd 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1902,6 +1902,7 @@
+     <string name="bisub_style_translation_alpha_key">bisub_style_translation_alpha</string>
+ 
+     <string name="bisub_cloud_backup_key">bisub_cloud_backup</string>
++    <string name="bisub_app_id_key">bisub_app_id</string>
+     <string name="bisub_cloud_backup_provider_key">bisub_cloud_backup_provider</string>
+     <string name="bisub_cloud_backup_webdav_url_key">bisub_cloud_backup_webdav_url</string>
+     <string name="bisub_cloud_backup_webdav_username_key">bisub_cloud_backup_webdav_username</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 03370d737..9443e8d17 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1239,8 +1239,11 @@
+     <string name="bisub_api_key_title">API key</string>
+     <string name="bisub_api_key_unset">Not set</string>
+     <string name="bisub_api_key_set">Set</string>
+-    <string name="bisub_api_key_baidu_hint">Format: appid#secret (from the Baidu console)</string>
+-    <string name="bisub_api_key_niutrans_hint">Format: appId#apikey (from the Niutrans console, API applications)</string>
++    <string name="bisub_api_key_baidu_hint">The secret key from the Baidu console (developer information)</string>
++    <string name="bisub_api_key_niutrans_hint">The API-KEY from the Niutrans console (API applications)</string>
++    <string name="bisub_app_id_title">App ID</string>
++    <string name="bisub_app_id_summary">Needed by Baidu and Niutrans, next to the API key</string>
++    <string name="bisub_missing_app_id">App ID</string>
+     <string name="bisub_model_title">Model</string>
+     <string name="bisub_model_summary">Model name, e.g. deepseek-chat</string>
+ 
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index bdf4d793f..91a8cb92e 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -35,6 +35,13 @@
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
+ 
++    <EditTextPreference
++        android:key="@string/bisub_app_id_key"
++        android:title="@string/bisub_app_id_title"
++        android:summary="@string/bisub_app_id_summary"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
+     <EditTextPreference
+         android:inputType="textPassword"
+         android:key="@string/bisub_api_key_key"
+-- 
+2.54.0.windows.1
+
