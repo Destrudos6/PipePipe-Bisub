@@ -1,0 +1,47 @@
+From efa69ce7e1fc86c77e3462305161748386008d6c Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 22:13:19 +0800
+Subject: [PATCH] Narrow the Baidu auth-scheme fallback to real rejections
+
+The automatic scheme detection caught any TranslationConfigException
+from the Bearer attempt and pinned the sign scheme, but that exception
+also covers quota exhaustion (54004), unsupported languages (58001)
+and a closed service (58002). When one of those hit mid-translation,
+the working Bearer authentication was poisoned in the cache, every
+following request went through the sign scheme, and API-key users
+ended up on a misleading 54001 'check your credentials' instead of
+the real error.
+
+Only a 54001 rejection of the Bearer token may trigger the fallback
+now; every other configuration error surfaces directly with its true
+meaning.
+---
+ .../org/schabi/newpipe/bisub/SubtitleTranslator.java   | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index ee78df54a..dea2f1344 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -792,10 +792,16 @@ public final class SubtitleTranslator {
+                         baiduSendWithRetries(joined, target, appId, secret, true);
+                 BAIDU_BEARER_AUTH.put(appId, true);
+                 return parsed;
+-            } catch (final BaiduAuthException | TranslationConfigException e) {
++            } catch (final BaiduAuthException e) {
+                 // The Bearer scheme was rejected (the key field holds the
+                 // classic secret, or the token is invalid): continue with
+-                // the sign scheme instead.
++                // the sign scheme instead. Only a 54001 rejection may pin
++                // the scheme: any other configuration error (quota, closed
++                // service, unsupported language) also arrives as a
++                // TranslationConfigException, but those have nothing to do
++                // with the authentication scheme, and treating them as a
++                // Bearer rejection would poison the cache and mask the
++                // real error behind a misleading sign-scheme 54001.
+                 BAIDU_BEARER_AUTH.put(appId, false);
+                 BisubLog.w("baidu bearer auth was rejected (" + e.getMessage()
+                         + "), switching to the sign scheme");
+-- 
+2.54.0.windows.1
+
