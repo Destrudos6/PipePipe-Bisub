@@ -1,0 +1,2238 @@
+From 8a0f7aa149e13d728efbd149d3ae29ba3246d329 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 10:57:46 +0800
+Subject: [PATCH] Add cloud backup to user-owned WebDAV or S3 storage
+
+Baking on the research of remotely-save (the popular Obsidian sync
+plugin) and its backend abstraction, whose free self-hosted core
+covers exactly WebDAV (Nextcloud, Synology, NutStore, AList, ...)
+and S3 (MinIO, Cloudflare R2, Backblaze B2, AWS, ...): those two
+backends are implemented on plain OkHttp with zero new
+dependencies, including a hand-rolled AWS SigV4 signer with
+path-style addressing and an XML parser for ListObjectsV2, and
+PROPFIND/MKCOL/PUT/GET/DELETE with Basic auth for WebDAV.
+
+A new second-level settings page (backup & restore -> cloud
+backup) configures the backend, tests the connection, uploads a
+complete backup zip on demand (database, settings, bisub subtitle
+cache - the same content as the manual export) and restores any
+remote backup with a picker, confirmation and an app restart.
+
+Automatic backups run through a periodic WorkManager job (daily
+or weekly) that fails silently and retries on the next run; the
+retention setting prunes the oldest remote backups after each
+upload. The configuration lives in the default shared
+preferences, so a restored device reconnects to its storage
+automatically.
+
+ContentSettingsManager learns to export into a plain OutputStream
+and to import from a local zip file, which is what the cloud
+pipeline uses; the SAF-based manual export/import keeps working
+through the same core.
+---
+ .../bisub/backup/CloudBackupConfig.java       | 195 ++++++++++
+ .../bisub/backup/CloudBackupManager.java      | 190 +++++++++
+ .../bisub/backup/CloudBackupWorker.java       |  38 ++
+ .../newpipe/bisub/backup/RemoteBackend.java   |  82 ++++
+ .../newpipe/bisub/backup/RemoteFile.java      |  21 +
+ .../newpipe/bisub/backup/S3Backend.java       | 365 ++++++++++++++++++
+ .../newpipe/bisub/backup/WebDavBackend.java   | 287 ++++++++++++++
+ .../newpipe/settings/CloudBackupFragment.java | 331 ++++++++++++++++
+ .../settings/ContentSettingsManager.kt        | 141 +++++--
+ .../settings/SettingsResourceRegistry.java    |   1 +
+ app/src/main/res/values-zh-rCN/strings.xml    |  50 +++
+ app/src/main/res/values-zh-rTW/strings.xml    |  50 +++
+ app/src/main/res/values/settings_keys.xml     |  48 +++
+ app/src/main/res/values/strings.xml           |  50 +++
+ app/src/main/res/xml/backup_settings.xml      |   8 +
+ .../main/res/xml/cloud_backup_settings.xml    | 154 ++++++++
+ 16 files changed, 1988 insertions(+), 23 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupConfig.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupWorker.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteBackend.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteFile.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+ create mode 100644 app/src/main/res/xml/cloud_backup_settings.xml
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupConfig.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupConfig.java
+new file mode 100644
+index 000000000..56407f6d4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupConfig.java
+@@ -0,0 +1,195 @@
++package org.schabi.newpipe.bisub.backup;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.preference.PreferenceManager;
++
++import org.schabi.newpipe.R;
++
++import java.io.IOException;
++
++/**
++ * Configuration of the cloud backup feature, persisted in the default
++ * shared preferences (and therefore included in regular data exports,
++ * so a restored device remembers its cloud storage).
++ */
++public final class CloudBackupConfig {
++
++    /** Backend identifier of the WebDAV implementation. */
++    public static final String PROVIDER_WEBDAV = "webdav";
++    /** Backend identifier of the S3 implementation. */
++    public static final String PROVIDER_S3 = "s3";
++    /** Default remote directory for backups. */
++    public static final String DEFAULT_DIR = "BiPipe";
++    /** Default number of remote backups kept before pruning. */
++    public static final int DEFAULT_RETENTION = 5;
++
++    @Nullable public final String provider;
++    @Nullable public final String webdavUrl;
++    @Nullable public final String webdavUsername;
++    @Nullable public final String webdavPassword;
++    @Nullable public final String s3Endpoint;
++    @Nullable public final String s3Region;
++    @Nullable public final String s3Bucket;
++    @Nullable public final String s3AccessKey;
++    @Nullable public final String s3SecretKey;
++    @NonNull public final String remoteDir;
++    public final boolean autoEnabled;
++    public final int autoIntervalDays;
++    public final int retention;
++
++    private CloudBackupConfig(@Nullable final String provider,
++                              @Nullable final String webdavUrl,
++                              @Nullable final String webdavUsername,
++                              @Nullable final String webdavPassword,
++                              @Nullable final String s3Endpoint,
++                              @Nullable final String s3Region,
++                              @Nullable final String s3Bucket,
++                              @Nullable final String s3AccessKey,
++                              @Nullable final String s3SecretKey,
++                              @Nullable final String remoteDir,
++                              final boolean autoEnabled,
++                              final int autoIntervalDays,
++                              final int retention) {
++        this.provider = provider;
++        this.webdavUrl = webdavUrl;
++        this.webdavUsername = webdavUsername;
++        this.webdavPassword = webdavPassword;
++        this.s3Endpoint = s3Endpoint;
++        this.s3Region = s3Region;
++        this.s3Bucket = s3Bucket;
++        this.s3AccessKey = s3AccessKey;
++        this.s3SecretKey = s3SecretKey;
++        this.remoteDir = remoteDir == null || remoteDir.trim().isEmpty()
++                ? DEFAULT_DIR : remoteDir.trim();
++        this.autoEnabled = autoEnabled;
++        this.autoIntervalDays = autoIntervalDays;
++        this.retention = retention;
++    }
++
++    /**
++     * @return whether enough settings of the selected backend are present
++     *         to attempt a connection
++     */
++    public boolean isConfigured() {
++        if (PROVIDER_WEBDAV.equals(provider)) {
++            return notBlank(webdavUrl) && notBlank(webdavUsername) && notBlank(webdavPassword);
++        }
++        if (PROVIDER_S3.equals(provider)) {
++            return notBlank(s3Endpoint) && notBlank(s3Bucket) && notBlank(s3AccessKey)
++                    && notBlank(s3SecretKey);
++        }
++        return false;
++    }
++
++    /**
++     * @return the backend for this configuration
++     * @throws IOException when the configuration is missing or invalid
++     */
++    @NonNull
++    public RemoteBackend toBackend() throws IOException {
++        if (!isConfigured()) {
++            throw new IOException("The cloud backup settings are incomplete");
++        }
++        if (PROVIDER_WEBDAV.equals(provider)) {
++            return new WebDavBackend(webdavUrl.trim(), webdavUsername.trim(),
++                    webdavPassword);
++        }
++        return new S3Backend(s3Endpoint.trim(), s3Region == null ? "" : s3Region,
++                s3Bucket, s3AccessKey.trim(), s3SecretKey);
++    }
++
++    /**
++     * @param context any context
++     * @return the current cloud backup configuration
++     */
++    @NonNull
++    public static CloudBackupConfig load(@NonNull final Context context) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        return new CloudBackupConfig(
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_provider_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_webdav_url_key),
++                        null),
++                prefs.getString(
++                        context.getString(R.string.bisub_cloud_backup_webdav_username_key),
++                        null),
++                prefs.getString(
++                        context.getString(R.string.bisub_cloud_backup_webdav_password_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_s3_endpoint_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_s3_region_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_s3_bucket_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_s3_access_key_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_s3_secret_key_key),
++                        null),
++                prefs.getString(context.getString(R.string.bisub_cloud_backup_dir_key),
++                        null),
++                prefs.getBoolean(
++                        context.getString(R.string.bisub_cloud_backup_auto_enabled_key), false),
++                readIntervalDays(prefs.getString(
++                        context.getString(R.string.bisub_cloud_backup_auto_interval_key),
++                        null)),
++                readRetention(prefs.getString(
++                        context.getString(R.string.bisub_cloud_backup_retention_key), null)));
++    }
++
++    private static int readIntervalDays(@Nullable final String value) {
++        if ("weekly".equals(value)) {
++            return 7;
++        }
++        return 1;
++    }
++
++    private static int readRetention(@Nullable final String value) {
++        if (value != null) {
++            try {
++                final int parsed = Integer.parseInt(value);
++                if (parsed > 0 && parsed <= 100) {
++                    return parsed;
++                }
++            } catch (final NumberFormatException ignored) {
++                // fall back to the default
++            }
++        }
++        return DEFAULT_RETENTION;
++    }
++
++    private static boolean notBlank(@Nullable final String value) {
++        return value != null && !value.trim().isEmpty();
++    }
++
++    /**
++     * Records when the last backup finished, for the settings summary.
++     *
++     * @param context     any context
++     * @param timestampMs epoch milliseconds of the finished backup
++     */
++    public static void recordLastBackupTime(@NonNull final Context context,
++                                            final long timestampMs) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        prefs.edit().putLong(
++                context.getString(R.string.bisub_cloud_backup_last_run_key), timestampMs)
++                .apply();
++    }
++
++    /**
++     * @param context any context
++     * @return epoch milliseconds of the last successful backup, or 0
++     */
++    public static long lastBackupTime(@NonNull final Context context) {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        return prefs.getLong(
++                context.getString(R.string.bisub_cloud_backup_last_run_key), 0L);
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+new file mode 100644
+index 000000000..50ba6b56e
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+@@ -0,0 +1,190 @@
++package org.schabi.newpipe.bisub.backup;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.util.Log;
++
++import androidx.annotation.NonNull;
++
++import androidx.preference.PreferenceManager;
++import androidx.work.ExistingPeriodicWorkPolicy;
++import androidx.work.PeriodicWorkRequest;
++import androidx.work.WorkManager;
++
++import org.schabi.newpipe.NewPipeDatabase;
++import org.schabi.newpipe.settings.ContentSettingsManager;
++import org.schabi.newpipe.settings.NewPipeFileLocator;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Orchestrates cloud backups: assembles the same complete backup zip as
++ * the manual export (database, settings, bisub subtitle cache), uploads
++ * it to the user's own remote storage, prunes old remote backups, and
++ * restores everything back on demand.
++ */
++public final class CloudBackupManager {
++
++    private static final String TAG = CloudBackupManager.class.getSimpleName();
++    private static final String WORK_NAME = "bipipe-cloud-backup";
++    private static final String TEMP_FILE = "bipipe-cloud-backup.zip";
++
++    private static volatile CloudBackupManager instance;
++
++    private final Context appContext;
++
++    private CloudBackupManager(@NonNull final Context context) {
++        this.appContext = context.getApplicationContext();
++    }
++
++    /** @param context any context */
++    @NonNull
++    public static CloudBackupManager getInstance(@NonNull final Context context) {
++        if (instance == null) {
++            synchronized (CloudBackupManager.class) {
++                if (instance == null) {
++                    instance = new CloudBackupManager(context);
++                }
++            }
++        }
++        return instance;
++    }
++
++    private ContentSettingsManager settingsManager() {
++        return new ContentSettingsManager(
++                new NewPipeFileLocator(appContext.getDataDir()));
++    }
++
++    /**
++     * Generates a complete backup and uploads it to the configured remote
++     * storage, then prunes old backups beyond the retention limit.
++     *
++     * @return the name of the uploaded backup file
++     * @throws Exception when the export or the upload fails; the message
++     *                   is suitable for display
++     */
++    @NonNull
++    public String backupNow() throws Exception {
++        synchronized (this) {
++            NewPipeDatabase.checkpoint();
++            final CloudBackupConfig config = CloudBackupConfig.load(appContext);
++            final RemoteBackend backend = config.toBackend();
++            final String name = backupFileName();
++            final File temp = new File(appContext.getCacheDir(), TEMP_FILE);
++            try {
++                final SharedPreferences preferences =
++                        PreferenceManager.getDefaultSharedPreferences(appContext);
++                try (OutputStream out = new FileOutputStream(temp)) {
++                    settingsManager().exportDatabase(preferences, out);
++                }
++                backend.ensureRemoteDir(config.remoteDir);
++                backend.uploadBackup(config.remoteDir, name, temp);
++                pruneOldBackups(backend, config);
++                CloudBackupConfig.recordLastBackupTime(appContext,
++                        System.currentTimeMillis());
++                Log.i(TAG, "Cloud backup uploaded: " + name + " (" + temp.length()
++                        + " bytes)");
++                return name;
++            } finally {
++                if (temp.exists() && !temp.delete()) {
++                    temp.deleteOnExit();
++                }
++            }
++        }
++    }
++
++    private void pruneOldBackups(@NonNull final RemoteBackend backend,
++                                 @NonNull final CloudBackupConfig config) {
++        try {
++            final List<RemoteFile> files = backend.listBackups(config.remoteDir);
++            // listBackups is newest-first; delete everything past the limit.
++            for (int i = config.retention; i < files.size(); i++) {
++                backend.deleteBackup(config.remoteDir, files.get(i).name);
++                Log.i(TAG, "Pruned old cloud backup: " + files.get(i).name);
++            }
++        } catch (final IOException e) {
++            // Pruning is best-effort: the fresh backup is already stored.
++            Log.w(TAG, "Could not prune old cloud backups: " + e.getMessage());
++        }
++    }
++
++    @NonNull
++    private static String backupFileName() {
++        return "bipipe-backup-"
++                + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date())
++                + ".zip";
++    }
++
++    /**
++     * @return the remote backups, newest first
++     * @throws IOException when the connection or the listing fails
++     */
++    @NonNull
++    public List<RemoteFile> listBackups() throws IOException {
++        final CloudBackupConfig config = CloudBackupConfig.load(appContext);
++        return config.toBackend().listBackups(config.remoteDir);
++    }
++
++    /**
++     * Downloads a remote backup and applies it locally: database, bisub
++     * subtitle cache and settings are replaced. The caller is expected to
++     * restart the app afterwards so the new database is picked up.
++     *
++     * @param name the remote backup file name
++     * @throws Exception when the download or the import fails
++     */
++    public void restoreBackup(@NonNull final String name) throws Exception {
++        synchronized (this) {
++            final CloudBackupConfig config = CloudBackupConfig.load(appContext);
++            final RemoteBackend backend = config.toBackend();
++            final File temp = new File(appContext.getCacheDir(), TEMP_FILE);
++            try {
++                backend.downloadBackup(config.remoteDir, name, temp);
++                final ContentSettingsManager manager = settingsManager();
++                if (!manager.extractDbFromFile(temp)) {
++                    throw new IOException("The backup contains no database");
++                }
++                manager.extractBisubCacheFromFile(temp);
++                if (manager.extractSettingsFromFile(temp)) {
++                    manager.loadSharedPreferences(
++                            PreferenceManager.getDefaultSharedPreferences(appContext));
++                }
++                Log.i(TAG, "Cloud backup restored: " + name);
++            } finally {
++                if (temp.exists() && !temp.delete()) {
++                    temp.deleteOnExit();
++                }
++            }
++        }
++    }
++
++    /**
++     * (Re-)schedules or cancels the periodic automatic backup according to
++     * the current configuration. Called whenever the related settings
++     * change; the unique work survives app restarts and process death.
++     *
++     * @param context any context
++     */
++    public static void scheduleAutomaticBackups(@NonNull final Context context) {
++        final WorkManager workManager = WorkManager.getInstance(context);
++        final CloudBackupConfig config = CloudBackupConfig.load(context);
++        if (!config.autoEnabled || !config.isConfigured()) {
++            workManager.cancelUniqueWork(WORK_NAME);
++            return;
++        }
++        final PeriodicWorkRequest request = new PeriodicWorkRequest.Builder(
++                CloudBackupWorker.class, config.autoIntervalDays, TimeUnit.DAYS)
++                .build();
++        workManager.enqueueUniquePeriodicWork(WORK_NAME,
++                ExistingPeriodicWorkPolicy.UPDATE, request);
++    }
++
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupWorker.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupWorker.java
+new file mode 100644
+index 000000000..071f66fc7
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupWorker.java
+@@ -0,0 +1,38 @@
++package org.schabi.newpipe.bisub.backup;
++
++import android.content.Context;
++import android.util.Log;
++
++import androidx.annotation.NonNull;
++import androidx.work.Worker;
++import androidx.work.WorkerParameters;
++
++/**
++ * Periodic background job that runs the cloud backup. Failures are
++ * silent by design (mirroring the auto-sync behaviour of similar
++ * projects): the next scheduled run retries, and the settings screen
++ * always shows when the last backup actually succeeded.
++ */
++public final class CloudBackupWorker extends Worker {
++
++    private static final String TAG = CloudBackupWorker.class.getSimpleName();
++
++    public CloudBackupWorker(@NonNull final Context context,
++                             @NonNull final WorkerParameters params) {
++        super(context, params);
++    }
++
++    @NonNull
++    @Override
++    public Result doWork() {
++        try {
++            final String name =
++                    CloudBackupManager.getInstance(getApplicationContext()).backupNow();
++            Log.i(TAG, "Automatic cloud backup finished: " + name);
++            return Result.success();
++        } catch (final Exception e) {
++            Log.e(TAG, "Automatic cloud backup failed", e);
++            return Result.failure();
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteBackend.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteBackend.java
+new file mode 100644
+index 000000000..3a071e35a
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteBackend.java
+@@ -0,0 +1,82 @@
++package org.schabi.newpipe.bisub.backup;
++
++import androidx.annotation.NonNull;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.List;
++
++/**
++ * A user-owned remote storage where complete backups are uploaded to and
++ * restored from. Two implementations exist, mirroring the backends that
++ * self-hosted storage commonly speaks: WebDAV (Nextcloud, Synology,
++ * NutStore, AList, InfiniCLOUD, ...) and S3 (MinIO, Cloudflare R2,
++ * Backblaze B2, Storj, Amazon S3, ...).
++ *
++ * <p>All methods are blocking network calls and must run off the main
++ * thread. Failures are reported as {@link IOException}s whose message is
++ * shown to the user, so implementations are expected to phrase them
++ * meaningfully (HTTP code, response body, or reason).</p>
++ */
++public interface RemoteBackend {
++
++    /**
++     * Verifies that the endpoint is reachable, the credentials are
++     * accepted and the target exists, without writing anything.
++     *
++     * @throws IOException when the connection cannot be established
++     */
++    void checkConnection() throws IOException;
++
++    /**
++     * Makes sure the remote directory for backups exists. A no-op for
++     * backends without real directories (S3 prefixes).
++     *
++     * @param dir the directory path, segments separated by {@code /},
++     *            without leading or trailing slashes; empty means the root
++     * @throws IOException when the directory cannot be created
++     */
++    void ensureRemoteDir(@NonNull String dir) throws IOException;
++
++    /**
++     * Lists the backup files (anything ending in {@code .zip}) inside a
++     * directory, ordered from newest to oldest by name.
++     *
++     * @param dir the directory to list; empty means the root
++     * @return the backup files; empty when there are none
++     * @throws IOException when listing fails
++     */
++    @NonNull
++    List<RemoteFile> listBackups(@NonNull String dir) throws IOException;
++
++    /**
++     * Uploads a local file into the remote directory under a new name.
++     *
++     * @param dir  the target directory; empty means the root
++     * @param name the file name inside the directory
++     * @param file the local file to upload
++     * @throws IOException when the upload fails
++     */
++    void uploadBackup(@NonNull String dir, @NonNull String name, @NonNull File file)
++            throws IOException;
++
++    /**
++     * Downloads a remote backup into a local file.
++     *
++     * @param dir    the directory the backup lives in; empty means the root
++     * @param name   the file name inside the directory
++     * @param target the local file to overwrite
++     * @throws IOException when the download fails
++     */
++    void downloadBackup(@NonNull String dir, @NonNull String name, @NonNull File target)
++            throws IOException;
++
++    /**
++     * Deletes a remote backup.
++     *
++     * @param dir  the directory the backup lives in; empty means the root
++     * @param name the file name inside the directory
++     * @throws IOException when the deletion fails
++     */
++    void deleteBackup(@NonNull String dir, @NonNull String name) throws IOException;
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteFile.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteFile.java
+new file mode 100644
+index 000000000..907603c56
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/RemoteFile.java
+@@ -0,0 +1,21 @@
++package org.schabi.newpipe.bisub.backup;
++
++import androidx.annotation.NonNull;
++
++/**
++ * One backup file stored on the remote storage backend.
++ */
++public final class RemoteFile {
++    /** File name, without any directory prefix. */
++    @NonNull public final String name;
++    /** Size in bytes. */
++    public final long size;
++    /** Last modification time in epoch milliseconds. */
++    public final long lastModified;
++
++    RemoteFile(@NonNull final String name, final long size, final long lastModified) {
++        this.name = name;
++        this.size = size;
++        this.lastModified = lastModified;
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
+new file mode 100644
+index 000000000..ddb64ff45
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/S3Backend.java
+@@ -0,0 +1,365 @@
++package org.schabi.newpipe.bisub.backup;
++
++import androidx.annotation.NonNull;
++
++import org.xmlpull.v1.XmlPullParser;
++
++import android.util.Xml;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.text.ParseException;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++import java.util.TimeZone;
++import java.util.concurrent.TimeUnit;
++
++import javax.crypto.Mac;
++import javax.crypto.spec.SecretKeySpec;
++
++import okhttp3.HttpUrl;
++import okhttp3.MediaType;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++
++/**
++ * S3 implementation of the backup backend, using path-style requests
++ * signed with AWS Signature Version 4. Works with Amazon S3, Cloudflare
++ * R2, Backblaze B2, MinIO, Storj and every other S3-compatible service.
++ * No SDK dependency: signing is roughly a hundred lines on top of OkHttp.
++ */
++final class S3Backend implements RemoteBackend {
++
++    /** SHA-256 of an empty body, as required for unsigned GET/DELETE. */
++    private static final String EMPTY_SHA256 =
++            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
++    private static final MediaType ZIP = MediaType.parse("application/zip");
++
++    private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
++            .connectTimeout(20, TimeUnit.SECONDS)
++            .readTimeout(60, TimeUnit.SECONDS)
++            .writeTimeout(5, TimeUnit.MINUTES)
++            .build();
++
++    private final HttpUrl endpoint;
++    private final String region;
++    private final String bucket;
++    private final String accessKey;
++    private final String secretKey;
++
++    S3Backend(@NonNull final String endpointUrl, @NonNull final String region,
++              @NonNull final String bucket, @NonNull final String accessKey,
++              @NonNull final String secretKey) throws IOException {
++        final HttpUrl parsed = HttpUrl.parse(endpointUrl);
++        if (parsed == null) {
++            throw new IOException("Invalid S3 endpoint: " + endpointUrl);
++        }
++        this.endpoint = parsed;
++        this.region = region.trim().isEmpty() ? "us-east-1" : region.trim();
++        this.bucket = bucket.trim();
++        this.accessKey = accessKey.trim();
++        this.secretKey = secretKey;
++        if (this.bucket.isEmpty()) {
++            throw new IOException("The S3 bucket name is empty");
++        }
++    }
++
++    private HttpUrl objectUrl(@NonNull final String key) {
++        // Path-style addressing: endpoint/bucket/key. This is what every
++        // self-hosted and S3-compatible service expects.
++        return endpoint.newBuilder()
++                .addPathSegments(bucket)
++                .addPathSegments(key)
++                .build();
++    }
++
++    private HttpUrl listUrl(@NonNull final String prefix, final int maxKeys) {
++        final HttpUrl.Builder builder = endpoint.newBuilder()
++                .addPathSegments(bucket)
++                .addQueryParameter("list-type", "2");
++        if (maxKeys > 0) {
++            builder.addQueryParameter("max-keys", String.valueOf(maxKeys));
++        }
++        if (!prefix.isEmpty()) {
++            builder.addQueryParameter("prefix", prefix);
++        }
++        return builder.build();
++    }
++
++    /**
++     * Builds a request with AWS SigV4 authentication. Only the headers we
++     * explicitly add are signed; OkHttp's automatic headers (gzip,
++     * keep-alive) stay unsigned, which S3 accepts.
++     */
++    private Request.Builder signedRequest(@NonNull final String method,
++                                          @NonNull final HttpUrl url,
++                                          @NonNull final String payloadHash) {
++        final SimpleDateFormat amzFormat =
++                new SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US);
++        amzFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
++        final String amzDate = amzFormat.format(new Date());
++        final String dateStamp = amzDate.substring(0, 8);
++
++        final String port = url.port() == 80 || url.port() == 443 ? "" : ":" + url.port();
++        final String hostHeader = url.host() + port;
++        final String canonicalUri = url.encodedPath();
++        final String canonicalQuery = url.encodedQuery() == null ? "" : url.encodedQuery();
++        final String canonicalHeaders = "host:" + hostHeader + "\n"
++                + "x-amz-content-sha256:" + payloadHash + "\n"
++                + "x-amz-date:" + amzDate + "\n";
++        final String signedHeaders = "host;x-amz-content-sha256;x-amz-date";
++        final String canonicalRequest = method + "\n" + canonicalUri + "\n" + canonicalQuery
++                + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash;
++
++        final String scope = dateStamp + "/" + region + "/s3/aws4_request";
++        final String stringToSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n"
++                + sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
++
++        final byte[] signingKey = hmac(hmac(hmac(hmac(
++                ("AWS4" + secretKey).getBytes(StandardCharsets.UTF_8), dateStamp),
++                region), "s3"), "aws4_request");
++        final String signature = hex(hmac(signingKey, stringToSign));
++
++        return new Request.Builder().url(url)
++                .header("x-amz-date", amzDate)
++                .header("x-amz-content-sha256", payloadHash)
++                .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + accessKey
++                        + "/" + scope + ",SignedHeaders=" + signedHeaders
++                        + ",Signature=" + signature);
++    }
++
++    private static byte[] hmac(@NonNull final byte[] key, @NonNull final String data) {
++        try {
++            final Mac mac = Mac.getInstance("HmacSHA256");
++            mac.init(new SecretKeySpec(key, "HmacSHA256"));
++            return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
++        } catch (final java.security.GeneralSecurityException e) {
++            // HmacSHA256 is guaranteed to exist on Android
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private static String sha256Hex(@NonNull final byte[] data) {
++        try {
++            return hex(MessageDigest.getInstance("SHA-256").digest(data));
++        } catch (final NoSuchAlgorithmException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private static String sha256Hex(@NonNull final File file) throws IOException {
++        try (InputStream in = new FileInputStream(file)) {
++            try {
++                final MessageDigest digest = MessageDigest.getInstance("SHA-256");
++                final byte[] buffer = new byte[8192];
++                int count = in.read(buffer);
++                while (count >= 0) {
++                    digest.update(buffer, 0, count);
++                    count = in.read(buffer);
++                }
++                return hex(digest.digest());
++            } catch (final NoSuchAlgorithmException e) {
++                throw new IllegalStateException(e);
++            }
++        }
++    }
++
++    private static String hex(@NonNull final byte[] bytes) {
++        final StringBuilder builder = new StringBuilder(bytes.length * 2);
++        for (final byte b : bytes) {
++            builder.append(Character.forDigit((b >> 4) & 0xF, 16));
++            builder.append(Character.forDigit(b & 0xF, 16));
++        }
++        return builder.toString();
++    }
++
++    /** Reads the S3 error XML and extracts its {@code Message} element. */
++    private static String describeError(@NonNull final Response response) {
++        String message = "";
++        try {
++            final String body = response.body() != null ? response.body().string() : "";
++            final java.util.regex.Matcher matcher = java.util.regex.Pattern
++                    .compile("<Message>(.*?)</Message>", java.util.regex.Pattern.DOTALL)
++                    .matcher(body);
++            if (matcher.find()) {
++                message = matcher.group(1);
++            }
++        } catch (final IOException ignored) {
++            // fall back to the plain status code
++        }
++        return message.isEmpty() ? "HTTP " + response.code()
++                : "HTTP " + response.code() + ": " + message;
++    }
++
++    @Override
++    public void checkConnection() throws IOException {
++        final Request request = signedRequest("GET", listUrl("", 1), EMPTY_SHA256).get().build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 403) {
++                throw new IOException("S3 rejected the credentials: " + describeError(response));
++            }
++            if (response.code() == 404) {
++                throw new IOException("Bucket '" + bucket + "' was not found");
++            }
++            if (!response.isSuccessful()) {
++                throw new IOException("S3 endpoint error: " + describeError(response));
++            }
++        }
++    }
++
++    @Override
++    public void ensureRemoteDir(@NonNull final String dir) {
++        // S3 has no directories: the prefix appears as soon as an object
++        // with that key prefix is uploaded.
++    }
++
++    @Override
++    @NonNull
++    public List<RemoteFile> listBackups(@NonNull final String dir) throws IOException {
++        final String trimmed = dir.trim();
++        final String prefix = trimmed.isEmpty() ? "" : trimmed + "/";
++        final Request request =
++                signedRequest("GET", listUrl(prefix, 0), EMPTY_SHA256).get().build();
++        final List<RemoteFile> files = new ArrayList<>();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 403) {
++                throw new IOException("S3 rejected the credentials: " + describeError(response));
++            }
++            if (!response.isSuccessful()) {
++                throw new IOException("Could not list the bucket: " + describeError(response));
++            }
++            final InputStream body = response.body() != null ? response.body().byteStream() : null;
++            if (body != null) {
++                parseListResult(body, prefix, files);
++            }
++        }
++        files.sort((a, b) -> b.name.compareTo(a.name));
++        return files;
++    }
++
++    private void parseListResult(@NonNull final InputStream body,
++                                 @NonNull final String prefix,
++                                 @NonNull final List<RemoteFile> output) throws IOException {
++        try {
++            final XmlPullParser parser = Xml.newPullParser();
++            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false);
++            parser.setInput(body, StandardCharsets.UTF_8.name());
++
++            String key = null;
++            long size = 0L;
++            long modified = 0L;
++            int event = parser.getEventType();
++            while (event != XmlPullParser.END_DOCUMENT) {
++                if (event == XmlPullParser.START_TAG) {
++                    final String tag = parser.getName();
++                    if ("Contents".equals(tag)) {
++                        key = null;
++                        size = 0L;
++                        modified = 0L;
++                    } else if ("Key".equals(tag)) {
++                        key = parser.nextText();
++                    } else if ("Size".equals(tag)) {
++                        try {
++                            size = Long.parseLong(parser.nextText().trim());
++                        } catch (final NumberFormatException ignored) {
++                            // keep 0
++                        }
++                    } else if ("LastModified".equals(tag)) {
++                        modified = parseIsoTime(parser.nextText().trim());
++                    }
++                } else if (event == XmlPullParser.END_TAG && "Contents".equals(parser.getName())
++                        && key != null && key.length() > prefix.length()) {
++                    final String name = key.substring(prefix.length());
++                    if (name.endsWith(".zip") && !name.contains("/")) {
++                        output.add(new RemoteFile(name, size, modified));
++                    }
++                    key = null;
++                }
++                event = parser.next();
++            }
++        } catch (final Exception e) {
++            throw new IOException("Malformed S3 listing: " + e.getMessage());
++        }
++    }
++
++    private static long parseIsoTime(@NonNull final String value) {
++        try {
++            final SimpleDateFormat format =
++                    new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
++            format.setTimeZone(TimeZone.getTimeZone("UTC"));
++            return format.parse(value).getTime();
++        } catch (final ParseException e) {
++            return 0L;
++        }
++    }
++
++    @Override
++    public void uploadBackup(@NonNull final String dir, @NonNull final String name,
++                             @NonNull final File file) throws IOException {
++        final String trimmed = dir.trim();
++        final String key = trimmed.isEmpty() ? name : trimmed + "/" + name;
++        final String payloadHash = sha256Hex(file);
++        final Request request = signedRequest("PUT", objectUrl(key), payloadHash)
++                .put(RequestBody.create(file, ZIP))
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (!response.isSuccessful()) {
++                throw new IOException("Upload '" + name + "' failed: " + describeError(response));
++            }
++        }
++    }
++
++    @Override
++    public void downloadBackup(@NonNull final String dir, @NonNull final String name,
++                               @NonNull final File target) throws IOException {
++        final String trimmed = dir.trim();
++        final String key = trimmed.isEmpty() ? name : trimmed + "/" + name;
++        final Request request = signedRequest("GET", objectUrl(key), EMPTY_SHA256).get().build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 404) {
++                throw new IOException("'" + name + "' was not found in the bucket");
++            }
++            if (!response.isSuccessful() || response.body() == null) {
++                throw new IOException("Download '" + name + "' failed: "
++                        + describeError(response));
++            }
++            try (InputStream in = response.body().byteStream();
++                 OutputStream out = new FileOutputStream(target)) {
++                final byte[] buffer = new byte[8192];
++                int count = in.read(buffer);
++                while (count >= 0) {
++                    out.write(buffer, 0, count);
++                    count = in.read(buffer);
++                }
++            }
++        }
++    }
++
++    @Override
++    public void deleteBackup(@NonNull final String dir, @NonNull final String name)
++            throws IOException {
++        final String trimmed = dir.trim();
++        final String key = trimmed.isEmpty() ? name : trimmed + "/" + name;
++        final Request request = signedRequest("DELETE", objectUrl(key), EMPTY_SHA256)
++                .delete()
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (!response.isSuccessful() && response.code() != 404) {
++                throw new IOException("Delete '" + name + "' failed: "
++                        + describeError(response));
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
+new file mode 100644
+index 000000000..abd55ba90
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/WebDavBackend.java
+@@ -0,0 +1,287 @@
++package org.schabi.newpipe.bisub.backup;
++
++import androidx.annotation.NonNull;
++
++import org.xmlpull.v1.XmlPullParser;
++
++import android.util.Xml;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.text.ParseException;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++
++import java.util.List;
++import java.util.Locale;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.HttpUrl;
++import okhttp3.MediaType;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++
++/**
++ * WebDAV implementation of the backup backend, speaking plain HTTP verbs
++ * (PROPFIND / MKCOL / PUT / GET / DELETE) with Basic authentication.
++ * Works with Nextcloud, ownCloud, Synology's WebDAV server, NutStore,
++ * AList, InfiniCLOUD and every other RFC 4918 server.
++ */
++final class WebDavBackend implements RemoteBackend {
++
++    private static final MediaType XML = MediaType.parse("application/xml; charset=utf-8");
++    private static final MediaType ZIP = MediaType.parse("application/zip");
++    private static final String PROPFIND_BODY = "<d:propfind xmlns:d=\"DAV:\">"
++            + "<d:prop><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>";
++
++    private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
++            .connectTimeout(20, TimeUnit.SECONDS)
++            .readTimeout(60, TimeUnit.SECONDS)
++            .writeTimeout(5, TimeUnit.MINUTES)
++            .build();
++
++    private final HttpUrl baseUrl;
++    private final String authorization;
++
++    WebDavBackend(@NonNull final String url, @NonNull final String username,
++                  @NonNull final String password) throws IOException {
++        final HttpUrl parsed = HttpUrl.parse(url);
++        if (parsed == null) {
++            throw new IOException("Invalid WebDAV address: " + url);
++        }
++        this.baseUrl = parsed;
++        this.authorization = okhttp3.Credentials.basic(username, password);
++    }
++
++    private HttpUrl urlOf(@NonNull final String dir, @NonNull final String name) {
++        final HttpUrl.Builder builder = baseUrl.newBuilder();
++        final String trimmed = dir.trim();
++        if (!trimmed.isEmpty()) {
++            for (final String segment : trimmed.split("/")) {
++                if (!segment.isEmpty()) {
++                    builder.addPathSegment(segment);
++                }
++            }
++        }
++        if (!name.isEmpty()) {
++            builder.addPathSegment(name);
++        }
++        return builder.build();
++    }
++
++    @Override
++    public void checkConnection() throws IOException {
++        final Request request = new Request.Builder()
++                .url(baseUrl)
++                .header("Authorization", authorization)
++                .header("Depth", "0")
++                .method("PROPFIND", RequestBody.create(PROPFIND_BODY, XML))
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 401) {
++                throw new IOException("Authentication failed (401): check username and password");
++            }
++            if (!response.isSuccessful() && response.code() != 207) {
++                throw new IOException("WebDAV server error: HTTP " + response.code());
++            }
++        }
++    }
++
++    @Override
++    public void ensureRemoteDir(@NonNull final String dir) throws IOException {
++        final String trimmed = dir.trim();
++        if (trimmed.isEmpty()) {
++            return;
++        }
++        // Create the directory one segment at a time: 201 means created,
++        // 405 means it already exists; both are fine.
++        final String[] segments = trimmed.split("/");
++        final HttpUrl.Builder builder = baseUrl.newBuilder();
++        for (final String segment : segments) {
++            if (segment.isEmpty()) {
++                continue;
++            }
++            builder.addPathSegment(segment);
++            final Request request = new Request.Builder()
++                    .url(builder.build())
++                    .header("Authorization", authorization)
++                    .method("MKCOL", null)
++                    .build();
++            try (Response response = CLIENT.newCall(request).execute()) {
++                if (response.code() != 201 && response.code() != 405) {
++                    throw new IOException("Could not create directory '" + trimmed
++                            + "': HTTP " + response.code());
++                }
++            }
++        }
++    }
++
++    @Override
++    @NonNull
++    public List<RemoteFile> listBackups(@NonNull final String dir) throws IOException {
++        final Request request = new Request.Builder()
++                .url(urlOf(dir, ""))
++                .header("Authorization", authorization)
++                .header("Depth", "1")
++                .method("PROPFIND", RequestBody.create(PROPFIND_BODY, XML))
++                .build();
++        final List<RemoteFile> files = new ArrayList<>();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 401) {
++                throw new IOException("Authentication failed (401): check username and password");
++            }
++            if (!response.isSuccessful() && response.code() != 207) {
++                throw new IOException("Could not list '" + dir + "': HTTP " + response.code());
++            }
++            final InputStream body = response.body() != null ? response.body().byteStream() : null;
++            if (body != null) {
++                parseMultistatus(body, files);
++            }
++        }
++        files.sort((a, b) -> b.name.compareTo(a.name));
++        return files;
++    }
++
++    /**
++     * Reads a PROPFIND {@code multistatus} body and appends every file
++     * entry ending in {@code .zip} to the output list. Only the local tag
++     * names are matched, so any namespace prefix works.
++     */
++    private void parseMultistatus(@NonNull final InputStream body,
++                                  @NonNull final List<RemoteFile> output) throws IOException {
++        try {
++            final XmlPullParser parser = Xml.newPullParser();
++            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false);
++            parser.setInput(body, StandardCharsets.UTF_8.name());
++
++            String href = null;
++            long size = -1L;
++            long modified = 0L;
++            int event = parser.getEventType();
++            while (event != XmlPullParser.END_DOCUMENT) {
++                if (event == XmlPullParser.START_TAG) {
++                    final String tag = parser.getName();
++                    if ("response".equals(tag)) {
++                        href = null;
++                        size = -1L;
++                        modified = 0L;
++                    } else if ("href".equals(tag)) {
++                        href = parser.nextText();
++                    } else if ("getcontentlength".equals(tag)) {
++                        try {
++                            size = Long.parseLong(parser.nextText().trim());
++                        } catch (final NumberFormatException ignored) {
++                            // keep -1: not a file (collection)
++                        }
++                    } else if ("getlastmodified".equals(tag)) {
++                        modified = parseHttpDate(parser.nextText().trim());
++                    }
++                } else if (event == XmlPullParser.END_TAG
++                        && "response".equals(parser.getName())) {
++                    if (href != null && size >= 0) {
++                        final String name = fileNameOf(href);
++                        if (name.endsWith(".zip")) {
++                            output.add(new RemoteFile(name, size, modified));
++                        }
++                    }
++                    href = null;
++                }
++                event = parser.next();
++            }
++        } catch (final Exception e) {
++            throw new IOException("Malformed WebDAV listing: " + e.getMessage());
++        }
++    }
++
++    private static String fileNameOf(@NonNull final String href) {
++        final String decoded;
++        try {
++            decoded = java.net.URLDecoder.decode(href, StandardCharsets.UTF_8.name());
++        } catch (final java.io.UnsupportedEncodingException e) {
++            // UTF-8 is always supported
++            throw new IllegalStateException(e);
++        }
++        final String trimmed = decoded.endsWith("/") && decoded.length() > 1
++                ? decoded.substring(0, decoded.length() - 1) : decoded;
++        final int slash = trimmed.lastIndexOf('/');
++        return slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
++    }
++
++    private static long parseHttpDate(@NonNull final String value) {
++        try {
++            return new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US)
++                    .parse(value).getTime();
++        } catch (final ParseException e) {
++            return 0L;
++        }
++    }
++
++    @Override
++    public void uploadBackup(@NonNull final String dir, @NonNull final String name,
++                             @NonNull final File file) throws IOException {
++        final Request request = new Request.Builder()
++                .url(urlOf(dir, name))
++                .header("Authorization", authorization)
++                .put(RequestBody.create(file, ZIP))
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 401) {
++                throw new IOException("Authentication failed (401): check username and password");
++            }
++            if (!response.isSuccessful()) {
++                throw new IOException("Upload '" + name + "' failed: HTTP " + response.code());
++            }
++        }
++    }
++
++    @Override
++    public void downloadBackup(@NonNull final String dir, @NonNull final String name,
++                               @NonNull final File target) throws IOException {
++        final Request request = new Request.Builder()
++                .url(urlOf(dir, name))
++                .header("Authorization", authorization)
++                .get()
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (response.code() == 401) {
++                throw new IOException("Authentication failed (401): check username and password");
++            }
++            if (response.code() == 404) {
++                throw new IOException("'" + name + "' was not found on the server");
++            }
++            if (!response.isSuccessful() || response.body() == null) {
++                throw new IOException("Download '" + name + "' failed: HTTP " + response.code());
++            }
++            try (InputStream in = response.body().byteStream();
++                 OutputStream out = new FileOutputStream(target)) {
++                final byte[] buffer = new byte[8192];
++                int count = in.read(buffer);
++                while (count >= 0) {
++                    out.write(buffer, 0, count);
++                    count = in.read(buffer);
++                }
++            }
++        }
++    }
++
++    @Override
++    public void deleteBackup(@NonNull final String dir, @NonNull final String name)
++            throws IOException {
++        final Request request = new Request.Builder()
++                .url(urlOf(dir, name))
++                .header("Authorization", authorization)
++                .delete()
++                .build();
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (!response.isSuccessful() && response.code() != 404) {
++                throw new IOException("Delete '" + name + "' failed: HTTP " + response.code());
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+new file mode 100644
+index 000000000..c2c065651
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+@@ -0,0 +1,331 @@
++package org.schabi.newpipe.settings;
++
++import android.app.AlertDialog;
++import android.content.Context;
++import android.os.Bundle;
++import android.text.format.DateUtils;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.preference.ListPreference;
++import androidx.preference.Preference;
++import androidx.preference.SwitchPreferenceCompat;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.backup.CloudBackupConfig;
++import org.schabi.newpipe.bisub.backup.CloudBackupManager;
++import org.schabi.newpipe.bisub.backup.RemoteFile;
++import org.schabi.newpipe.util.NavigationHelper;
++
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
++import io.reactivex.rxjava3.core.Completable;
++import io.reactivex.rxjava3.disposables.CompositeDisposable;
++import io.reactivex.rxjava3.schedulers.Schedulers;
++
++/**
++ * Second-level settings page for backups to the user's own cloud storage
++ * (WebDAV or S3), with manual backup / restore actions and an optional
++ * automatic backup schedule.
++ */
++public final class CloudBackupFragment extends BasePreferenceFragment {
++
++    private final CompositeDisposable disposables = new CompositeDisposable();
++    private AlertDialog busyDialog;
++    /** The last remote listing, kept for the restore chooser dialog. */
++    private List<RemoteFile> remoteFiles = new ArrayList<>();
++
++    @Override
++    public void onCreatePreferences(@Nullable final Bundle savedInstanceState,
++                                    @Nullable final String rootKey) {
++        addPreferencesFromResourceRegistry();
++
++        bindProviderPreference();
++        bindServerFields();
++        bindActions();
++        bindAutomaticBackups();
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        refreshSummaries();
++        applyProviderVisibility();
++        // Keep the periodic work aligned even if the process died with
++        // changed-but-unsaved settings or the app was restored from a backup.
++        CloudBackupManager.scheduleAutomaticBackups(requireContext());
++    }
++
++    @Override
++    public void onDestroy() {
++        dismissBusyDialog();
++        disposables.clear();
++        super.onDestroy();
++    }
++
++    private CloudBackupConfig config() {
++        return CloudBackupConfig.load(requireContext());
++    }
++
++    private void bindProviderPreference() {
++        final ListPreference provider =
++                (ListPreference) requirePreference(R.string.bisub_cloud_backup_provider_key);
++        provider.setOnPreferenceChangeListener((p, value) -> {
++
++            applyProviderVisibility();
++            CloudBackupManager.scheduleAutomaticBackups(requireContext());
++            refreshSummaries();
++            return true;
++        });
++    }
++
++    private void bindServerFields() {
++        // Editing any server field may complete or invalidate the
++        // configuration, so the automatic schedule must be re-evaluated.
++        final int[] editKeys = {
++                R.string.bisub_cloud_backup_webdav_url_key,
++                R.string.bisub_cloud_backup_webdav_username_key,
++                R.string.bisub_cloud_backup_webdav_password_key,
++                R.string.bisub_cloud_backup_s3_endpoint_key,
++                R.string.bisub_cloud_backup_s3_region_key,
++                R.string.bisub_cloud_backup_s3_bucket_key,
++                R.string.bisub_cloud_backup_s3_access_key_key,
++                R.string.bisub_cloud_backup_s3_secret_key_key,
++                R.string.bisub_cloud_backup_dir_key,};
++        for (final int key : editKeys) {
++            requirePreference(key).setOnPreferenceChangeListener((p, value) -> {
++                CloudBackupManager.scheduleAutomaticBackups(requireContext());
++                return true;
++            });
++        }
++    }
++
++    private void bindActions() {
++        requirePreference(R.string.bisub_cloud_backup_test_key)
++                .setOnPreferenceClickListener(p -> {
++                    runTestConnection();
++                    return true;
++                });
++        requirePreference(R.string.bisub_cloud_backup_now_key)
++                .setOnPreferenceClickListener(p -> {
++                    runBackupNow();
++                    return true;
++                });
++        requirePreference(R.string.bisub_cloud_backup_restore_key)
++                .setOnPreferenceClickListener(p -> {
++                    pickRemoteBackup();
++                    return true;
++                });
++    }
++
++    private void bindAutomaticBackups() {
++        final SwitchPreferenceCompat enabled =
++                (SwitchPreferenceCompat) requirePreference(
++                        R.string.bisub_cloud_backup_auto_enabled_key);
++        enabled.setOnPreferenceChangeListener((p, value) -> {
++            CloudBackupManager.scheduleAutomaticBackups(requireContext());
++            return true;
++        });
++        final ListPreference interval =
++                (ListPreference) requirePreference(
++                        R.string.bisub_cloud_backup_auto_interval_key);
++        interval.setOnPreferenceChangeListener((p, value) -> {
++            CloudBackupManager.scheduleAutomaticBackups(requireContext());
++            return true;
++        });
++    }
++
++    private void applyProviderVisibility() {
++        final boolean webdav =
++                CloudBackupConfig.PROVIDER_WEBDAV.equals(config().provider);
++        final int[] webdavKeys = {
++                R.string.bisub_cloud_backup_webdav_url_key,
++                R.string.bisub_cloud_backup_webdav_username_key,
++                R.string.bisub_cloud_backup_webdav_password_key,};
++        final int[] s3Keys = {
++                R.string.bisub_cloud_backup_s3_endpoint_key,
++                R.string.bisub_cloud_backup_s3_region_key,
++                R.string.bisub_cloud_backup_s3_bucket_key,
++                R.string.bisub_cloud_backup_s3_access_key_key,
++                R.string.bisub_cloud_backup_s3_secret_key_key,};
++        for (final int key : webdavKeys) {
++            requirePreference(key).setVisible(webdav);
++        }
++        for (final int key : s3Keys) {
++            requirePreference(key).setVisible(!webdav);
++        }
++    }
++
++    private void refreshSummaries() {
++        final long last = CloudBackupConfig.lastBackupTime(requireContext());
++        final Preference now = requirePreference(R.string.bisub_cloud_backup_now_key);
++        if (last == 0L) {
++            now.setSummary(R.string.bisub_cloud_backup_never);
++        } else {
++            now.setSummary(getString(R.string.bisub_cloud_backup_last_backup,
++                    DateUtils.formatDateTime(requireContext(), last,
++                            DateUtils.FORMAT_SHOW_DATE | DateUtils.FORMAT_SHOW_TIME)));
++        }
++    }
++
++    private void runTestConnection() {
++        final CloudBackupConfig config = config();
++        if (!config.isConfigured()) {
++            Toast.makeText(requireContext(),
++                    R.string.bisub_cloud_backup_not_configured, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        disposables.add(Completable.fromAction(() -> config.toBackend().checkConnection())
++                .subscribeOn(Schedulers.io())
++                .observeOn(AndroidSchedulers.mainThread())
++                .subscribe(
++                        () -> Toast.makeText(requireContext(),
++                                R.string.bisub_cloud_backup_test_ok,
++                                Toast.LENGTH_SHORT).show(),
++                        e -> Toast.makeText(requireContext(),
++                                getString(R.string.bisub_cloud_backup_test_failed,
++                                        e.getMessage()), Toast.LENGTH_LONG).show()));
++    }
++
++    private void runBackupNow() {
++        final CloudBackupConfig config = config();
++        if (!config.isConfigured()) {
++            Toast.makeText(requireContext(),
++                    R.string.bisub_cloud_backup_not_configured, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        showBusyDialog(getString(R.string.bisub_cloud_backup_running));
++        final Context context = requireContext();
++        disposables.add(Completable.fromAction(() ->
++                        CloudBackupManager.getInstance(context).backupNow())
++                .subscribeOn(Schedulers.io())
++                .observeOn(AndroidSchedulers.mainThread())
++                .subscribe(
++                        () -> {
++                            dismissBusyDialog();
++                            refreshSummaries();
++                            Toast.makeText(context, R.string.bisub_cloud_backup_done,
++                                    Toast.LENGTH_SHORT).show();
++                        },
++                        e -> {
++                            dismissBusyDialog();
++                            Toast.makeText(context,
++                                    getString(R.string.bisub_cloud_backup_failed,
++                                            e.getMessage()), Toast.LENGTH_LONG).show();
++                        }));
++    }
++
++    private void pickRemoteBackup() {
++        final CloudBackupConfig config = config();
++        if (!config.isConfigured()) {
++            Toast.makeText(requireContext(),
++                    R.string.bisub_cloud_backup_not_configured, Toast.LENGTH_SHORT).show();
++            return;
++        }
++        final Context context = requireContext();
++        showBusyDialog(getString(R.string.bisub_cloud_backup_listing));
++        final CloudBackupManager manager =
++                CloudBackupManager.getInstance(context.getApplicationContext());
++        disposables.add(Completable.fromAction(() -> remoteFiles = manager.listBackups())
++                .subscribeOn(Schedulers.io())
++                .observeOn(AndroidSchedulers.mainThread())
++                .subscribe(
++                        () -> {
++                            dismissBusyDialog();
++                            if (remoteFiles.isEmpty()) {
++                                Toast.makeText(context,
++                                        R.string.bisub_cloud_backup_restore_empty,
++                                        Toast.LENGTH_SHORT).show();
++                                return;
++                            }
++                            showRestoreChooser();
++                        },
++                        e -> {
++                            dismissBusyDialog();
++                            Toast.makeText(context,
++                                    getString(R.string.bisub_cloud_backup_failed,
++                                            e.getMessage()), Toast.LENGTH_LONG).show();
++                        }));
++    }
++
++    private void showRestoreChooser() {
++        final List<RemoteFile> files = remoteFiles;
++        final SimpleDateFormat format =
++                new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault());
++        final CharSequence[] labels = new CharSequence[files.size()];
++        for (int i = 0; i < files.size(); i++) {
++            final RemoteFile file = files.get(i);
++            labels[i] = file.name + "\n"
++                    + String.format(Locale.getDefault(), "%.1f MB", file.size / 1048576.0)
++                    + "  ·  " + format.format(new Date(file.lastModified));
++        }
++        final Context context = requireContext();
++        final int[] selected = {0};
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_cloud_backup_restore_title)
++                .setSingleChoiceItems(labels, 0, (dialog, which) -> selected[0] = which)
++                .setNegativeButton(R.string.cancel, null)
++                .setPositiveButton(R.string.bisub_cloud_backup_restore_action,
++                        (dialog, which) -> confirmRestore(files.get(selected[0])))
++                .show();
++    }
++
++    private void confirmRestore(@NonNull final RemoteFile file) {
++        final Context context = requireContext();
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_cloud_backup_restore_title)
++                .setMessage(getString(R.string.bisub_cloud_backup_restore_confirm,
++                        file.name))
++                .setNegativeButton(R.string.cancel, null)
++                .setPositiveButton(R.string.ok, (dialog, which) ->
++                        restoreFromCloud(file.name))
++                .show();
++    }
++
++    private void restoreFromCloud(@NonNull final String name) {
++        final Context context = requireContext();
++        showBusyDialog(getString(R.string.bisub_cloud_backup_restoring));
++        disposables.add(Completable.fromAction(() ->
++                        CloudBackupManager.getInstance(context).restoreBackup(name))
++                .subscribeOn(Schedulers.io())
++                .observeOn(AndroidSchedulers.mainThread())
++                .subscribe(
++                        () -> {
++                            dismissBusyDialog();
++                            Toast.makeText(context,
++                                    R.string.bisub_cloud_backup_restore_done,
++                                    Toast.LENGTH_SHORT).show();
++                            // The database on disk changed: restart like the
++                            // manual import does, so the running process
++                            // reopens everything cleanly.
++                            NavigationHelper.restartApp(requireActivity());
++                        },
++                        e -> {
++                            dismissBusyDialog();
++                            Toast.makeText(context,
++                                    getString(R.string.bisub_cloud_backup_failed,
++                                            e.getMessage()), Toast.LENGTH_LONG).show();
++                        }));
++    }
++
++    private void showBusyDialog(@NonNull final CharSequence message) {
++        dismissBusyDialog();
++        busyDialog = new AlertDialog.Builder(requireContext())
++                .setMessage(message)
++                .setCancelable(false)
++                .show();
++    }
++
++    private void dismissBusyDialog() {
++        if (busyDialog != null && busyDialog.isShowing()) {
++            busyDialog.dismiss();
++        }
++        busyDialog = null;
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt b/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
+index ccd095d68..4234de465 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
++++ b/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
+@@ -14,6 +14,7 @@ import java.io.FileOutputStream
+ import java.io.IOException
+ import java.io.ObjectInputStream
+ import java.io.ObjectOutputStream
++import java.io.OutputStream
+ import java.util.zip.ZipEntry
+ import java.util.zip.ZipInputStream
+ import java.util.zip.ZipOutputStream
+@@ -35,14 +36,26 @@ class ContentSettingsManager(private val fileLocator: NewPipeFileLocator) {
+     @Throws(Exception::class)
+     fun exportDatabase(preferences: SharedPreferences, file: StoredFileHelper) {
+         file.create()
+-        ZipOutputStream(BufferedOutputStream(SharpOutputStream(file.stream)))
++        SharpOutputStream(file.stream).use { out ->
++            exportDatabase(preferences, out)
++        }
++    }
++
++    /**
++     * Exports the database, the settings and the bisub subtitle cache as a
++     * complete backup zip into the given stream. The caller owns the
++     * stream; it is closed with the zip.
++     */
++    @Throws(Exception::class)
++    fun exportDatabase(preferences: SharedPreferences, output: OutputStream) {
++        ZipOutputStream(BufferedOutputStream(output))
+             .use { outZip ->
+                 ZipHelper.addFileToZip(outZip, fileLocator.db.path, "newpipe.db")
+ 
+                 try {
+-                    ObjectOutputStream(FileOutputStream(fileLocator.settings)).use { output ->
+-                        output.writeObject(preferences.all)
+-                        output.flush()
++                    ObjectOutputStream(FileOutputStream(fileLocator.settings)).use { out ->
++                        out.writeObject(preferences.all)
++                        out.flush()
+                     }
+                 } catch (e: IOException) {
+                     Log.e(TAG, "Unable to exportDatabase", e)
+@@ -98,6 +111,72 @@ class ContentSettingsManager(private val fileLocator: NewPipeFileLocator) {
+         return ZipHelper.extractFileFromZip(file, fileLocator.settings.path, "newpipe.settings")
+     }
+ 
++    /**
++     * Extracts the database of a local backup zip, removing stale journal
++     * files like the SAF variant does.
++     *
++     * @param zip the backup zip on the local file system
++     * @return whether the archive contained a database
++     */
++    fun extractDbFromFile(zip: File): Boolean {
++        val success = extractZipEntry(zip, "newpipe.db", fileLocator.db.path)
++        if (success) {
++            fileLocator.dbJournal.delete()
++            fileLocator.dbWal.delete()
++            fileLocator.dbShm.delete()
++        }
++        return success
++    }
++
++    /**
++     * Extracts the bisub subtitle cache of a local backup zip.
++     *
++     * @param zip the backup zip on the local file system
++     * @return whether the archive contained any cache entry
++     */
++    fun extractBisubCacheFromFile(zip: File): Boolean {
++        return extractBisubCache(zip)
++    }
++
++    /**
++     * Extracts the settings blob of a local backup zip so that
++     * [loadSharedPreferences] can import it afterwards.
++     *
++     * @param zip the backup zip on the local file system
++     * @return whether the archive contained settings
++     */
++    fun extractSettingsFromFile(zip: File): Boolean {
++        return extractZipEntry(zip, "newpipe.settings", fileLocator.settings.path)
++    }
++
++    /**
++     * Copies one entry of a zip archive to a local path, overwriting any
++     * previous file.
++     */
++    private fun extractZipEntry(zip: File, name: String, target: String): Boolean {
++        ZipInputStream(BufferedInputStream(FileInputStream(zip))).use { inZip ->
++            val data = ByteArray(BUFFER_SIZE)
++            while (true) {
++                val entry: ZipEntry = inZip.nextEntry ?: break
++                if (entry.name == name) {
++                    val oldFile = File(target)
++                    if (oldFile.exists()) {
++                        oldFile.delete()
++                    }
++                    FileOutputStream(target).use { outFile ->
++                        var count = inZip.read(data)
++                        while (count != -1) {
++                            outFile.write(data, 0, count)
++                            count = inZip.read(data)
++                        }
++                    }
++                    return true
++                }
++            }
++        }
++        return false
++    }
++
+     /**
+      * Extracts the bisub subtitle cache files ("bisub/<file name>" entries)
+      * of a backup zip into the bisub cache directory. Only top-level entries
+@@ -107,30 +186,46 @@ class ContentSettingsManager(private val fileLocator: NewPipeFileLocator) {
+      * backups made before this feature existed import without a hitch.
+      */
+     fun extractBisubCache(file: StoredFileHelper): Boolean {
++        ZipInputStream(BufferedInputStream(SharpInputStream(file.stream))).use { inZip ->
++            return extractBisubCacheEntries(inZip)
++        }
++    }
++
++    /** File-based variant of [extractBisubCache] for local backup zips. */
++    private fun extractBisubCache(zip: File): Boolean {
++        ZipInputStream(BufferedInputStream(FileInputStream(zip))).use { inZip ->
++            return extractBisubCacheEntries(inZip)
++        }
++    }
++
++    /**
++     * Shared core of the bisub cache extraction: walks the zip entries and
++     * writes every accepted "bisub/<file name>" entry into the cache
++     * directory.
++     */
++    private fun extractBisubCacheEntries(inZip: ZipInputStream): Boolean {
+         val dir = fileLocator.bisubDir
+         if (!dir.exists() && !dir.mkdir()) {
+             return false
+         }
+         var found = false
+-        ZipInputStream(BufferedInputStream(SharpInputStream(file.stream))).use { inZip ->
+-            val data = ByteArray(BUFFER_SIZE)
+-            while (true) {
+-                val entry: ZipEntry = inZip.nextEntry ?: break
+-                if (!entry.name.startsWith(BISUB_CACHE_PREFIX)) {
+-                    continue
+-                }
+-                val relative = entry.name.removePrefix(BISUB_CACHE_PREFIX)
+-                if (relative.isEmpty() || relative.contains('/') || relative.contains('\\')) {
+-                    continue
+-                }
+-                found = true
+-                val output = File(dir, relative)
+-                FileOutputStream(output).use { outFile ->
+-                    var count = inZip.read(data)
+-                    while (count != -1) {
+-                        outFile.write(data, 0, count)
+-                        count = inZip.read(data)
+-                    }
++        val data = ByteArray(BUFFER_SIZE)
++        while (true) {
++            val entry: ZipEntry = inZip.nextEntry ?: break
++            if (!entry.name.startsWith(BISUB_CACHE_PREFIX)) {
++                continue
++            }
++            val relative = entry.name.removePrefix(BISUB_CACHE_PREFIX)
++            if (relative.isEmpty() || relative.contains('/') || relative.contains('\\')) {
++                continue
++            }
++            found = true
++            val output = File(dir, relative)
++            FileOutputStream(output).use { outFile ->
++                var count = inZip.read(data)
++                while (count != -1) {
++                    outFile.write(data, 0, count)
++                    count = inZip.read(data)
+                 }
+             }
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+index 930daa1a9..924febb68 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+@@ -44,6 +44,7 @@ public final class SettingsResourceRegistry {
+         add(GestureSettingsFragment.class, R.xml.gesture_settings);
+         add(AdvancedSettingsFragment.class, R.xml.advanced_settings);
+         add(BackupSettingsFragment.class, R.xml.backup_settings);
++        add(CloudBackupFragment.class, R.xml.cloud_backup_settings);
+         add(BulletCommentsSettingsFragment.class, R.xml.bullet_comments_settings);
+         add(ExoPlayerSettingsFragment.class, R.xml.exoplayer_settings);
+         add(SponsorBlockSettingsFragment.class, R.xml.sponsor_block_settings);
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 5bf66f8e4..acd7a4808 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1323,4 +1323,54 @@
+     <string name="bisub_debug_log_clear">清空</string>
+     <string name="bisub_debug_log_copied">调试日志已复制到剪贴板</string>
+     <string name="bisub_debug_log_cleared">调试日志已清空</string>
++
++    <string name="bisub_cloud_backup_title">云备份</string>
++    <string name="bisub_cloud_backup_summary">备份到你自己的 WebDAV 或 S3 存储</string>
++    <string name="bisub_cloud_backup_category_server">存储服务器</string>
++    <string name="bisub_cloud_backup_category_actions">操作</string>
++    <string name="bisub_cloud_backup_category_automatic">自动备份</string>
++    <string name="bisub_cloud_backup_provider_title">存储类型</string>
++    <string name="bisub_cloud_backup_provider_webdav">WebDAV</string>
++    <string name="bisub_cloud_backup_provider_s3">S3</string>
++    <string name="bisub_cloud_backup_webdav_url_title">服务器地址</string>
++    <string name="bisub_cloud_backup_webdav_url_summary">https://你的服务器/dav —— Nextcloud、群晖、坚果云、AList 等（需 HTTPS）</string>
++    <string name="bisub_cloud_backup_webdav_username_title">用户名</string>
++    <string name="bisub_cloud_backup_webdav_password_title">密码</string>
++    <string name="bisub_cloud_backup_s3_endpoint_title">端点</string>
++    <string name="bisub_cloud_backup_s3_endpoint_summary">https://主机:端口 —— MinIO、Cloudflare R2、Backblaze B2、AWS 等</string>
++    <string name="bisub_cloud_backup_s3_region_title">区域</string>
++    <string name="bisub_cloud_backup_s3_bucket_title">存储桶</string>
++    <string name="bisub_cloud_backup_s3_access_key_title">Access Key</string>
++    <string name="bisub_cloud_backup_s3_secret_key_title">Secret Key</string>
++    <string name="bisub_cloud_backup_dir_title">远程目录</string>
++    <string name="bisub_cloud_backup_dir_summary">备份文件存放在该目录下</string>
++    <string name="bisub_cloud_backup_test_title">测试连接</string>
++    <string name="bisub_cloud_backup_test_summary">检查服务器与凭据</string>
++    <string name="bisub_cloud_backup_now_title">立即备份</string>
++    <string name="bisub_cloud_backup_never">尚未备份</string>
++    <string name="bisub_cloud_backup_last_backup">上次备份：%s</string>
++    <string name="bisub_cloud_backup_restore_title">从云端恢复</string>
++    <string name="bisub_cloud_backup_restore_summary">下载备份并替换本机全部数据</string>
++    <string name="bisub_cloud_backup_restore_action">恢复</string>
++    <string name="bisub_cloud_backup_restore_confirm">“%s” 将替换本机全部数据（数据库、设置、翻译缓存），应用随后会重启。继续？</string>
++    <string name="bisub_cloud_backup_restore_empty">云端还没有备份</string>
++    <string name="bisub_cloud_backup_restore_done">恢复完成，即将重启…</string>
++    <string name="bisub_cloud_backup_auto_enabled_title">自动备份</string>
++    <string name="bisub_cloud_backup_auto_enabled_summary">按计划自动上传新备份</string>
++    <string name="bisub_cloud_backup_auto_interval_title">备份频率</string>
++    <string name="bisub_cloud_backup_auto_interval_daily">每天</string>
++    <string name="bisub_cloud_backup_auto_interval_weekly">每周</string>
++    <string name="bisub_cloud_backup_retention_title">保留备份数</string>
++    <string name="bisub_cloud_backup_retention_3">保留 3 份</string>
++    <string name="bisub_cloud_backup_retention_5">保留 5 份</string>
++    <string name="bisub_cloud_backup_retention_10">保留 10 份</string>
++    <string name="bisub_cloud_backup_retention_20">保留 20 份</string>
++    <string name="bisub_cloud_backup_test_ok">连接成功</string>
++    <string name="bisub_cloud_backup_test_failed">连接失败：%s</string>
++    <string name="bisub_cloud_backup_not_configured">请先填写服务器设置</string>
++    <string name="bisub_cloud_backup_running">正在备份…</string>
++    <string name="bisub_cloud_backup_listing">正在读取云端备份…</string>
++    <string name="bisub_cloud_backup_restoring">正在从云端恢复…</string>
++    <string name="bisub_cloud_backup_done">云备份完成</string>
++    <string name="bisub_cloud_backup_failed">云备份失败：%s</string>
+ </resources>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index 18fcaba50..c590fefbd 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1157,4 +1157,54 @@
+ <string name="audio_quality_high">高 (最高位元率)</string>
+ <string name="audio_quality_medium">中 (~128 kbps)</string>
+ <string name="audio_quality_low">低 (最低位元率，節省數據用量)</string>
++
++    <string name="bisub_cloud_backup_title">雲端備份</string>
++    <string name="bisub_cloud_backup_summary">備份到你自己的 WebDAV 或 S3 儲存</string>
++    <string name="bisub_cloud_backup_category_server">儲存伺服器</string>
++    <string name="bisub_cloud_backup_category_actions">操作</string>
++    <string name="bisub_cloud_backup_category_automatic">自動備份</string>
++    <string name="bisub_cloud_backup_provider_title">儲存類型</string>
++    <string name="bisub_cloud_backup_provider_webdav">WebDAV</string>
++    <string name="bisub_cloud_backup_provider_s3">S3</string>
++    <string name="bisub_cloud_backup_webdav_url_title">伺服器位址</string>
++    <string name="bisub_cloud_backup_webdav_url_summary">https://你的伺服器/dav —— Nextcloud、群暉、堅果雲、AList 等（需 HTTPS）</string>
++    <string name="bisub_cloud_backup_webdav_username_title">使用者名稱</string>
++    <string name="bisub_cloud_backup_webdav_password_title">密碼</string>
++    <string name="bisub_cloud_backup_s3_endpoint_title">端點</string>
++    <string name="bisub_cloud_backup_s3_endpoint_summary">https://主機:埠 —— MinIO、Cloudflare R2、Backblaze B2、AWS 等</string>
++    <string name="bisub_cloud_backup_s3_region_title">區域</string>
++    <string name="bisub_cloud_backup_s3_bucket_title">儲存貯體</string>
++    <string name="bisub_cloud_backup_s3_access_key_title">Access Key</string>
++    <string name="bisub_cloud_backup_s3_secret_key_title">Secret Key</string>
++    <string name="bisub_cloud_backup_dir_title">遠端目錄</string>
++    <string name="bisub_cloud_backup_dir_summary">備份檔存放在該目錄下</string>
++    <string name="bisub_cloud_backup_test_title">測試連線</string>
++    <string name="bisub_cloud_backup_test_summary">檢查伺服器與憑證</string>
++    <string name="bisub_cloud_backup_now_title">立即備份</string>
++    <string name="bisub_cloud_backup_never">尚未備份</string>
++    <string name="bisub_cloud_backup_last_backup">上次備份：%s</string>
++    <string name="bisub_cloud_backup_restore_title">從雲端還原</string>
++    <string name="bisub_cloud_backup_restore_summary">下載備份並取代本機全部資料</string>
++    <string name="bisub_cloud_backup_restore_action">還原</string>
++    <string name="bisub_cloud_backup_restore_confirm">「%s」 將取代本機全部資料（資料庫、設定、翻譯快取），應用程式隨後會重新啟動。繼續？</string>
++    <string name="bisub_cloud_backup_restore_empty">雲端還沒有備份</string>
++    <string name="bisub_cloud_backup_restore_done">還原完成，即將重新啟動…</string>
++    <string name="bisub_cloud_backup_auto_enabled_title">自動備份</string>
++    <string name="bisub_cloud_backup_auto_enabled_summary">按排程自動上傳新備份</string>
++    <string name="bisub_cloud_backup_auto_interval_title">備份頻率</string>
++    <string name="bisub_cloud_backup_auto_interval_daily">每天</string>
++    <string name="bisub_cloud_backup_auto_interval_weekly">每週</string>
++    <string name="bisub_cloud_backup_retention_title">保留備份數</string>
++    <string name="bisub_cloud_backup_retention_3">保留 3 份</string>
++    <string name="bisub_cloud_backup_retention_5">保留 5 份</string>
++    <string name="bisub_cloud_backup_retention_10">保留 10 份</string>
++    <string name="bisub_cloud_backup_retention_20">保留 20 份</string>
++    <string name="bisub_cloud_backup_test_ok">連線成功</string>
++    <string name="bisub_cloud_backup_test_failed">連線失敗：%s</string>
++    <string name="bisub_cloud_backup_not_configured">請先填寫伺服器設定</string>
++    <string name="bisub_cloud_backup_running">正在備份…</string>
++    <string name="bisub_cloud_backup_listing">正在讀取雲端備份…</string>
++    <string name="bisub_cloud_backup_restoring">正在從雲端還原…</string>
++    <string name="bisub_cloud_backup_done">雲端備份完成</string>
++    <string name="bisub_cloud_backup_failed">雲端備份失敗：%s</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 2d63b3a21..dafb568e3 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1901,6 +1901,54 @@
+     <string name="bisub_style_original_alpha_key">bisub_style_original_alpha</string>
+     <string name="bisub_style_translation_alpha_key">bisub_style_translation_alpha</string>
+ 
++    <string name="bisub_cloud_backup_key">bisub_cloud_backup</string>
++    <string name="bisub_cloud_backup_provider_key">bisub_cloud_backup_provider</string>
++    <string name="bisub_cloud_backup_webdav_url_key">bisub_cloud_backup_webdav_url</string>
++    <string name="bisub_cloud_backup_webdav_username_key">bisub_cloud_backup_webdav_username</string>
++    <string name="bisub_cloud_backup_webdav_password_key">bisub_cloud_backup_webdav_password</string>
++    <string name="bisub_cloud_backup_s3_endpoint_key">bisub_cloud_backup_s3_endpoint</string>
++    <string name="bisub_cloud_backup_s3_region_key">bisub_cloud_backup_s3_region</string>
++    <string name="bisub_cloud_backup_s3_bucket_key">bisub_cloud_backup_s3_bucket</string>
++    <string name="bisub_cloud_backup_s3_access_key_key">bisub_cloud_backup_s3_access_key</string>
++    <string name="bisub_cloud_backup_s3_secret_key_key">bisub_cloud_backup_s3_secret_key</string>
++    <string name="bisub_cloud_backup_dir_key">bisub_cloud_backup_dir</string>
++    <string name="bisub_cloud_backup_test_key">bisub_cloud_backup_test</string>
++    <string name="bisub_cloud_backup_now_key">bisub_cloud_backup_now</string>
++    <string name="bisub_cloud_backup_restore_key">bisub_cloud_backup_restore</string>
++    <string name="bisub_cloud_backup_auto_enabled_key">bisub_cloud_backup_auto_enabled</string>
++    <string name="bisub_cloud_backup_auto_interval_key">bisub_cloud_backup_auto_interval</string>
++    <string name="bisub_cloud_backup_retention_key">bisub_cloud_backup_retention</string>
++    <string name="bisub_cloud_backup_last_run_key">bisub_cloud_backup_last_run</string>
++
++    <string-array name="bisub_cloud_backup_providers">
++        <item>@string/bisub_cloud_backup_provider_webdav</item>
++        <item>@string/bisub_cloud_backup_provider_s3</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_provider_values">
++        <item>webdav</item>
++        <item>s3</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_intervals">
++        <item>@string/bisub_cloud_backup_auto_interval_daily</item>
++        <item>@string/bisub_cloud_backup_auto_interval_weekly</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_interval_values">
++        <item>daily</item>
++        <item>weekly</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_retentions">
++        <item>@string/bisub_cloud_backup_retention_3</item>
++        <item>@string/bisub_cloud_backup_retention_5</item>
++        <item>@string/bisub_cloud_backup_retention_10</item>
++        <item>@string/bisub_cloud_backup_retention_20</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_retention_values">
++        <item>3</item>
++        <item>5</item>
++        <item>10</item>
++        <item>20</item>
++    </string-array>
++
+     <string-array name="bisub_provider_values">
+         <item>custom</item>
+         <item>openai</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 60c5be61d..b6df9c2ff 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1326,4 +1326,54 @@
+     <string name="bisub_debug_log_clear">Clear</string>
+     <string name="bisub_debug_log_copied">Debug log copied to the clipboard</string>
+     <string name="bisub_debug_log_cleared">Debug log cleared</string>
++
++    <string name="bisub_cloud_backup_title">Cloud backup</string>
++    <string name="bisub_cloud_backup_summary">Back up to your own WebDAV or S3 storage</string>
++    <string name="bisub_cloud_backup_category_server">Storage server</string>
++    <string name="bisub_cloud_backup_category_actions">Actions</string>
++    <string name="bisub_cloud_backup_category_automatic">Automatic backups</string>
++    <string name="bisub_cloud_backup_provider_title">Storage type</string>
++    <string name="bisub_cloud_backup_provider_webdav">WebDAV</string>
++    <string name="bisub_cloud_backup_provider_s3">S3</string>
++    <string name="bisub_cloud_backup_webdav_url_title">Server address</string>
++    <string name="bisub_cloud_backup_webdav_url_summary">https://your-server/dav — Nextcloud, Synology, NutStore, AList… (HTTPS required)</string>
++    <string name="bisub_cloud_backup_webdav_username_title">Username</string>
++    <string name="bisub_cloud_backup_webdav_password_title">Password</string>
++    <string name="bisub_cloud_backup_s3_endpoint_title">Endpoint</string>
++    <string name="bisub_cloud_backup_s3_endpoint_summary">https://host:port — MinIO, Cloudflare R2, Backblaze B2, AWS…</string>
++    <string name="bisub_cloud_backup_s3_region_title">Region</string>
++    <string name="bisub_cloud_backup_s3_bucket_title">Bucket</string>
++    <string name="bisub_cloud_backup_s3_access_key_title">Access key</string>
++    <string name="bisub_cloud_backup_s3_secret_key_title">Secret key</string>
++    <string name="bisub_cloud_backup_dir_title">Remote directory</string>
++    <string name="bisub_cloud_backup_dir_summary">Backups are stored under this folder</string>
++    <string name="bisub_cloud_backup_test_title">Test connection</string>
++    <string name="bisub_cloud_backup_test_summary">Check the server and the credentials</string>
++    <string name="bisub_cloud_backup_now_title">Back up now</string>
++    <string name="bisub_cloud_backup_never">Never backed up</string>
++    <string name="bisub_cloud_backup_last_backup">Last backup: %s</string>
++    <string name="bisub_cloud_backup_restore_title">Restore from cloud</string>
++    <string name="bisub_cloud_backup_restore_summary">Download a backup and replace all local data</string>
++    <string name="bisub_cloud_backup_restore_action">Restore</string>
++    <string name="bisub_cloud_backup_restore_confirm">\'%s\' will replace all local data (database, settings, translation cache) and the app will restart afterwards. Continue?</string>
++    <string name="bisub_cloud_backup_restore_empty">No backups on the server yet</string>
++    <string name="bisub_cloud_backup_restore_done">Restore complete, restarting…</string>
++    <string name="bisub_cloud_backup_auto_enabled_title">Automatic backup</string>
++    <string name="bisub_cloud_backup_auto_enabled_summary">Upload a fresh backup on a schedule</string>
++    <string name="bisub_cloud_backup_auto_interval_title">Interval</string>
++    <string name="bisub_cloud_backup_auto_interval_daily">Daily</string>
++    <string name="bisub_cloud_backup_auto_interval_weekly">Weekly</string>
++    <string name="bisub_cloud_backup_retention_title">Backups to keep</string>
++    <string name="bisub_cloud_backup_retention_3">3 backups</string>
++    <string name="bisub_cloud_backup_retention_5">5 backups</string>
++    <string name="bisub_cloud_backup_retention_10">10 backups</string>
++    <string name="bisub_cloud_backup_retention_20">20 backups</string>
++    <string name="bisub_cloud_backup_test_ok">Connection successful</string>
++    <string name="bisub_cloud_backup_test_failed">Connection failed: %s</string>
++    <string name="bisub_cloud_backup_not_configured">Complete the server settings first</string>
++    <string name="bisub_cloud_backup_running">Backing up…</string>
++    <string name="bisub_cloud_backup_listing">Loading backups from the server…</string>
++    <string name="bisub_cloud_backup_restoring">Restoring from the cloud…</string>
++    <string name="bisub_cloud_backup_done">Cloud backup complete</string>
++    <string name="bisub_cloud_backup_failed">Cloud backup failed: %s</string>
+ </resources>
+diff --git a/app/src/main/res/xml/backup_settings.xml b/app/src/main/res/xml/backup_settings.xml
+index e76837f84..3319f9db0 100644
+--- a/app/src/main/res/xml/backup_settings.xml
++++ b/app/src/main/res/xml/backup_settings.xml
+@@ -16,6 +16,14 @@
+             app:singleLineTitle="false"
+             app:iconSpaceReserved="false" />
+ 
++    <Preference
++            android:key="@string/bisub_cloud_backup_key"
++            android:summary="@string/bisub_cloud_backup_summary"
++            android:title="@string/bisub_cloud_backup_title"
++            android:fragment="org.schabi.newpipe.settings.CloudBackupFragment"
++            app:singleLineTitle="false"
++            app:iconSpaceReserved="false" />
++
+     <PreferenceCategory
+             android:layout="@layout/settings_category_header_layout"
+             android:title="@string/tab_subscriptions"
+diff --git a/app/src/main/res/xml/cloud_backup_settings.xml b/app/src/main/res/xml/cloud_backup_settings.xml
+new file mode 100644
+index 000000000..8deb82741
+--- /dev/null
++++ b/app/src/main/res/xml/cloud_backup_settings.xml
+@@ -0,0 +1,154 @@
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++                  xmlns:app="http://schemas.android.com/apk/res-auto"
++                  android:title="@string/bisub_cloud_backup_title">
++
++    <PreferenceCategory
++            android:layout="@layout/settings_category_header_layout"
++            android:title="@string/bisub_cloud_backup_category_server"
++            app:singleLineTitle="false"
++            app:iconSpaceReserved="false">
++
++        <ListPreference
++                android:key="@string/bisub_cloud_backup_provider_key"
++                android:defaultValue="webdav"
++                android:entries="@array/bisub_cloud_backup_providers"
++                android:entryValues="@array/bisub_cloud_backup_provider_values"
++                android:title="@string/bisub_cloud_backup_provider_title"
++                android:summary="%s"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_webdav_url_key"
++                android:title="@string/bisub_cloud_backup_webdav_url_title"
++                android:summary="@string/bisub_cloud_backup_webdav_url_summary"
++                android:inputType="textUri"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_webdav_username_key"
++                android:title="@string/bisub_cloud_backup_webdav_username_title"
++                android:inputType="text"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_webdav_password_key"
++                android:title="@string/bisub_cloud_backup_webdav_password_title"
++                android:inputType="textPassword"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_s3_endpoint_key"
++                android:title="@string/bisub_cloud_backup_s3_endpoint_title"
++                android:summary="@string/bisub_cloud_backup_s3_endpoint_summary"
++                android:inputType="textUri"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_s3_region_key"
++                android:defaultValue="us-east-1"
++                android:title="@string/bisub_cloud_backup_s3_region_title"
++                android:inputType="text"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_s3_bucket_key"
++                android:title="@string/bisub_cloud_backup_s3_bucket_title"
++                android:inputType="text"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_s3_access_key_key"
++                android:title="@string/bisub_cloud_backup_s3_access_key_title"
++                android:inputType="text"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_s3_secret_key_key"
++                android:title="@string/bisub_cloud_backup_s3_secret_key_title"
++                android:inputType="textPassword"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <EditTextPreference
++                android:key="@string/bisub_cloud_backup_dir_key"
++                android:defaultValue="BiPipe"
++                android:title="@string/bisub_cloud_backup_dir_title"
++                android:summary="@string/bisub_cloud_backup_dir_summary"
++                android:inputType="text"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++    </PreferenceCategory>
++
++    <PreferenceCategory
++            android:layout="@layout/settings_category_header_layout"
++            android:title="@string/bisub_cloud_backup_category_actions"
++            app:singleLineTitle="false"
++            app:iconSpaceReserved="false">
++
++        <Preference
++                android:key="@string/bisub_cloud_backup_test_key"
++                android:title="@string/bisub_cloud_backup_test_title"
++                android:summary="@string/bisub_cloud_backup_test_summary"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <Preference
++                android:key="@string/bisub_cloud_backup_now_key"
++                android:title="@string/bisub_cloud_backup_now_title"
++                android:summary="@string/bisub_cloud_backup_never"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <Preference
++                android:key="@string/bisub_cloud_backup_restore_key"
++                android:title="@string/bisub_cloud_backup_restore_title"
++                android:summary="@string/bisub_cloud_backup_restore_summary"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++    </PreferenceCategory>
++
++    <PreferenceCategory
++            android:layout="@layout/settings_category_header_layout"
++            android:title="@string/bisub_cloud_backup_category_automatic"
++            app:singleLineTitle="false"
++            app:iconSpaceReserved="false">
++
++        <SwitchPreferenceCompat
++                android:key="@string/bisub_cloud_backup_auto_enabled_key"
++                android:defaultValue="false"
++                android:title="@string/bisub_cloud_backup_auto_enabled_title"
++                android:summary="@string/bisub_cloud_backup_auto_enabled_summary"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <ListPreference
++                android:key="@string/bisub_cloud_backup_auto_interval_key"
++                android:defaultValue="daily"
++                android:entries="@array/bisub_cloud_backup_intervals"
++                android:entryValues="@array/bisub_cloud_backup_interval_values"
++                android:title="@string/bisub_cloud_backup_auto_interval_title"
++                android:summary="%s"
++                android:dependency="@string/bisub_cloud_backup_auto_enabled_key"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
++        <ListPreference
++                android:key="@string/bisub_cloud_backup_retention_key"
++                android:defaultValue="5"
++                android:entries="@array/bisub_cloud_backup_retentions"
++                android:entryValues="@array/bisub_cloud_backup_retention_values"
++                android:title="@string/bisub_cloud_backup_retention_title"
++                android:summary="%s"
++
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++    </PreferenceCategory>
++</PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+
