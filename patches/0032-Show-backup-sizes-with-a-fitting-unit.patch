@@ -1,0 +1,58 @@
+From 7a53d605a85c9dcae438d17fa5213af2caa0286f Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 12:47:04 +0800
+Subject: [PATCH] Show backup sizes with a fitting unit
+
+The restore list formatted every file size as megabytes with one
+decimal, so small backups (a fresh install produces a zip of a few
+dozen kilobytes) all showed up as "0.0 MB" and could not be told
+apart. Pick the unit based on the size: bytes, kilobytes, or
+megabytes.
+---
+ .../newpipe/settings/CloudBackupFragment.java | 23 +++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+index 59841e811..c1e520896 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+@@ -267,6 +267,26 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+                         }));
+     }
+ 
++    /**
++     * Formats a byte count with a unit that keeps it readable: fresh
++     * backups of an almost-empty app are a few dozen kilobytes, which a
++     * fixed "MB" format would collapse to "0.0 MB" and make two backups
++     * indistinguishable.
++     *
++     * @param bytes the file size in bytes
++     * @return the formatted size, e.g. "38.4 KB" or "63.4 MB"
++     */
++    @NonNull
++    private static String formatSize(final long bytes) {
++        if (bytes >= 1024L * 1024L) {
++            return String.format(Locale.getDefault(), "%.1f MB", bytes / 1048576.0);
++        }
++        if (bytes >= 1024L) {
++            return String.format(Locale.getDefault(), "%.1f KB", bytes / 1024.0);
++        }
++        return bytes + " B";
++    }
++
+     private void showRestoreChooser() {
+         final List<RemoteFile> files = remoteFiles;
+         final SimpleDateFormat format =
+@@ -274,8 +294,7 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+         final CharSequence[] labels = new CharSequence[files.size()];
+         for (int i = 0; i < files.size(); i++) {
+             final RemoteFile file = files.get(i);
+-            labels[i] = file.name + "\n"
+-                    + String.format(Locale.getDefault(), "%.1f MB", file.size / 1048576.0)
++            labels[i] = file.name + "\n" + formatSize(file.size)
+                     + "  ·  " + format.format(new Date(file.lastModified));
+         }
+         final Context context = requireContext();
+-- 
+2.54.0.windows.1
+
