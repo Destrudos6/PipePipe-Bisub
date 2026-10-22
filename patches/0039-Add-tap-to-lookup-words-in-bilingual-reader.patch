@@ -1,0 +1,1021 @@
+From bf19272c42be75114e68669371f3ecb97427a15c Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Thu, 22 Oct 2026 13:52:06 +0800
+Subject: [PATCH] Add tap-to-lookup words in the bilingual reader
+
+Reading a transcript is the moment unknown words actually appear,
+so every word of the original line is now tappable: tapping it
+opens a dictionary popup filled by the Youdao web dictionary API
+(dict.youdao.com/jsonapi, the same endpoint the Youdao web client
+uses; field mapping cross-checked against the easydict open-source
+implementation). The popup shows the phonetic transcription - which
+plays the pronunciation clip when tapped - the exam labels, the
+per-sense translations, the word forms and web translations as a
+fallback for phrases, plus a button that saves the word into a
+local word book (stored in the default shared preferences, so it
+rides along in every export and cloud backup and is ready for a
+later export to a spaced-repetition app).
+
+Lookup results are kept in an LRU cache, so re-tapping a word
+while reading is instant and free. Word boundaries keep embedded
+apostrophes and hyphens (don't, good-looking); single letters are
+skipped except a/I. The translation line stays plain: tapping is
+for the learning side of the pair, not the meaning the learner
+already has.
+---
+ .../newpipe/bisub/wordlookup/WordBook.java    | 115 +++++++
+ .../newpipe/bisub/wordlookup/WordEntry.java   |  52 +++
+ .../bisub/wordlookup/YoudaoDictionary.java    | 265 ++++++++++++++++
+ .../settings/BisubSubtitleReaderFragment.java | 297 +++++++++++++++++-
+ app/src/main/res/layout/dialog_bisub_word.xml |  80 +++++
+ app/src/main/res/values-zh-rCN/strings.xml    |   7 +
+ app/src/main/res/values-zh-rTW/strings.xml    |   7 +
+ app/src/main/res/values/strings.xml           |   7 +
+ 8 files changed, 829 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+ create mode 100644 app/src/main/res/layout/dialog_bisub_word.xml
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+new file mode 100644
+index 000000000..3f0bbcfa4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+@@ -0,0 +1,115 @@
++package org.schabi.newpipe.bisub.wordlookup;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import androidx.annotation.NonNull;
++
++import androidx.preference.PreferenceManager;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * The local word book: every word the learner saved from the reader's
++ * word popup. Stored as a JSON array in the default shared preferences,
++ * so it rides along in every data export and cloud backup (and will be
++ * ready for an export to a spaced-repetition app later).
++ */
++public final class WordBook {
++
++    private static final String KEY = "bisub_word_book";
++
++    private WordBook() {
++    }
++
++    private static SharedPreferences prefs(@NonNull final Context context) {
++        return PreferenceManager.getDefaultSharedPreferences(
++                context.getApplicationContext());
++    }
++
++    /**
++     * Saves a word (most recent first). Saving an existing word moves
++     * it to the front without duplicating it.
++     *
++     * @param context any context
++     * @param word    the word to save
++     */
++    public static void add(@NonNull final Context context, @NonNull final String word) {
++        final List<String> words = list(context);
++        words.remove(word);
++        words.add(0, word);
++        save(context, words);
++    }
++
++    /**
++     * Removes a word.
++     *
++     * @param context any context
++     * @param word    the word to remove
++     */
++    public static void remove(@NonNull final Context context, @NonNull final String word) {
++        final List<String> words = list(context);
++        if (words.remove(word)) {
++            save(context, words);
++        }
++    }
++
++    /**
++     * @param context any context
++     * @param word    the word to check
++     * @return whether the word is in the book
++     */
++    public static boolean contains(@NonNull final Context context,
++                                   @NonNull final String word) {
++        return list(context).contains(word);
++    }
++
++    /**
++     * @param context any context
++     * @return the saved words, most recent first
++     */
++    @NonNull
++    public static List<String> list(@NonNull final Context context) {
++        final List<String> words = new ArrayList<>();
++        final String json = prefs(context).getString(KEY, null);
++        if (json == null) {
++            return words;
++        }
++        try {
++            final JSONArray array = new JSONArray(json);
++            for (int i = 0; i < array.length(); i++) {
++                final JSONObject item = array.optJSONObject(i);
++                final String word = item == null ? null : item.optString("word", "");
++                if (!word.isEmpty()) {
++                    words.add(word);
++                }
++            }
++        } catch (final JSONException e) {
++            // A corrupted list is replaced by the next save; reading an
++            // empty book is better than crashing the reader.
++        }
++        return words;
++    }
++
++    private static void save(@NonNull final Context context,
++                             @NonNull final List<String> words) {
++        final JSONArray array = new JSONArray();
++        for (final String word : words) {
++            final JSONObject item = new JSONObject();
++            try {
++                item.put("word", word);
++                item.put("time", System.currentTimeMillis());
++                array.put(item);
++            } catch (final JSONException e) {
++                // JSONObject.put with a non-null value never throws
++            }
++        }
++        prefs(context).edit().putString(KEY, array.toString()).apply();
++    }
++
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
+new file mode 100644
+index 000000000..fc3deae75
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
+@@ -0,0 +1,52 @@
++package org.schabi.newpipe.bisub.wordlookup;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * One dictionary entry of a looked-up word, as shown in the word popup
++ * of the bilingual reader. The fields follow what the Youdao dictionary
++ * API returns for a word: phonetic transcription, one translation per
++ * sense, exam labels (like CET4 or postgraduate), word forms (past
++ * tense, plural, ...) and - as a fallback for phrases and unknown
++ * words - web translations.
++ */
++public final class WordEntry {
++
++    /** The word that was looked up. */
++    @NonNull public final String word;
++    /** Phonetic transcription (US), without slashes. */
++    @Nullable public final String phonetic;
++    /** URL of the pronunciation audio clip, playable when present. */
++    @Nullable public final String speechUrl;
++    /** Dictionary translations, one per sense, e.g. "n. 苹果". */
++    @NonNull public final List<String> translations = new ArrayList<>();
++    /** Exam labels, e.g. "CET4", "CET6", "考研". */
++    @NonNull public final List<String> examTypes = new ArrayList<>();
++    /** Word forms as label/value pairs, e.g. ["复数", "apples"]. */
++    @NonNull public final List<String[]> forms = new ArrayList<>();
++    /** Web translations as key/value pairs, used when no dictionary
++     *  entry exists (phrases, proper nouns). */
++    @NonNull public final List<String[]> webTranslations = new ArrayList<>();
++    /** Whether the word has a real dictionary entry. */
++    public final boolean isWord;
++
++    public WordEntry(@NonNull final String word, @Nullable final String phonetic,
++                     @Nullable final String speechUrl, final boolean isWord) {
++        this.word = word;
++        this.phonetic = phonetic;
++        this.speechUrl = speechUrl;
++        this.isWord = isWord;
++    }
++
++    /**
++     * @return whether the entry carries anything worth showing; an empty
++     *         entry renders as "no result"
++     */
++    public boolean isEmpty() {
++        return translations.isEmpty() && webTranslations.isEmpty() && forms.isEmpty();
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+new file mode 100644
+index 000000000..41d44e7d0
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+@@ -0,0 +1,265 @@
++package org.schabi.newpipe.bisub.wordlookup;
++
++import android.util.LruCache;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++import org.schabi.newpipe.bisub.BisubLog;
++
++import java.io.IOException;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.Response;
++
++/**
++ * Word lookup through the Youdao web dictionary API
++ * ({@code dict.youdao.com/jsonapi}), the same endpoint the Youdao web
++ * dictionary uses. It returns exactly what a learner needs on a tapped
++ * word: phonetic transcription, per-sense Chinese translations, exam
++ * labels, word forms and web translations as a fallback for phrases.
++ *
++ * <p>Tapping a word is a rare, single-shot request, so rate limits are
++ * not a concern. Results are cached in an {@link LruCache}, so reading
++ * the same word again while browsing a transcript is instant and
++ * free.</p>
++ */
++public final class YoudaoDictionary {
++
++    private static final String TAG = YoudaoDictionary.class.getSimpleName();
++    private static final String ENDPOINT =
++            "https://dict.youdao.com/jsonapi?le=eng&q=";
++    /**
++     * Restricts the reply to the modules the popup shows: the
++     * English-Chinese dictionary and the web translations. This is the
++     * same parameter the Youdao web client sends, just without the
++     * encyclopedia and Chinese dictionary modules.
++     */
++    private static final String DICTS_PARAM =
++            "&dicts=%7B%22count%22%3A99%2C%22dicts%22%3A%5B%5B%22web_trans%22%2C%22ec%22%5D%5D%7D";
++
++    private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
++            .connectTimeout(10, TimeUnit.SECONDS)
++            .readTimeout(10, TimeUnit.SECONDS)
++            .build();
++
++    /** Recently looked-up words, so re-taps while reading are instant. */
++    private static final LruCache<String, WordEntry> CACHE = new LruCache<>(256);
++
++    private YoudaoDictionary() {
++    }
++
++    /**
++     * Looks one word up, preferring the cache. Blocking network call:
++     * run off the main thread.
++     *
++     * @param word the word (or phrase) to look up
++     * @return the entry; translations and web translations may both be
++     *         empty when nothing was found
++     * @throws IOException on network errors
++     */
++    @NonNull
++    public static WordEntry lookup(@NonNull final String word) throws IOException {
++        final String key = word.toLowerCase();
++        final WordEntry cached = CACHE.get(key);
++        if (cached != null) {
++            return cached;
++        }
++        final Request request = new Request.Builder()
++                .url(ENDPOINT + encode(word) + DICTS_PARAM)
++                .header("User-Agent",
++                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++                                + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
++                .get()
++                .build();
++        final String body;
++        try (Response response = CLIENT.newCall(request).execute()) {
++            if (!response.isSuccessful() || response.body() == null) {
++                throw new IOException("Dictionary lookup failed: HTTP "
++                        + response.code());
++            }
++            body = response.body().string();
++        }
++        final WordEntry entry = parse(word, body);
++        CACHE.put(key, entry);
++        return entry;
++    }
++
++    @NonNull
++    private static String encode(@NonNull final String word) {
++        // OkHttp accepts pre-encoded URLs; the word may contain spaces
++        // when a phrase was passed, so percent-encode defensively.
++        return word.replace(" ", "%20");
++    }
++
++    /**
++     * Parses the jsonapi reply, following the field layout of the
++     * Youdao web client: {@code ec.word[0]} carries the phonetic
++     * transcription, the senses ({@code trs}) and the word forms
++     * ({@code wfs}), {@code ec.exam_type} the exam labels, and
++     * {@code web_trans.web-translation} the web translations.
++     *
++     * @param word the looked-up word
++     * @param body the response body
++     * @return the parsed entry, never {@code null}
++     */
++    @NonNull
++    private static WordEntry parse(@NonNull final String word,
++                                   @NonNull final String body) {
++        try {
++            final JSONObject root = new JSONObject(body);
++            String phonetic = null;
++            String speechUrl = null;
++            boolean isWord = false;
++            final JSONObject ec = root.optJSONObject("ec");
++            final JSONObject firstWord = firstEcWord(ec);
++            if (firstWord != null) {
++                isWord = true;
++                phonetic = optTrim(firstWord, "usphone");
++                final String speech = optTrim(firstWord, "usspeech");
++                if (speech != null) {
++                    speechUrl = "https://dict.youdao.com/dictvoice?audio=" + speech;
++                }
++            }
++            final WordEntry entry = new WordEntry(word, phonetic, speechUrl, isWord);
++            if (firstWord != null) {
++                final JSONArray trs = firstWord.optJSONArray("trs");
++                if (trs != null) {
++                    for (int i = 0; i < trs.length(); i++) {
++                        final String text = senseText(trs.optJSONObject(i));
++                        if (text != null && !text.isEmpty()) {
++                            entry.translations.add(text);
++                        }
++                    }
++                }
++                final JSONArray wfs = firstWord.optJSONArray("wfs");
++                if (wfs != null) {
++                    for (int i = 0; i < wfs.length(); i++) {
++                        final JSONObject wf = wfs.optJSONObject(i);
++                        final JSONObject form = wf == null
++                                ? null : wf.optJSONObject("wf");
++                        if (form == null) {
++                            continue;
++                        }
++                        final String name = optTrim(form, "name");
++                        final String value = optTrim(form, "value");
++                        if (name != null && value != null) {
++                            entry.forms.add(new String[]{name, value});
++                        }
++                    }
++                }
++            }
++            if (ec != null) {
++                final JSONArray examTypes = ec.optJSONArray("exam_type");
++                if (examTypes != null) {
++                    for (int i = 0; i < examTypes.length(); i++) {
++                        final String label = examTypes.optString(i, "");
++                        if (!label.isEmpty()) {
++                            entry.examTypes.add(label);
++                        }
++                    }
++                }
++            }
++            final JSONObject webTrans = root.optJSONObject("web_trans");
++            final JSONArray webArray = webTrans == null
++                    ? null : webTrans.optJSONArray("web-translation");
++            if (webArray != null) {
++                for (int i = 0; i < webArray.length(); i++) {
++                    final JSONObject item = webArray.optJSONObject(i);
++                    if (item == null) {
++                        continue;
++                    }
++                    final String phrase = optTrim(item, "key");
++                    final JSONArray trans = item.optJSONArray("trans");
++                    if (phrase == null || trans == null || trans.length() == 0) {
++                        continue;
++                    }
++                    final StringBuilder values = new StringBuilder();
++                    for (int t = 0; t < trans.length() && t < 3; t++) {
++                        final String value = optTrim(trans.optJSONObject(t), "value");
++                        if (value != null) {
++                            if (values.length() > 0) {
++                                values.append("；");
++                            }
++                            values.append(value);
++                        }
++                    }
++                    if (values.length() > 0) {
++                        entry.webTranslations.add(new String[]{phrase, values.toString()});
++                    }
++                }
++            }
++            BisubLog.i("word lookup '" + word + "': " + entry.translations.size()
++                    + " senses, " + entry.webTranslations.size() + " web, isWord="
++                    + entry.isWord);
++            return entry;
++        } catch (final JSONException e) {
++            BisubLog.w("word lookup '" + word + "': malformed reply");
++            return new WordEntry(word, null, null, false);
++        }
++    }
++
++    @Nullable
++    private static JSONObject firstEcWord(@Nullable final JSONObject ec) {
++        if (ec == null) {
++            return null;
++        }
++        final JSONArray words = ec.optJSONArray("word");
++        return words != null && words.length() > 0 ? words.optJSONObject(0) : null;
++    }
++
++    /**
++     * Reads one sense of the ec dictionary: {@code tr.l.i} holds the
++     * text, and {@code l.pos} may hold the part of speech.
++     *
++     * @param tr one element of the {@code trs} array
++     * @return the sense text like "n. 苹果", or {@code null}
++     */
++    @Nullable
++    private static String senseText(@Nullable final JSONObject tr) {
++        if (tr == null) {
++            return null;
++        }
++        final JSONObject l = tr.optJSONObject("l");
++        if (l == null) {
++            return null;
++        }
++        String text = null;
++        final JSONArray i = l.optJSONArray("i");
++        if (i != null) {
++            for (int k = 0; k < i.length(); k++) {
++                final Object part = i.opt(k);
++                final String piece = part instanceof String ? (String) part
++                        : part instanceof JSONObject
++                        ? ((JSONObject) part).optString("#text", "") : "";
++                if (!piece.isEmpty()) {
++                    text = text == null ? piece : text + piece;
++                }
++            }
++        } else {
++            text = optTrim(l, "i");
++        }
++        if (text == null || text.isEmpty()) {
++            return null;
++        }
++        final String pos = optTrim(l, "pos");
++        return pos == null ? text : pos + " " + text;
++    }
++
++    @Nullable
++    private static String optTrim(@Nullable final JSONObject object,
++                                  @NonNull final String key) {
++        if (object == null) {
++            return null;
++        }
++        final String value = object.optString(key, "");
++        final String trimmed = value.trim();
++        return trimmed.isEmpty() ? null : trimmed;
++    }
++
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+index c4cea4338..4847bfda4 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+@@ -1,12 +1,23 @@
+ package org.schabi.newpipe.settings;
+ 
+ import android.content.Context;
++import android.graphics.Color;
++import android.media.MediaPlayer;
+ import android.os.Bundle;
++
++import android.text.SpannableStringBuilder;
++import android.text.Spanned;
++import android.text.TextPaint;
++import android.text.method.LinkMovementMethod;
++import android.text.style.ClickableSpan;
++import android.util.TypedValue;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.widget.Button;
+ import android.widget.RadioGroup;
+ import android.widget.TextView;
++import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -16,6 +27,9 @@ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.VttParser;
++import org.schabi.newpipe.bisub.wordlookup.WordBook;
++import org.schabi.newpipe.bisub.wordlookup.WordEntry;
++import org.schabi.newpipe.bisub.wordlookup.YoudaoDictionary;
+ import org.schabi.newpipe.util.ThemeHelper;
+ 
+ import java.io.File;
+@@ -24,6 +38,8 @@ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Third-level reader page that shows one cached bilingual subtitle as a
+@@ -36,6 +52,11 @@ import java.util.List;
+  * original only and the translation only, so the transcript can be read
+  * as a comprehension exercise: cover the translation first, then reveal
+  * it line by line.</p>
++ *
++ * <p>Every word of the original line is tappable: tapping it looks the
++ * word up in the Youdao dictionary (cached) and shows the definition in
++ * a popup with the phonetic transcription, exam labels, word forms and
++ * a button to save the word into the local word book.</p>
+  */
+ public final class BisubSubtitleReaderFragment extends Fragment {
+ 
+@@ -49,11 +70,23 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+     private static final String ARG_FILE_PATH = "filePath";
+     private static final String ARG_TITLE = "title";
+ 
++    /**
++     * Words are Latin letters with embedded apostrophes and hyphens, so
++     * "don't" and "good-looking" are looked up as whole words.
++     */
++    private static final Pattern WORD =
++            Pattern.compile("[A-Za-z]+(?:['’\\-][A-Za-z]+)*");
++
+     private RecyclerView recyclerView;
+     private TextView emptyView;
+     private final BisubReaderAdapter adapter = new BisubReaderAdapter();
+     private int displayMode = MODE_BILINGUAL;
+ 
++    /** Accent color for tappable words, resolved from the theme. */
++    private int wordColor;
++    /** The pronunciation clip of the currently open word popup. */
++    private MediaPlayer speechPlayer;
++
+     /**
+      * Builds the arguments of a reader page for one cache entry.
+      *
+@@ -81,6 +114,7 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+         emptyView = root.findViewById(R.id.bisub_reader_empty);
+         recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
+         recyclerView.setAdapter(adapter);
++        wordColor = resolveThemeColor(androidx.appcompat.R.attr.colorPrimary);
+ 
+         final RadioGroup modeGroup = root.findViewById(R.id.bisub_reader_mode_group);
+         modeGroup.setOnCheckedChangeListener((final RadioGroup group, final int id) -> {
+@@ -108,6 +142,12 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+         }
+     }
+ 
++    @Override
++    public void onDestroy() {
++        stopSpeech();
++        super.onDestroy();
++    }
++
+     /**
+      * Reads the cached file and parses it into parallel lines on a
+      * background thread, then swaps them into the list on the UI thread.
+@@ -167,6 +207,199 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+         recyclerView.setVisibility(View.GONE);
+     }
+ 
++    /**
++     * Opens the dictionary popup for one word: the popup appears
++     * immediately with a "looking up" state, the lookup runs on a
++     * background thread (the dictionary cache makes repeated taps
++     * instant), and the result fills the popup in place.
++     *
++     * @param word the tapped word
++     */
++    private void showWordDialog(@NonNull final String word) {
++        final Context context = getContext();
++        if (context == null) {
++            return;
++        }
++        stopSpeech();
++        final View view = LayoutInflater.from(context)
++                .inflate(R.layout.dialog_bisub_word, null);
++        final TextView wordView = view.findViewById(R.id.bisub_word);
++        wordView.setText(word);
++        final android.view.ViewGroup content =
++                view.findViewById(R.id.bisub_word_content);
++        content.addView(row(getString(R.string.bisub_word_looking_up), false));
++        final androidx.appcompat.app.AlertDialog dialog =
++                new androidx.appcompat.app.AlertDialog.Builder(context)
++                        .setView(view)
++                        .show();
++        // The book button state does not depend on the lookup result,
++        // so it is set right away (also covers lookup failures).
++        final Button bookButton = view.findViewById(R.id.bisub_word_book_button);
++        refreshBookButton(bookButton, word);
++        bookButton.setOnClickListener(v -> {
++            final Context buttonContext = v.getContext();
++            if (WordBook.contains(buttonContext, word)) {
++                WordBook.remove(buttonContext, word);
++                Toast.makeText(buttonContext, R.string.bisub_word_book_removed,
++                        Toast.LENGTH_SHORT).show();
++            } else {
++                WordBook.add(buttonContext, word);
++                Toast.makeText(buttonContext, R.string.bisub_word_book_added,
++                        Toast.LENGTH_SHORT).show();
++            }
++            refreshBookButton(bookButton, word);
++        });
++        new Thread(() -> {
++            WordEntry entry = null;
++            try {
++                entry = YoudaoDictionary.lookup(word);
++            } catch (final IOException e) {
++                // keep null: shown as a lookup failure below
++            }
++            final WordEntry result = entry;
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null || !dialog.isShowing()) {
++                    return;
++                }
++                fillWordDialog(view, word, result);
++            });
++        }).start();
++    }
++
++    /**
++     * Fills the popup with the lookup result: phonetic transcription
++     * (tappable to play the pronunciation), exam labels, senses, word
++     * forms, web translations as a fallback, and the word book button.
++     *
++     * @param view  the inflated popup layout
++     * @param word  the looked-up word
++     * @param entry the lookup result, or {@code null} on failure
++     */
++    private void fillWordDialog(@NonNull final View view, @NonNull final String word,
++                                @Nullable final WordEntry entry) {
++        final TextView phoneticView = view.findViewById(R.id.bisub_word_phonetic);
++        final TextView examView = view.findViewById(R.id.bisub_word_exam);
++        final android.view.ViewGroup content = view.findViewById(R.id.bisub_word_content);
++        content.removeAllViews();
++        if (entry == null) {
++            content.addView(row(getString(R.string.bisub_word_lookup_failed), false));
++            return;
++        }
++        if (entry.phonetic != null) {
++            phoneticView.setText("/" + entry.phonetic + "/");
++            phoneticView.setOnClickListener(v -> {
++                if (entry.speechUrl != null) {
++                    playSpeech(entry.speechUrl);
++                } else {
++                    playSpeech(entry.word);
++                }
++            });
++        } else {
++            phoneticView.setOnClickListener(v -> playSpeech(entry.word));
++        }
++        examView.setText(android.text.TextUtils.join(" · ", entry.examTypes));
++        if (entry.isEmpty()) {
++            content.addView(row(getString(R.string.bisub_word_no_result), false));
++        }
++        for (final String translation : entry.translations) {
++            content.addView(row(translation, false));
++        }
++        if (!entry.forms.isEmpty()) {
++            final StringBuilder forms = new StringBuilder();
++            for (final String[] form : entry.forms) {
++                if (forms.length() > 0) {
++                    forms.append("；");
++                }
++                forms.append(form[0]).append(' ').append(form[1]);
++            }
++            content.addView(row(forms.toString(), true));
++        }
++        for (final String[] web : entry.webTranslations) {
++            content.addView(row(web[0] + "：" + web[1], false));
++        }
++
++    }
++
++    /**
++     * @param button the word book button
++     * @param word   the looked-up word
++     */
++    private void refreshBookButton(@NonNull final Button button,
++                                   @NonNull final String word) {
++        if (WordBook.contains(button.getContext(), word)) {
++            button.setText(R.string.bisub_word_book_remove);
++        } else {
++            button.setText(R.string.bisub_word_book_add);
++        }
++    }
++
++    /**
++     * @param text      the row text
++     * @param secondary whether the row renders as secondary (word forms)
++     * @return one row of the popup content
++     */
++    @NonNull
++    private TextView row(@NonNull final String text, final boolean secondary) {
++        final TextView textView = new TextView(requireContext());
++        textView.setLayoutParams(new android.view.ViewGroup.LayoutParams(
++                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
++                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
++        final float density = getResources().getDisplayMetrics().density;
++        final int pad = (int) (secondary ? 2 * density : 4 * density);
++        textView.setPadding(0, pad, 0, pad);
++        textView.setTextSize(secondary ? 13 : 15);
++        // Theme attributes resolve differently per day/night theme, so
++        // they cannot be read as a static color.
++        textView.setTextColor(secondary
++                ? resolveThemeColor(android.R.attr.textColorTertiary)
++                : resolveThemeColor(android.R.attr.textColorPrimary));
++        return textView;
++    }
++
++    /**
++     * @param attr a theme attribute like {@code android.R.attr.textColorPrimary}
++     * @return the resolved color for the current theme
++     */
++    private int resolveThemeColor(final int attr) {
++        final TypedValue typedValue = new TypedValue();
++        requireContext().getTheme().resolveAttribute(attr, typedValue, true);
++        if (typedValue.resourceId != 0) {
++            return getContext().getResources().getColor(typedValue.resourceId, null);
++        }
++        return typedValue.data;
++    }
++
++    /**
++     * Plays the pronunciation of the popup word, streaming the Youdao
++     * audio clip; when no clip exists, the word itself is spoken.
++     *
++     * @param audio the audio URL or the word itself
++     */
++    private void playSpeech(@NonNull final String audio) {
++        stopSpeech();
++        try {
++            speechPlayer = new MediaPlayer();
++            speechPlayer.setDataSource(audio.startsWith("http")
++                    ? audio : "https://dict.youdao.com/dictvoice?audio=" + audio);
++            speechPlayer.setOnPreparedListener(MediaPlayer::start);
++            speechPlayer.setOnCompletionListener(MediaPlayer::release);
++            speechPlayer.prepareAsync();
++        } catch (final IOException e) {
++            Toast.makeText(requireContext(), R.string.bisub_word_lookup_failed,
++                    Toast.LENGTH_SHORT).show();
++        }
++    }
++
++    private void stopSpeech() {
++        if (speechPlayer != null) {
++            speechPlayer.release();
++            speechPlayer = null;
++        }
++    }
++
+     private final class BisubReaderAdapter
+             extends RecyclerView.Adapter<BisubReaderHolder> {
+         private final List<String[]> lines = new ArrayList<>();
+@@ -205,6 +438,11 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+             super(itemView);
+             originalView = itemView.findViewById(R.id.bisub_reader_original);
+             translationView = itemView.findViewById(R.id.bisub_reader_translation);
++            // Handing touches to the movement method is what makes the
++            // word spans clickable; the press highlight is disabled so
++            // taps do not flash the whole line.
++            originalView.setMovementMethod(LinkMovementMethod.getInstance());
++            originalView.setHighlightColor(Color.TRANSPARENT);
+         }
+ 
+         /**
+@@ -220,10 +458,67 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+                     displayMode == MODE_BILINGUAL || displayMode == MODE_TRANSLATION;
+             originalView.setVisibility(
+                     showOriginal && !line[0].isEmpty() ? View.VISIBLE : View.GONE);
+-            originalView.setText(line[0]);
++            if (showOriginal && !line[0].isEmpty()) {
++                originalView.setText(spannedOriginal(line[0]));
++            } else {
++                originalView.setText(line[0]);
++            }
+             translationView.setVisibility(
+                     showTranslation && !line[1].isEmpty() ? View.VISIBLE : View.GONE);
+             translationView.setText(line[1]);
+         }
++
++        /**
++         * Builds the original line with one clickable span per word, so
++         * tapping a word opens the dictionary popup. The spannable is
++         * rebuilt per bind; the layout cost of a few dozen spans per
++         * line is far below a frame.
++         *
++         * @param text the original line
++         * @return the line with word spans
++         */
++        @NonNull
++        private CharSequence spannedOriginal(@NonNull final String text) {
++            final SpannableStringBuilder builder = new SpannableStringBuilder(text);
++            final Matcher matcher = WORD.matcher(text);
++            while (matcher.find()) {
++                final String word = matcher.group();
++                if (word.length() == 1 && !isSingleLetterWord(word.charAt(0))) {
++                    continue;
++                }
++                builder.setSpan(new WordSpan(word), matcher.start(), matcher.end(),
++                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
++            }
++            return builder;
++        }
++
++        private boolean isSingleLetterWord(final char c) {
++            // "a" and "I" are words; any other single letter is noise
++            return c == 'a' || c == 'A' || c == 'i' || c == 'I';
++        }
++    }
++
++    /**
++     * One tappable word of the original line: colored like a link
++     * (without the underline, to keep the transcript calm) and opening
++     * the dictionary popup when tapped.
++     */
++    private final class WordSpan extends ClickableSpan {
++        private final String word;
++
++        WordSpan(@NonNull final String word) {
++            this.word = word;
++        }
++
++        @Override
++        public void onClick(@NonNull final View widget) {
++            showWordDialog(word);
++        }
++
++        @Override
++        public void updateDrawState(@NonNull final TextPaint ds) {
++            ds.setColor(wordColor);
++            ds.setUnderlineText(false);
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/dialog_bisub_word.xml b/app/src/main/res/layout/dialog_bisub_word.xml
+new file mode 100644
+index 000000000..724a05aa9
+--- /dev/null
++++ b/app/src/main/res/layout/dialog_bisub_word.xml
+@@ -0,0 +1,80 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:paddingStart="20dp"
++    android:paddingEnd="20dp"
++    android:paddingTop="16dp"
++    android:paddingBottom="4dp">
++
++    <TextView
++        android:id="@+id/bisub_word"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:textColor="?android:attr/textColorPrimary"
++        android:textSize="22sp"
++        android:textStyle="bold" />
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="4dp"
++        android:gravity="center_vertical"
++        android:orientation="horizontal">
++
++        <TextView
++            android:id="@+id/bisub_word_phonetic"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:background="?attr/selectableItemBackground"
++            android:paddingTop="4dp"
++            android:paddingBottom="4dp"
++            android:paddingEnd="8dp"
++            android:textColor="?android:attr/textColorSecondary"
++            android:textSize="14sp"
++            android:textStyle="italic" />
++
++        <TextView
++            android:id="@+id/bisub_word_exam"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:textSize="12sp"
++            android:textColor="?android:attr/textColorTertiary" />
++    </LinearLayout>
++
++    <View
++        android:layout_width="match_parent"
++        android:layout_height="1dp"
++        android:layout_marginTop="10dp"
++        android:layout_marginBottom="6dp"
++        android:alpha="0.15"
++        android:background="?android:attr/textColorPrimary" />
++
++    <ScrollView
++        android:id="@+id/bisub_word_scroll"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:scrollbars="none">
++
++        <LinearLayout
++            android:id="@+id/bisub_word_content"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="vertical"
++            android:paddingBottom="4dp" />
++    </ScrollView>
++
++    <Button
++        android:id="@+id/bisub_word_book_button"
++        style="@style/Base.Widget.AppCompat.Button.Borderless"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="end"
++        android:layout_marginTop="2dp"
++        android:minWidth="0dp"
++        android:paddingStart="16dp"
++        android:paddingEnd="16dp"
++        android:textSize="14sp" />
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 4e9a62601..3c5deba89 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1305,6 +1305,13 @@
+     <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
+     <string name="bisub_toast_failed">字幕翻译失败，请检查网络后重试</string>
+     <string name="bisub_reader_title">双语字幕</string>
++    <string name="bisub_word_looking_up">查询中…</string>
++    <string name="bisub_word_lookup_failed">查询失败，请检查网络</string>
++    <string name="bisub_word_no_result">没有找到释义</string>
++    <string name="bisub_word_book_add">加入生词本</string>
++    <string name="bisub_word_book_remove">从生词本移除</string>
++    <string name="bisub_word_book_added">已加入生词本</string>
++    <string name="bisub_word_book_removed">已从生词本移除</string>
+     <string name="bisub_reader_open">双语阅读</string>
+     <string name="bisub_reader_empty">该文件没有可读的字幕内容</string>
+     <string name="bisub_reader_mode_bilingual">双语</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index 63db5f91b..c82887774 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1210,4 +1210,11 @@
+     <string name="bisub_cloud_backup_restoring">正在從雲端還原…</string>
+     <string name="bisub_cloud_backup_done">雲端備份完成</string>
+     <string name="bisub_cloud_backup_failed">雲端備份失敗：%s</string>
++    <string name="bisub_word_looking_up">查詢中…</string>
++    <string name="bisub_word_lookup_failed">查詢失敗，請檢查網路</string>
++    <string name="bisub_word_no_result">沒有找到釋義</string>
++    <string name="bisub_word_book_add">加入生詞本</string>
++    <string name="bisub_word_book_remove">從生詞本移除</string>
++    <string name="bisub_word_book_added">已加入生詞本</string>
++    <string name="bisub_word_book_removed">已從生詞本移除</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9e95b5247..a7590faec 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1308,6 +1308,13 @@
+     <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
+     <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
+     <string name="bisub_reader_title">Bilingual subtitles</string>
++    <string name="bisub_word_looking_up">Looking up…</string>
++    <string name="bisub_word_lookup_failed">Lookup failed, check your connection</string>
++    <string name="bisub_word_no_result">No definition found</string>
++    <string name="bisub_word_book_add">Add to word book</string>
++    <string name="bisub_word_book_remove">Remove from word book</string>
++    <string name="bisub_word_book_added">Added to the word book</string>
++    <string name="bisub_word_book_removed">Removed from the word book</string>
+     <string name="bisub_reader_open">Read bilingually</string>
+     <string name="bisub_reader_empty">No readable cues in this file</string>
+     <string name="bisub_reader_mode_bilingual">Bilingual</string>
+-- 
+2.54.0.windows.1
+
