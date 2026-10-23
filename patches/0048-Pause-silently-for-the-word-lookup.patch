@@ -1,0 +1,170 @@
+From b9646a8d80b9a3591268363c41a8797c5a1b3e12 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Fri, 23 Oct 2026 16:06:43 +0800
+Subject: [PATCH] Pause silently for the word lookup
+
+Tapping a word paused the video through the regular pause() path,
+and the playback state controller reacts to every PAUSED transition
+by showing the controls - progress bar, title, quality, the pause
+icon - and dimming the video behind them. In frequent-lookup
+sessions that popup/undim cycle shattered the fullscreen viewing
+experience, and the controls stayed up after resuming until yet
+another tap hid them again.
+
+The word lookup now uses pauseSilently()/playSilently(): a
+silent-transition flag makes the state controller skip its
+controls-popup block for exactly that one transition, so the video
+freezes (and later resumes) invisibly behind the dictionary popup.
+The flag is consumed by every state transition, so it can never
+outlive its own pause and silence a later manual one; double-tap
+seeking, buffering and all other reactions are untouched, and
+onPlaying never touches the controls anyway. The dictionary popup
+itself now holds the screen awake while it is open, since the
+paused player drops keepScreenOn.
+---
+ .../bisub/wordlookup/WordDialogHelper.java    |  5 +++
+ .../org/schabi/newpipe/player/Player.java     | 44 +++++++++++++++++++
+ .../newpipe/player/PlayerLayoutController.kt  |  6 ++-
+ .../player/PlayerPlaybackStateController.kt   | 14 ++++--
+ 4 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+index f82ec84d0..adcc3e15e 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+@@ -132,6 +132,11 @@ public final class WordDialogHelper {
+         if (dark) {
+             styleDarkWindow(dialog, view);
+         }
++        // The player drops keepScreenOn while paused; the popup holds the
++        // screen awake itself for the reading, and releases it on dismiss.
++        if (dialog.getWindow() != null) {
++            dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++        }
+         dialog.setOnDismissListener(d -> {
+             stopSpeech();
+             if (onDismiss != null) {
+diff --git a/app/src/main/java/org/schabi/newpipe/player/Player.java b/app/src/main/java/org/schabi/newpipe/player/Player.java
+index 5c32859fa..a23f6cff1 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/Player.java
++++ b/app/src/main/java/org/schabi/newpipe/player/Player.java
+@@ -1148,6 +1148,50 @@ public final class Player {
+         transportController.pause();
+     }
+ 
++    // BISUB-BEGIN
++    /**
++     * Set while a tap-to-lookup pause or resume is in flight: the
++     * playback state controller suppresses its "show controls on
++     * pause" reaction for that one state transition, so the video
++     * freezes silently behind the dictionary popup instead of popping
++     * up the whole control layer (and dimming the video with it).
++     * Every state transition consumes the flag, so a flag that never
++     * reaches its transition cannot silence a later manual pause.
++     */
++    private boolean bisubSilentTransition = false;
++
++    /**
++     * Pauses playback without showing the controls: the video simply
++     * freezes behind whatever is on top of it. Used by the word lookup.
++     */
++    public void pauseSilently() {
++        bisubSilentTransition = true;
++        pause();
++    }
++
++    /**
++     * Resumes playback without any control-layer reaction, mirroring
++     * {@link #pauseSilently()}.
++     */
++    public void playSilently() {
++        bisubSilentTransition = true;
++        play();
++    }
++
++    /**
++     * Consumes the silent-transition flag.
++     *
++     * @return whether the ongoing state transition should stay silent
++     */
++    public boolean consumeBisubSilentTransition() {
++        if (bisubSilentTransition) {
++            bisubSilentTransition = false;
++            return true;
++        }
++        return false;
++    }
++    // BISUB-END
++
+     public void playPause() {
+         transportController.playPause();
+     }
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+index 8468bdbd6..efd425e04 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+@@ -79,11 +79,13 @@ class PlayerLayoutController(private val player: Player) {
+                             )
+                     val resumeAfterLookup = pauseOnLookup && player.isPlaying
+                     if (resumeAfterLookup) {
+-                        player.pause()
++                        // Silent pause: the video freezes behind the popup without
++                        // the control layer popping up (and dimming the video).
++                        player.pauseSilently()
+                     }
+                     WordDialogHelper.show(activity, word, true) {
+                         if (resumeAfterLookup) {
+-                            player.play()
++                            player.playSilently()
+                         }
+                     }
+                 }
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerPlaybackStateController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerPlaybackStateController.kt
+index fe5ffe027..d78a511f1 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerPlaybackStateController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerPlaybackStateController.kt
+@@ -149,6 +149,12 @@ class PlayerPlaybackStateController(private val player: Player) {
+         if (Player.DEBUG) {
+             Log.d(Player.TAG, "changeState() called with: state = [$state]")
+         }
++        // BISUB-BEGIN: consume the silent-transition flag on every state
++        // change, so the flag never outlives its own transition (a stale
++        // flag would wrongly silence the controls on a later manual
++        // pause). Only the PAUSED reaction actually consults it.
++        val silent = player.consumeBisubSilentTransition()
++        // BISUB-END
+         player.currentState = state
+         when (state) {
+             PlayerPlaybackState.BLOCKED -> onBlocked()
+@@ -163,7 +169,7 @@ class PlayerPlaybackStateController(private val player: Player) {
+ 
+             PlayerPlaybackState.PAUSED -> {
+                 player.autoQueueController.cancelEnqueueTimer()
+-                onPaused()
++                onPaused(silent)
+                 player.bulletCommentsController.pause()
+                 // A live stream has no paused position worth keeping: release the source so the
+                 // manifest refresh, the segment downloads and the live chat connections stop.
+@@ -294,7 +300,7 @@ class PlayerPlaybackStateController(private val player: Player) {
+         }
+     }
+ 
+-    private fun onPaused() {
++    private fun onPaused(silent: Boolean = false) {
+         if (Player.DEBUG) {
+             Log.d(Player.TAG, "onPaused() called")
+         }
+@@ -305,7 +311,9 @@ class PlayerPlaybackStateController(private val player: Player) {
+ 
+         // Don't let UI elements popup during double tap seeking. This state is entered sometimes
+         // during seeking/loading. This if-else check ensures that the controls aren't popping up.
+-        if (!player.gestureController.isDoubleTapping) {
++        // BISUB: also skip the whole popup block for a silent (word-lookup) pause - the video
++        // simply freezes behind the dictionary popup, without the controls or the dimming.
++        if (!player.gestureController.isDoubleTapping && !silent) {
+             player.showControls(400L)
+             player.binding.loadingPanel.visibility = View.GONE
+ 
+-- 
+2.54.0.windows.1
+
