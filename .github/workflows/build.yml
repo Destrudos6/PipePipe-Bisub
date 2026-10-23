@@ -2,8 +2,10 @@ name: Build bisub APK
 
 on:
   schedule:
-    # Every Monday at 04:00 UTC, follow upstream dev/main
-    - cron: '0 4 * * 1'
+    # Every 2 hours: probe the upstream heads and build only when they
+    # moved. The probe costs one git ls-remote (~20 s, billed as 1 min);
+    # an unchanged upstream skips the whole build job for free.
+    - cron: '17 */2 * * *'
   workflow_dispatch:
     inputs:
       client_ref:
@@ -16,7 +18,46 @@ on:
         default: '73442076c671ae09bd5c0f9635932a5a67bdd609'
 
 jobs:
+  # Lightweight probe: resolves the upstream dev/main heads and compares
+  # them with the .upstream-state file (written back by every scheduled
+  # build). A scheduled run only proceeds to the build when something
+  # actually moved upstream; manual dispatches skip the check entirely.
+  check-upstream:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.probe.outputs.changed }}
+      client_sha: ${{ steps.probe.outputs.client_sha }}
+      extractor_sha: ${{ steps.probe.outputs.extractor_sha }}
+    steps:
+      - name: Checkout this patch project
+        uses: actions/checkout@v6
+
+      - name: Probe upstream heads
+        id: probe
+        run: |
+          CLIENT_SHA=$(git ls-remote https://codeberg.org/NullPointerException/PipePipeClient.git dev | cut -f1)
+          EXTRACTOR_SHA=$(git ls-remote https://codeberg.org/NullPointerException/PipePipeExtractor.git main | cut -f1)
+          if [ -z "$CLIENT_SHA" ] || [ -z "$EXTRACTOR_SHA" ]; then
+            # Network hiccup: treat as unchanged, the next run retries.
+            echo "Probe failed, treating upstream as unchanged"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_CLIENT=$(grep '^client=' .upstream-state 2>/dev/null | cut -d= -f2)
+          LAST_EXTRACTOR=$(grep '^extractor=' .upstream-state 2>/dev/null | cut -d= -f2)
+          echo "client_sha=$CLIENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "extractor_sha=$EXTRACTOR_SHA" >> "$GITHUB_OUTPUT"
+          if [ "$CLIENT_SHA" = "$LAST_CLIENT" ] && [ "$EXTRACTOR_SHA" = "$LAST_EXTRACTOR" ]; then
+            echo "Upstream unchanged (client ${CLIENT_SHA:0:10}), skipping the build"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream moved (client ${LAST_CLIENT:0:10} -> ${CLIENT_SHA:0:10}, extractor ${LAST_EXTRACTOR:0:10} -> ${EXTRACTOR_SHA:0:10})"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check-upstream
+    if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -27,8 +68,8 @@ jobs:
       - name: Resolve upstream refs
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "CLIENT_REF=dev" >> "$GITHUB_ENV"
-            echo "EXTRACTOR_REF=main" >> "$GITHUB_ENV"
+            echo "CLIENT_REF=${{ needs.check-upstream.outputs.client_sha }}" >> "$GITHUB_ENV"
+            echo "EXTRACTOR_REF=${{ needs.check-upstream.outputs.extractor_sha }}" >> "$GITHUB_ENV"
           else
             echo "CLIENT_REF=${{ github.event.inputs.client_ref }}" >> "$GITHUB_ENV"
             echo "EXTRACTOR_REF=${{ github.event.inputs.extractor_ref }}" >> "$GITHUB_ENV"
@@ -97,6 +138,16 @@ jobs:
           files: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record the built upstream state (scheduled builds only)
+        if: github.event_name == 'schedule'
+        run: |
+          printf 'client=%s\nextractor=%s\n' "$CLIENT_REF" "$EXTRACTOR_REF" > .upstream-state
+          git config user.name "bisub-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add .upstream-state
+          git commit -m "Track upstream client ${CLIENT_REF:0:10} extractor ${EXTRACTOR_REF:0:10}"
+          git push
 
   report-failure:
     needs: build
