@@ -139,14 +139,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Record the built upstream state (scheduled builds only)
-        if: github.event_name == 'schedule'
+  # Records the upstream SHAs a scheduled run attempted - on success AND
+  # on failure. Without the failure case, a broken build (e.g. a patch
+  # conflict after an upstream refactor) never writes the state, every
+  # probe keeps seeing "upstream moved", and the same failing build
+  # re-runs every two hours forever. Recording the attempt stops the
+  # retries; the next actual upstream movement re-triggers the build.
+  record-state:
+    needs: build
+    if: always() && github.event_name == 'schedule' && !cancelled()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this patch project
+        uses: actions/checkout@v6
+
+      - name: Record the attempted upstream state
         run: |
-          printf 'client=%s\nextractor=%s\n' "$CLIENT_REF" "$EXTRACTOR_REF" > .upstream-state
+          printf 'client=%s\nextractor=%s\n' "${{ needs.check-upstream.outputs.client_sha }}" "${{ needs.check-upstream.outputs.extractor_sha }}" > .upstream-state
           git config user.name "bisub-bot"
           git config user.email "bot@users.noreply.github.com"
           git add .upstream-state
-          git commit -m "Track upstream client ${CLIENT_REF:0:10} extractor ${EXTRACTOR_REF:0:10}"
+          git commit -m "Track upstream client ${{ needs.check-upstream.outputs.client_sha }} extractor ${{ needs.check-upstream.outputs.extractor_sha }}"
           git push
 
   report-failure:
