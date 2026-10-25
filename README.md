@@ -1,72 +1,109 @@
-# PipePipe Bisub — LLM 双语字幕补丁工程
+# BiPipe — 双语字幕视频播放器
 
-给 [PipePipe](https://github.com/InfinityLoop1308/PipePipe)（NewPipe 知名分支）加上「LLM 实时翻译双语字幕」的 patch 集合。
+基于 [PipePipe](https://github.com/InfinityLoop1308/PipePipe)（NewPipe 分支）的 Android 客户端，叠加双语字幕翻译、点词查词、生词本、云备份等语言学习功能。
 
-不 fork、不长期维护整个项目——只维护最小的补丁集，可手动/定期跟随上游重新构建。上游失效时自动收到 issue 通知。
-
-迁移自 [NewPipe-Bisub](../NewPipe-Bisub)（bisub-28 终态），基线 **PipePipe v5.5.0-beta3**。NewPipe 版的 UI 精简 patch（隐藏非 YouTube 服务、删 kiosk/捐赠）**未迁移**——PipePipe 原生多平台 UI 全部保留。
+不 fork 上游、不长期维护整个项目——只维护 **51 个 client patch + 4 个 extractor patch**，通过 CI 自动应用到上游源码并构建 APK。
 
 ## 功能
 
-- 详情页「双语」按钮手动触发：将字幕轨（默认英文，优先人工字幕）通过你配置的大模型批量翻译，实时显示进度百分比
-- 译文完成后字幕菜单出现 **Bilingual（双语）** 轨，选中后由自绘 `BisubSubtitleView` 渲染「原文 + 译文」双层字幕（不依赖系统字幕设置，鸿蒙可用）
-- 应用内样式编辑器：字幕大小、文字颜色、背景模式（半透明/纯黑/透明描边）、内边距、圆角、最大宽度、垂直位置，所见即所得预览
-- 译文按视频 + 字幕轨 + 模型 + 目标语言缓存，第二次观看零等待
-- 支持任何 OpenAI 兼容接口：OpenAI / DeepSeek / Moonshot (Kimi) / 智谱 GLM / OpenRouter / 自定义
+### 双语字幕翻译
+- 详情页「双语」按钮一键触发，将字幕轨通过大模型批量翻译，实时显示进度
+- 译文完成后字幕菜单出现双语轨，自绘渲染「原文 + 译文」双层字幕（不依赖系统字幕设置）
+- 应用内样式编辑器：字幕大小、颜色、背景模式、内边距、圆角、最大宽度、垂直位置，所见即所得预览
+- 译文按视频 + 字幕轨 + 模型 + 目标语言缓存，二次观看零等待
+- 多翻译 profile 随时切换，已缓存的翻译在字幕菜单直接选
+- 翻译引擎：OpenAI / DeepSeek / Moonshot (Kimi) / 智谱 GLM / OpenRouter / 百度 / 小牛 / Google / Microsoft / DeepL / LibreTranslate / 自定义
 
-## Patch 清单
+### 点词查词
+- 播放时点按字幕中的单词弹出词典释义（有道词典 / 微软免费翻译）
+- 释义含音标（可点击播放发音）、考试标签、词形变化、网络释义
+- 播放器内深色半透明磨砂弹窗，不遮挡视频
+- 查词时静默暂停播放（不唤起控制层），关闭弹窗自动恢复
 
-| # | 内容 |
-|---|---|
-| 0001 | bisub 包：流式翻译管线（BisubManager/VttParser/SubtitleTranslator/BisubPrefs/BisubStyle/BisubSubtitleView） |
-| 0002 | 设置页 + 应用内样式编辑器（含中文字符串） |
-| 0003 | VideoPlaybackResolver 注入双语轨（完成态缓存只读） |
-| 0004 | 详情页双语按钮（默认 + layout-large-land 两个布局变体） |
-| 0005 | 播放器接线：player.xml 叠加自绘 View，onCues 双喂，选轨时切换渲染层 |
+### 生词本 + 墨墨背单词同步
+- 查词弹窗一键加入生词本，本地缓存释义（离线可查）
+- 生词本卡片页：单词 + 音标 + 释义预览 + 日期
+- 批量多选删除 / 同步
+- 一键同步到墨墨背单词云词本（`//` 前缀自动还原原形：looked → look）
+- 未同步筛选 + 懒加载
 
-## 与 NewPipe 版的实现差异（PipePipe 重构适配）
+### 学习中心
+- 设置一级入口：双语阅读书架 + 生词本
+- 阅读书架：收藏的双语字幕缓存，点击进入双语对照阅读页
+- 三种阅读模式：双语对照 / 仅原文 / 仅译文
+- 缓存自动清理（可配置阈值，阅读书架中的永不清）
 
-- PipePipe 把播放器拆成了 Kotlin controller：渲染接线在 `PlayerLayoutController.onCues/reapplyCues`（双喂）与 `PlayerTracksController.applyBisubStyleIfSelected`（选轨判定 + 视图切换），NewPipe 版的 `VideoPlayerUi.java` 单文件接线不复存在
-- `setupSubtitleView()` 拆出无副作用的 `setupSubtitleViewStyle()`，避免 else 分支重入选轨逻辑造成递归
-- `BisubManager` 内联字幕候选过滤（PipePipe 的 `ListHelper` 无 `getUrlAndNonTorrentStreams`）
+### 云备份
+- 支持 WebDAV（坚果云 / Nextcloud / 群晖 / AList 等）和 S3 系（AWS / R2 / B2 / MinIO / Storj 等）
+- 自动定时备份 + 保留份数自动清理
+- 备份内容：数据库 + 所有设置 + 翻译缓存 + 生词本 + 阅读书架 + 云配置
+- 恢复后自动重连云备份
 
-## 配置方法
+### 其他
+- BiPipe 品牌化：自定义图标 + 启动屏 + 关于页
+- YouTube 评论时间戳转弹幕（普通视频也能有弹幕）
+- Sleep timer Toast 反馈
+- 调试日志系统（`adb logcat -s Bisub`）
+- 仅保留 YouTube / BiliBili / NicoNico 三个服务
 
-PipePipe 设置 → **Bilingual subtitles**：
+## 下载安装
 
-| 设置项 | 说明 |
-|---|---|
-| Enable | 总开关 |
-| Provider | 提供商预设，选择后自动填充 URL 和模型名 |
-| API base URL | OpenAI 兼容接口地址，如 `https://api.deepseek.com/v1` |
-| API key | 密钥，摘要只显示「Set / Not set」 |
-| Model | 模型名，如 `deepseek-chat` |
-| Target language | 译文语言，默认 `Simplified Chinese` |
-| Source subtitle language | 源字幕轨语言码，默认 `en`；留空则用第一条可用轨 |
+从 [Releases](../../releases) 页下载最新 APK，直接安装。
+
+支持架构：arm64-v8a / armeabi-v7a / x86 / x86_64
+
+## 配置
+
+### 翻译引擎
+设置 → 双语字幕 → Translation profile：
+- 选择 Provider（如 DeepSeek），填入 API base URL、API key、Model
+- 可创建多个 profile 随时切换
+- 免费引擎（Google / Microsoft）零配置即可使用
+
+### 点词查词
+设置 → 双语字幕 → 点词查词：
+- 词典提供商：有道词典（默认）/ 微软翻译
+- 查词时暂停视频：默认开
+
+### 云备份
+设置 → 备份与恢复 → 云备份：
+- 选择后端（WebDAV / S3），填入服务器地址和凭证
+- 设置自动备份频率和保留份数
+
+### 墨墨背单词同步
+生词本页顶部「墨墨背单词开放 API」按钮：
+- 获取 token：墨墨 App → 我的 → 更多设置 → 实验功能 → 开放 API
+- 同步后生词本中的词自动加 `//` 前缀，墨墨会还原原形
+
+## 架构
+
+```
+patches/              51 个 client patch（0001-0051）
+patches-extractor/    4 个 extractor patch（0001-0004）
+.github/workflows/    CI 构建工作流
+.upstream-state       上游 SHA 记录
+build.sh              本地构建脚本
+```
+
+CI 流程：clone 上游 PipePipeClient + PipePipeExtractor → `git am` 应用所有 patch → `./gradlew assembleDebug` → 发布 Release
+
+上游基线：PipePipe v5.5.0（client dev `b91f008fb` + extractor main `1a09d20e`）
 
 ## 本地构建
 
 ```bash
-./build.sh                # 基线 client b7cd5a34c + extractor 73442076 构建
-./build.sh dev main       # 跟随上游 dev/main
-./build.sh dev main --keep-source   # 保留源码目录以便调试
+./build.sh                           # 默认基线构建
+./build.sh dev main                  # 跟随上游 dev/main
+./build.sh dev main --keep-source    # 保留源码目录以便调试
 ```
 
-要求：git、JDK 25、Android SDK（`ANDROID_HOME` 环境变量或 `local.properties`）。
+要求：git、JDK 25、Android SDK
 
-注意：PipePipeClient 的 `settings.gradle` 含 `includeBuild('../PipePipeExtractor')`，脚本会把两个上游仓**并排** clone 到 `src/` 下原名目录。
+## 致谢
 
-产物：`src/PipePipeClient/app/build/outputs/apk/debug/*.apk`
+- [PipePipe](https://github.com/InfinityLoop1308/PipePipe) — NewPipe 分支，反检测优化
+- [NewPipe](https://github.com/TeamNewPipe/NewPipe) — 原始项目
 
-## GitHub Actions 自动构建
+## 许可证
 
-- 手动触发（workflow_dispatch）：可指定 client/extractor ref，默认基线 v5.5.0-beta3
-- 每周一 04:00 UTC 自动跟随上游 `dev` / `main` 重建
-- 构建成功 → 自动创建 `bisub-<run_number>` release 并附带 APK
-- patch 无法应用或编译失败 → 自动开 issue 提醒
-
-## 维护守则（给未来的自己）
-
-- 上游重构 player controller 时，0005 最容易碎：先看 `PlayerTracksController.onTextTracksChanged` 的选轨判定是否还能拿到回调参数 `Tracks` 快照
-- 选轨语言判定必须 `equalsIgnoreCase`（ExoPlayer 会把语言码规范化成小写，实锤教训）
-- 一次 patch 失败后先用 `git am --abort` 清理再改 patch，不要在 CI 里硬续
+[GPL-3.0](LICENSE) — 继承自 PipePipe / NewPipe
