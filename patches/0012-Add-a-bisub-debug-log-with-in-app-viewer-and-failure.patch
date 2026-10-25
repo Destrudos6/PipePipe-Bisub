@@ -1,7 +1,7 @@
-From c5cf4daefad5047c3d1697ceebf0e6b52e4a44f9 Mon Sep 17 00:00:00 2001
+From 37e396734ac23c1ba2d6c40dfec7e0ce11973022 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 16:56:06 +0800
-Subject: [PATCH 12/12] Add a bisub debug log with in-app viewer and failure
+Subject: [PATCH 12/51] Add a bisub debug log with in-app viewer and failure
  dumps
 
 Every pipeline stage now records into a 2000-entry in-memory ring
@@ -704,7 +704,7 @@ index 89a6def76..064e3097d 100644
       * Loads the cache entries on a background thread and shows the list
       * dialog on the UI thread.
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 23b4e847f..0cb453f07 100644
+index c6eea11df..3735e411a 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1291,4 +1291,12 @@
@@ -721,10 +721,10 @@ index 23b4e847f..0cb453f07 100644
 +    <string name="bisub_debug_log_cleared">调试日志已清空</string>
  </resources>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index bc7f390f6..4f5fd6c90 100644
+index 82d0314c7..b84e9b88c 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1899,6 +1899,7 @@
+@@ -1901,6 +1901,7 @@
      <string name="bisub_test_connection_key">bisub_test_connection</string>
      <string name="bisub_caption_style_key">bisub_caption_style</string>
      <string name="bisub_cached_list_key">bisub_cached_list</string>
@@ -733,10 +733,10 @@ index bc7f390f6..4f5fd6c90 100644
      <string name="bisub_style_text_color_key">bisub_style_text_color</string>
      <string name="bisub_style_background_key">bisub_style_background</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 47900259d..288f45414 100644
+index 8cf721799..40919f6fc 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1295,4 +1295,12 @@
+@@ -1296,5 +1296,13 @@
      <string name="bisub_cached_delete_message">The bilingual subtitle file will be removed and translated again the next time you request it.</string>
      <string name="bisub_cached_deleted">Deleted</string>
      <string name="bisub_cached_delete_failed">Could not delete the file</string>
@@ -749,6 +749,7 @@ index 47900259d..288f45414 100644
 +    <string name="bisub_debug_log_copied">Debug log copied to the clipboard</string>
 +    <string name="bisub_debug_log_cleared">Debug log cleared</string>
  </resources>
+ 
 diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
 index 8959366ca..f3bec8e1d 100644
 --- a/app/src/main/res/xml/bisub_settings.xml

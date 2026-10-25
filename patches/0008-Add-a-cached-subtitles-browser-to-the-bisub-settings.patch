@@ -1,7 +1,7 @@
-From 5a7ef49f491d52e46d533613231b14a25ed3fc56 Mon Sep 17 00:00:00 2001
+From 180fc09fe60d1d24ebbd6316ff6316f091908a49 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 12:45:02 +0800
-Subject: [PATCH 08/12] Add a cached-subtitles browser to the bisub settings
+Subject: [PATCH 08/51] Add a cached-subtitles browser to the bisub settings
 
 Every finished translation now writes a .meta sidecar next to its
 cache file, recording the video title and id, source and target
@@ -561,7 +561,7 @@ index 9fe2ea935..e49f337ad 100644
       * Text colors offered in the style editor, in the same order as the
       * radio buttons in {@code dialog_bisub_style.xml}.
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index b62266345..518c11031 100644
+index 5277f6e43..6a12cc7cf 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1263,4 +1263,14 @@
@@ -580,10 +580,10 @@ index b62266345..518c11031 100644
 +    <string name="bisub_cached_delete_failed">删除失败</string>
  </resources>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index f705fb8be..a249b514d 100644
+index 1aa52a5c4..d40f056c7 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1895,6 +1895,7 @@
+@@ -1897,6 +1897,7 @@
      <string name="bisub_batch_size_key">bisub_batch_size</string>
      <string name="bisub_test_connection_key">bisub_test_connection</string>
      <string name="bisub_caption_style_key">bisub_caption_style</string>
@@ -592,10 +592,10 @@ index f705fb8be..a249b514d 100644
      <string name="bisub_style_text_color_key">bisub_style_text_color</string>
      <string name="bisub_style_background_key">bisub_style_background</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 817331631..298fb0643 100644
+index 92622ae7d..e51a634f0 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1268,4 +1268,14 @@
+@@ -1269,5 +1269,15 @@
      <string name="bisub_button_failed">Retry</string>
      <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
      <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
@@ -610,6 +610,7 @@ index 817331631..298fb0643 100644
 +    <string name="bisub_cached_deleted">Deleted</string>
 +    <string name="bisub_cached_delete_failed">Could not delete the file</string>
  </resources>
+ 
 diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
 index f026289d7..afffeedf7 100644
 --- a/app/src/main/res/xml/bisub_settings.xml

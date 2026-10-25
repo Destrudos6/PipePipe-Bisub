@@ -1,7 +1,7 @@
-From 4fa7b1f9cabf85b5299259e35b602848c45f7209 Mon Sep 17 00:00:00 2001
+From eff02c89fe113b6f08ea7bbf20cafb1103376a7b Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 19:01:38 +0800
-Subject: [PATCH 14/14] Replace the fixed background modes with an opacity
+Subject: [PATCH 14/51] Replace the fixed background modes with an opacity
  slider and add original-text dimming
 
 The style editor used to offer three fixed background modes
@@ -486,7 +486,7 @@ index a256c9ac3..92e6e12c7 100644
              android:layout_width="match_parent"
              android:layout_height="wrap_content"
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 0cb453f07..a86424f06 100644
+index 3735e411a..1b9b3f458 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1231,13 +1231,13 @@
@@ -519,10 +519,10 @@ index 0cb453f07..a86424f06 100644
      <string name="bisub_style_preview_translation">史上最难的题</string>
      <string name="bisub_button_starting">准备中…</string>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 4f5fd6c90..6b80351ce 100644
+index b84e9b88c..f7d7a40a9 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1903,10 +1903,12 @@
+@@ -1905,10 +1905,12 @@
      <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
      <string name="bisub_style_text_color_key">bisub_style_text_color</string>
      <string name="bisub_style_background_key">bisub_style_background</string>
@@ -536,10 +536,10 @@ index 4f5fd6c90..6b80351ce 100644
      <string-array name="bisub_provider_values">
          <item>custom</item>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 288f45414..fe9362759 100644
+index 40919f6fc..a1b0a4d2e 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1234,13 +1234,12 @@
+@@ -1235,13 +1235,12 @@
      <string name="bisub_provider_libre">LibreTranslate (self-hosted)</string>
      <string name="bisub_base_url_title">API base URL</string>
      <string name="bisub_base_url_summary">OpenAI-compatible endpoint, e.g. https://api.deepseek.com/v1</string>
@@ -554,7 +554,7 @@ index 288f45414..fe9362759 100644
      <string name="bisub_target_lang_title">Target language</string>
      <string name="bisub_target_lang_summary">Language to translate subtitles into, e.g. Simplified Chinese</string>
      <string name="bisub_source_lang_title">Source subtitle language</string>
-@@ -1272,9 +1271,10 @@
+@@ -1273,9 +1272,10 @@
      <string name="bisub_style_corner_radius">Corner radius</string>
      <string name="bisub_style_max_width">Maximum text width</string>
      <string name="bisub_style_position">Vertical position</string>

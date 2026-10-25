@@ -1,0 +1,204 @@
+From a83ba58d5d2fa49973924784f64f87848483f8c7 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Thu, 22 Oct 2026 12:57:51 +0800
+Subject: [PATCH 3/4] Show timestamped comments as bullet comments on YouTube
+
+The YouTube bullet comments only ever worked for streams with a live
+chat or a chat replay: every regular video was reported as disabled
+in onFetchPage, so the bullet comments layer stayed empty and the
+toggle appeared to do nothing (BiliBili works through its own real
+bullet comment API).
+
+Regular videos now fall back to timestamped comments: the comment
+section is scanned (up to twenty pages) and every comment quoting a
+video position - like "0:23 best part" - becomes a bullet comment
+at that position, one per quoted timestamp. The fallback reports
+itself as not live, so the player filters the fixed list by the
+play position like it does for recorded BiliBili videos; streams
+with a chat replay keep the original behaviour.
+---
+ .../YoutubeBulletCommentsExtractor.java       | 120 +++++++++++++++++-
+ 1 file changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/extractor/src/main/java/org/schabi/newpipe/extractor/services/youtube/extractors/YoutubeBulletCommentsExtractor.java b/extractor/src/main/java/org/schabi/newpipe/extractor/services/youtube/extractors/YoutubeBulletCommentsExtractor.java
+index 712265d9..8b525605 100644
+--- a/extractor/src/main/java/org/schabi/newpipe/extractor/services/youtube/extractors/YoutubeBulletCommentsExtractor.java
++++ b/extractor/src/main/java/org/schabi/newpipe/extractor/services/youtube/extractors/YoutubeBulletCommentsExtractor.java
+@@ -11,9 +11,12 @@ import com.grack.nanojson.JsonWriter;
+ 
+ import org.schabi.newpipe.extractor.Page;
+ import org.schabi.newpipe.extractor.StreamingService;
++import org.schabi.newpipe.extractor.ListExtractor.InfoItemsPage;
+ import org.schabi.newpipe.extractor.bulletComments.BulletCommentsExtractor;
+ import org.schabi.newpipe.extractor.bulletComments.BulletCommentsInfoItem;
+ import org.schabi.newpipe.extractor.bulletComments.BulletCommentsInfoItemsCollector;
++import org.schabi.newpipe.extractor.comments.CommentsExtractor;
++import org.schabi.newpipe.extractor.comments.CommentsInfoItem;
+ import org.schabi.newpipe.extractor.downloader.Downloader;
+ import org.schabi.newpipe.extractor.exceptions.ExtractionException;
+ import org.schabi.newpipe.extractor.exceptions.ParsingException;
+@@ -25,9 +28,12 @@ import org.schabi.newpipe.extractor.services.youtube.YoutubeBulletCommentPair;
+ import org.schabi.newpipe.extractor.stream.StreamType;
+ 
+ import java.io.IOException;
++import java.time.Duration;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.concurrent.*;
++import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+ import javax.annotation.Nonnull;
+@@ -47,6 +53,33 @@ public class YoutubeBulletCommentsExtractor extends BulletCommentsExtractor {
+     private long lastPlayPosition = 0;
+     private final boolean isLiveStream;
+     private final long startTime;
++
++    /**
++     * Set when the video has neither a live chat nor a live chat replay:
++     * instead of reporting the bullet comments as unavailable, the video
++     * falls back to timestamped comments - regular comments that quote a
++     * position of the video (like "0:23 best part") are shown as bullet
++     * comments at that position, mirroring how viewers of services
++     * without a live chat still mark moments worth watching.
++     */
++    private boolean commentFallback = false;
++
++    /**
++     * The comments of one page are fetched per request; popular videos
++     * have tens of thousands of them, so the fallback scans only a
++     * reasonable prefix of the comment section.
++     */
++    private static final int MAX_COMMENT_PAGES = 20;
++
++    /**
++     * Timestamps quoted in comments, either {@code m:ss} or
++     * {@code h:mm:ss}. The lookarounds keep numbers embedded in longer
++     * digit runs (ids, dates) from matching.
++     */
++    private static final Pattern COMMENT_TIMESTAMP =
++            Pattern.compile("(?<!\\d)(\\d{1,3}:\\d{1,2}:\\d{2}|\\d{1,4}:\\d{2})(?!\\d)");
++
++    private List<BulletCommentsInfoItem> commentItems = new ArrayList<>();
+     private final String[] continuationKeyTexts = new String[]{
+             "timedContinuationData", "invalidationContinuationData"
+ //           , "playerSeekContinuationData" , "liveChatReplayContinuationData"
+@@ -73,7 +106,9 @@ public class YoutubeBulletCommentsExtractor extends BulletCommentsExtractor {
+     public void onFetchPage(@Nonnull Downloader downloader) throws IOException, ExtractionException {
+         String response = downloader.get(getUrl()).responseBody();
+         if(response.contains("Live chat replay is not available") || response.contains("is disabled") || (!shoudldBeLive && !isLiveStream) ) {
+-            disabled = true;
++            // No live chat and no chat replay: fall back to timestamped
++            // comments instead of silently showing nothing.
++            commentFallback = true;
+             return ;
+         }
+         try {
+@@ -176,6 +211,10 @@ public class YoutubeBulletCommentsExtractor extends BulletCommentsExtractor {
+     @Nonnull
+     @Override
+     public InfoItemsPage<BulletCommentsInfoItem> getInitialPage() throws IOException, ExtractionException {
++        if (commentFallback) {
++            collectTimestampedComments();
++            return new InfoItemsPage<>(commentItems, null, Collections.emptyList());
++        }
+         if(isDisabled()){
+             return null;
+         }
+@@ -184,6 +223,80 @@ public class YoutubeBulletCommentsExtractor extends BulletCommentsExtractor {
+         return null;
+     }
+ 
++    /**
++     * Scans the beginning of the comment section and turns every comment
++     * that quotes a video position into bullet comments at that position.
++     * A comment quoting several positions becomes one bullet comment per
++     * position. Comments without a timestamp are skipped, so the bullet
++     * comment layer stays sparse and meaningful.
++     *
++     * @throws IOException      when the comments cannot be fetched
++     * @throws ExtractionException when the comments cannot be extracted
++     */
++    private void collectTimestampedComments() throws IOException, ExtractionException {
++        final CommentsExtractor commentsExtractor = getService().getCommentsExtractor(getUrl());
++        if (commentsExtractor == null) {
++            return;
++        }
++        String streamUrl;
++        try {
++            streamUrl = getUrl();
++        } catch (final ParsingException e) {
++            return;
++        }
++        commentsExtractor.fetchPage();
++        InfoItemsPage<CommentsInfoItem> page = commentsExtractor.getInitialPage();
++        int pagesScanned = 0;
++        while (page != null && page.getItems() != null && pagesScanned < MAX_COMMENT_PAGES) {
++            for (final CommentsInfoItem comment : page.getItems()) {
++                commitTimestampedItems(comment, streamUrl);
++            }
++            pagesScanned++;
++            if (page.getNextPage() == null) {
++                break;
++            }
++            page = commentsExtractor.getPage(page.getNextPage());
++        }
++        Collections.sort(commentItems);
++    }
++
++    /**
++     * Parses the timestamps quoted in one comment and appends a bullet
++     * comment item for each of them.
++     *
++     * @param comment the comment to parse
++     * @param streamUrl the url of the video, for the item url field
++     */
++    private void commitTimestampedItems(final CommentsInfoItem comment, final String streamUrl) {
++        final String text = comment.getCommentText() == null
++                ? null : comment.getCommentText().getContent();
++        if (text == null || text.isEmpty()) {
++            return;
++        }
++        final Matcher matcher = COMMENT_TIMESTAMP.matcher(text);
++        while (matcher.find()) {
++            final String[] parts = matcher.group(1).split(":");
++            long seconds;
++            try {
++                if (parts.length == 3) {
++                    seconds = Long.parseLong(parts[0]) * 3600L
++                            + Long.parseLong(parts[1]) * 60L + Long.parseLong(parts[2]);
++                } else {
++                    seconds = Long.parseLong(parts[0]) * 60L + Long.parseLong(parts[1]);
++                }
++            } catch (final NumberFormatException e) {
++                continue;
++            }
++            final BulletCommentsInfoItem item = new BulletCommentsInfoItem(
++                    getServiceId(), streamUrl, "Comment");
++            item.setCommentText(text);
++            item.setAuthorName(comment.getUploaderName());
++            item.setDuration(Duration.ofSeconds(seconds));
++            item.setPosition(BulletCommentsInfoItem.Position.REGULAR);
++            commentItems.add(item);
++        }
++    }
++
+     @Override
+     public InfoItemsPage<BulletCommentsInfoItem> getPage(Page page) throws IOException, ExtractionException {
+         return null;
+@@ -191,7 +304,10 @@ public class YoutubeBulletCommentsExtractor extends BulletCommentsExtractor {
+ 
+     @Override
+     public boolean isLive() {
+-        return true;
++        // The timestamped-comment fallback behaves like a recorded stream:
++        // the player filters a fixed list by play position instead of
++        // pulling live messages.
++        return !commentFallback;
+     }
+ 
+     @Override
+-- 
+2.54.0.windows.1
+

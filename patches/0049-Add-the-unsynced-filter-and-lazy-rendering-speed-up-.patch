@@ -1,0 +1,403 @@
+From 068b0ed0316252cd0f691f18f74e3e4834dbeafe Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Fri, 23 Oct 2026 17:15:09 +0800
+Subject: [PATCH 49/51] Add the unsynced filter and lazy rendering, speed up
+ backups, drop the Debug suffix
+
+The word book's top bar gained an "Unsynced" checkbox: with it on,
+the list shows only the words that have not reached Maimemo yet, and
+the bar also carries a live count of them (tappable as a shortcut for
+the filter). The list itself now renders lazily - one page of 60
+cards at a time, the next page appended when the list nears its
+rendered end - so a book of thousands of words binds only what is on
+screen. Full-book operations (sync all, select all) still cover every
+word, rendered or not.
+
+Backups are written with maximum DEFLATE effort now: the database
+and the subtitle cache are highly redundant, and the upload to
+WebDAV/S3 is bounded by the archive size, so the extra compression
+directly shortens the backup wait (measured against synthetic data:
+the default level already compresses well, the top level trims a
+little more at negligible CPU cost).
+
+The debug launcher label is now plain "BiPipe" - the debug suffix
+was a leftover of the NewPipe upstream convention.
+---
+ app/build.gradle                              |   2 +-
+ .../settings/ContentSettingsManager.kt        |   7 +
+ .../newpipe/settings/WordBookFragment.java    | 129 ++++++++++++++----
+ .../main/res/layout/fragment_word_book.xml    |  23 +++-
+ app/src/main/res/values-zh-rCN/strings.xml    |   2 +
+ app/src/main/res/values-zh-rTW/strings.xml    |   2 +
+ app/src/main/res/values/strings.xml           |   2 +
+ 7 files changed, 136 insertions(+), 31 deletions(-)
+
+diff --git a/app/build.gradle b/app/build.gradle
+index 7b2936e01..772744866 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -66,7 +66,7 @@ android {
+             if (true) {
+                 // default values when branch name could not be determined or is master or dev
+                 applicationIdSuffix ".debug"
+-                resValue "string", "app_name", "BiPipe Debug"
++                resValue "string", "app_name", "BiPipe"
+             } else {
+                 applicationIdSuffix ".debug." + normalizedWorkingBranch
+                 resValue "string", "app_name", "BiPipe " + workingBranch
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt b/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
+index 4234de465..c413eec08 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
++++ b/app/src/main/java/org/schabi/newpipe/settings/ContentSettingsManager.kt
+@@ -15,6 +15,7 @@ import java.io.IOException
+ import java.io.ObjectInputStream
+ import java.io.ObjectOutputStream
+ import java.io.OutputStream
++import java.util.zip.Deflater
+ import java.util.zip.ZipEntry
+ import java.util.zip.ZipInputStream
+ import java.util.zip.ZipOutputStream
+@@ -50,6 +51,12 @@ class ContentSettingsManager(private val fileLocator: NewPipeFileLocator) {
+     fun exportDatabase(preferences: SharedPreferences, output: OutputStream) {
+         ZipOutputStream(BufferedOutputStream(output))
+             .use { outZip ->
++                // Maximum DEFLATE effort: the database and the subtitle
++                // cache are highly redundant (repeated page headers,
++                // subtitle line patterns), so a higher level measurably
++                // shrinks the backup - which is what a WebDAV/S3 upload
++                // is bounded by.
++                outZip.setLevel(Deflater.BEST_COMPRESSION)
+                 ZipHelper.addFileToZip(outZip, fileLocator.db.path, "newpipe.db")
+ 
+                 try {
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+index 98755158b..1ce2622ab 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+@@ -67,6 +67,7 @@ public final class WordBookFragment extends Fragment {
+     private View normalBar;
+     private View selectionBar;
+     private TextView selectionCountView;
++    private TextView unsyncedHint;
+     private Button maimemoEntry;
+     private Button syncButton;
+     private final WordBookAdapter adapter = new WordBookAdapter();
+@@ -76,6 +77,11 @@ public final class WordBookFragment extends Fragment {
+     private boolean selectionMode;
+     /** The selected words of the multi-select mode. */
+     private final Set<String> selectedWords = new HashSet<>();
++    /** Whether the unsynced-only filter is on. */
++    private boolean filterUnsynced;
++    /** Every card of the book (before the filter), kept so toggling the
++     *  filter does not re-read storage. */
++    private final List<WordCard> allCards = new ArrayList<>();
+ 
+     @Nullable
+     @Override
+@@ -91,8 +97,30 @@ public final class WordBookFragment extends Fragment {
+         selectionCountView = root.findViewById(R.id.word_book_selection_count);
+         maimemoEntry = root.findViewById(R.id.word_book_maimemo_entry);
+         syncButton = root.findViewById(R.id.word_book_sync_button);
++        final CheckBox unsyncedFilter =
++                root.findViewById(R.id.word_book_unsynced_filter);
++        unsyncedHint = root.findViewById(R.id.word_book_unsynced_hint);
+         recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
+         recyclerView.setAdapter(adapter);
++        // Lazy rendering: append another page when the list nears its end.
++        recyclerView.addOnScrollListener(new RecyclerView.OnScrollListener() {
++            @Override
++            public void onScrolled(@NonNull final RecyclerView rv,
++                                   final int dx, final int dy) {
++                if (dy <= 0) {
++                    return;
++                }
++                final LinearLayoutManager manager =
++                        (LinearLayoutManager) rv.getLayoutManager();
++                if (manager == null) {
++                    return;
++                }
++                if (manager.findLastVisibleItemPosition()
++                        >= adapter.getItemCount() - 8) {
++                    adapter.loadMore();
++                }
++            }
++        });
+ 
+         // Token entry: tapping opens the dialog only while unset (a set
+         // token cannot be bumped by accident); long-press always opens
+@@ -107,6 +135,12 @@ public final class WordBookFragment extends Fragment {
+             return true;
+         });
+         syncButton.setOnClickListener(v -> syncToMaimemo(unsyncedWords()));
++        unsyncedFilter.setOnCheckedChangeListener((buttonView, isChecked) -> {
++            filterUnsynced = isChecked;
++            applyFilter();
++        });
++        unsyncedHint.setOnClickListener(v ->
++                unsyncedFilter.setChecked(!filterUnsynced));
+ 
+         root.findViewById(R.id.word_book_selection_all).setOnClickListener(
+                 v -> selectAll());
+@@ -150,17 +184,33 @@ public final class WordBookFragment extends Fragment {
+                 if (getActivity() == null) {
+                     return;
+                 }
+-                adapter.setCards(cards);
+-                final boolean empty = cards.isEmpty();
+-                emptyView.setVisibility(empty ? View.VISIBLE : View.GONE);
+-                recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
+-                refreshBars();
++                allCards.clear();
++                allCards.addAll(cards);
++                applyFilter();
+             });
+         }).start();
+     }
+ 
+     /**
+-     * Updates the top bars and the sync button state.
++     * Applies the unsynced-only filter to {@link #allCards} and hands the
++     * result to the adapter (which renders it lazily, page by page).
++     */
++    private void applyFilter() {
++        final List<WordCard> visible = new ArrayList<>();
++        for (final WordCard card : allCards) {
++            if (!filterUnsynced || !card.synced) {
++                visible.add(card);
++            }
++        }
++        adapter.setCards(visible);
++        final boolean empty = visible.isEmpty();
++        emptyView.setVisibility(empty ? View.VISIBLE : View.GONE);
++        recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
++        refreshBars();
++    }
++
++    /**
++     * Updates the top bars, the unsynced counter and the sync button.
+      */
+     private void refreshBars() {
+         normalBar.setVisibility(selectionMode ? View.GONE : View.VISIBLE);
+@@ -169,6 +219,15 @@ public final class WordBookFragment extends Fragment {
+             selectionCountView.setText(getString(
+                     R.string.bisub_word_book_selection_count, selectedWords.size()));
+         }
++        int unsyncedCount = 0;
++        for (final WordCard card : adapter.all) {
++            if (!card.synced) {
++                unsyncedCount++;
++            }
++        }
++        unsyncedHint.setText(unsyncedCount > 0
++                ? getString(R.string.bisub_word_book_unsynced_count, unsyncedCount)
++                : "");
+         final Context context = getContext();
+         final boolean tokenSet =
+                 context != null && MaimemoClient.token(context) != null;
+@@ -177,19 +236,18 @@ public final class WordBookFragment extends Fragment {
+         maimemoEntry.setText(tokenSet
+                 ? R.string.bisub_maimemo_entry_connected
+                 : R.string.bisub_maimemo_entry);
+-        final boolean allSynced = adapter.allSynced();
+-        syncButton.setEnabled(tokenSet && !syncing && !allSynced
+-                && adapter.getItemCount() > 0);
++        syncButton.setEnabled(tokenSet && !syncing && unsyncedCount > 0
++                && adapter.all.size() > 0);
+     }
+ 
+     /**
+-     * @return the words that have not been synced to Maimemo yet
++     * @return the words that have not been synced to Maimemo yet (the
++     *         full book, not just the rendered pages)
+      */
+     @NonNull
+     private List<String> unsyncedWords() {
+         final List<String> unsynced = new ArrayList<>();
+-        for (int i = 0; i < adapter.getItemCount(); i++) {
+-            final WordCard card = adapter.cards.get(i);
++        for (final WordCard card : adapter.all) {
+             if (!card.synced) {
+                 unsynced.add(card.word);
+             }
+@@ -240,8 +298,8 @@ public final class WordBookFragment extends Fragment {
+      */
+     private void selectAll() {
+         selectedWords.clear();
+-        for (int i = 0; i < adapter.getItemCount(); i++) {
+-            selectedWords.add(adapter.cards.get(i).word);
++        for (final WordCard card : adapter.all) {
++            selectedWords.add(card.word);
+         }
+         adapter.notifyDataSetChanged();
+         refreshBars();
+@@ -396,23 +454,36 @@ public final class WordBookFragment extends Fragment {
+ 
+     private final class WordBookAdapter
+             extends RecyclerView.Adapter<WordBookHolder> {
+-        private final List<WordCard> cards = new ArrayList<>();
++        /** How many cards a lazily-rendered page holds; the next page is
++         *  appended when the list nears its rendered end. */
++        private static final int PAGE_SIZE = 60;
++
++        /** The full (filtered) list the adapter is showing. */
++        private final List<WordCard> all = new ArrayList<>();
++        /** How much of {@link #all} is currently rendered. */
++        private int rendered = 0;
+ 
+         void setCards(@NonNull final List<WordCard> newCards) {
+-            cards.clear();
+-            cards.addAll(newCards);
++            all.clear();
++            all.addAll(newCards);
++            rendered = Math.min(PAGE_SIZE, all.size());
+             notifyDataSetChanged();
+         }
+ 
+-        boolean allSynced() {
+-            for (final WordCard card : cards) {
+-                if (!card.synced) {
+-                    return false;
+-                }
++        /**
++         * Appends another page of cards, when the list nears its rendered
++         * end.
++         */
++        void loadMore() {
++            if (rendered >= all.size()) {
++                return;
+             }
+-            return true;
++            final int from = rendered;
++            rendered = Math.min(rendered + PAGE_SIZE, all.size());
++            notifyItemRangeInserted(from, rendered - from);
+         }
+ 
++
+         @NonNull
+         @Override
+         public WordBookHolder onCreateViewHolder(@NonNull final ViewGroup parent,
+@@ -424,12 +495,12 @@ public final class WordBookFragment extends Fragment {
+         @Override
+         public void onBindViewHolder(@NonNull final WordBookHolder holder,
+                                      final int position) {
+-            holder.bind(cards.get(position));
++            holder.bind(all.get(position));
+         }
+ 
+         @Override
+         public int getItemCount() {
+-            return cards.size();
++            return rendered;
+         }
+     }
+ 
+@@ -454,10 +525,10 @@ public final class WordBookFragment extends Fragment {
+             // the multi-select mode.
+             itemView.setOnClickListener(view -> {
+                 final int position = getBindingAdapterPosition();
+-                if (position < 0 || position >= adapter.cards.size()) {
++                if (position < 0 || position >= adapter.getItemCount()) {
+                     return;
+                 }
+-                final WordCard card = adapter.cards.get(position);
++                final WordCard card = adapter.all.get(position);
+                 if (selectionMode) {
+                     toggleSelected(card.word);
+                 } else {
+@@ -466,11 +537,11 @@ public final class WordBookFragment extends Fragment {
+             });
+             itemView.setOnLongClickListener(view -> {
+                 final int position = getBindingAdapterPosition();
+-                if (position < 0 || position >= adapter.cards.size()) {
++                if (position < 0 || position >= adapter.getItemCount()) {
+                     return true;
+                 }
+                 if (!selectionMode) {
+-                    enterSelection(adapter.cards.get(position).word);
++                    enterSelection(adapter.all.get(position).word);
+                 }
+                 return true;
+             });
+diff --git a/app/src/main/res/layout/fragment_word_book.xml b/app/src/main/res/layout/fragment_word_book.xml
+index 0971811d1..67e3409fa 100644
+--- a/app/src/main/res/layout/fragment_word_book.xml
++++ b/app/src/main/res/layout/fragment_word_book.xml
+@@ -5,7 +5,8 @@
+     android:orientation="vertical">
+ 
+     <!-- The normal bar: the Maimemo entry on the left (its look follows
+-         the token state), the sync-all button on the right. -->
++         the token state), the unsynced-only filter in the middle, the
++         sync-all button on the right. -->
+     <LinearLayout
+         android:id="@+id/word_book_bar_normal"
+         android:layout_width="match_parent"
+@@ -25,6 +26,26 @@
+             android:text="@string/bisub_maimemo_entry"
+             android:textSize="13sp" />
+ 
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:id="@+id/word_book_unsynced_hint"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:gravity="center_horizontal"
++            android:textColor="?android:attr/textColorSecondary"
++            android:textSize="11sp" />
++
++        <CheckBox
++            android:id="@+id/word_book_unsynced_filter"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:minWidth="0dp"
++            android:minHeight="0dp"
++            android:paddingStart="4dp"
++            android:paddingEnd="4dp"
++            android:text="@string/bisub_word_book_filter_unsynced"
++            android:textSize="12sp" />
++
+         <Button
+             android:id="@+id/word_book_sync_button"
+             style="@style/Base.Widget.AppCompat.Button.Borderless"
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 506672c91..5edba35d6 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1350,6 +1350,8 @@
+     <string name="bisub_word_book_sync_selected">同步</string>
+     <string name="bisub_word_book_selection_done">完成</string>
+     <string name="bisub_word_book_selection_count">已选 %d 个（长按单词进入多选）</string>
++    <string name="bisub_word_book_filter_unsynced">未同步</string>
++    <string name="bisub_word_book_unsynced_count">%d 个未同步</string>
+     <string name="bisub_word_book_delete_selected_confirm">将选中的 %d 个单词从生词本移除？</string>
+     <string name="bisub_word_book_empty">生词本还是空的。\n点字幕上或阅读页里的单词，查释义后加入生词本</string>
+     <string name="bisub_word_book_uncached">首次打开时加载释义</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index aa4b47667..b1a35f7c3 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1256,6 +1256,8 @@
+     <string name="bisub_word_book_sync_selected">同步</string>
+     <string name="bisub_word_book_selection_done">完成</string>
+     <string name="bisub_word_book_selection_count">已選 %d 個（長按單字進入多選）</string>
++    <string name="bisub_word_book_filter_unsynced">未同步</string>
++    <string name="bisub_word_book_unsynced_count">%d 個未同步</string>
+     <string name="bisub_word_book_delete_selected_confirm">將選中的 %d 個單字從生詞本移除？</string>
+     <string name="bisub_word_book_empty">生詞本還是空的。\n點字幕上或閱讀頁裡的單字，查釋義後加入生詞本</string>
+     <string name="bisub_word_book_uncached">首次開啟時載入釋義</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index dbddd16d9..2ac428637 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1355,6 +1355,8 @@
+     <string name="bisub_word_book_sync_selected">Sync</string>
+     <string name="bisub_word_book_selection_done">Done</string>
+     <string name="bisub_word_book_selection_count">%d selected (long-press a word to select)</string>
++    <string name="bisub_word_book_filter_unsynced">Unsynced</string>
++    <string name="bisub_word_book_unsynced_count">%d unsynced</string>
+     <string name="bisub_word_book_delete_selected_confirm">Remove the %d selected word(s) from the word book?</string>
+     <string name="bisub_word_book_empty">The word book is empty.\nTap a word on a subtitle or in the reader to look it up and save it</string>
+     <string name="bisub_word_book_uncached">Definition loads on first open</string>
+-- 
+2.54.0.windows.1
+

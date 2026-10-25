@@ -1,7 +1,7 @@
-From b9646a8d80b9a3591268363c41a8797c5a1b3e12 Mon Sep 17 00:00:00 2001
+From 5b583d3ade3be25ca695310d769e59a372753bdd Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Fri, 23 Oct 2026 16:06:43 +0800
-Subject: [PATCH] Pause silently for the word lookup
+Subject: [PATCH 48/51] Pause silently for the word lookup
 
 Tapping a word paused the video through the regular pause() path,
 and the playback state controller reacts to every PAUSED transition
@@ -45,7 +45,7 @@ index f82ec84d0..adcc3e15e 100644
              stopSpeech();
              if (onDismiss != null) {
 diff --git a/app/src/main/java/org/schabi/newpipe/player/Player.java b/app/src/main/java/org/schabi/newpipe/player/Player.java
-index 5c32859fa..a23f6cff1 100644
+index 99e425174..bdd1a99b6 100644
 --- a/app/src/main/java/org/schabi/newpipe/player/Player.java
 +++ b/app/src/main/java/org/schabi/newpipe/player/Player.java
 @@ -1148,6 +1148,50 @@ public final class Player {

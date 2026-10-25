@@ -1,7 +1,7 @@
-From dba8828ff8d0afd316e5d08d01a98e6f9cc30355 Mon Sep 17 00:00:00 2001
+From 55897c8b68e8f7a3390ab079dfec1fa85be6828e Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 18:52:53 +0800
-Subject: [PATCH 13/14] Hide engine-irrelevant settings fields per provider
+Subject: [PATCH 13/51] Hide engine-irrelevant settings fields per provider
 
 Google and Microsoft need nothing, DeepL needs only its API key and
 LibreTranslate its server address (plus an optional key), so the base

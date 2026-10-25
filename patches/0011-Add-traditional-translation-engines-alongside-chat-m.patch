@@ -1,7 +1,7 @@
-From 3a041a2dc8ec8ffa33fe0ff03a3fa4c27b438bba Mon Sep 17 00:00:00 2001
+From 89cde7eb0aace87d1f93d3111af37cb28c7d6601 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 16:03:32 +0800
-Subject: [PATCH 11/12] Add traditional translation engines alongside chat
+Subject: [PATCH 11/51] Add traditional translation engines alongside chat
  models
 
 Following the engine setup of established open-source subtitle
@@ -1154,7 +1154,7 @@ index 2f86d9966..89a6def76 100644
       * Reads one cached subtitle file on a background thread and opens the
       * viewer with its full text.
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 1aab0e4b3..23b4e847f 100644
+index 1d8251e50..c6eea11df 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1225,13 +1225,19 @@
@@ -1178,10 +1178,10 @@ index 1aab0e4b3..23b4e847f 100644
      <string name="bisub_target_lang_summary">字幕要翻译成的语言，如 Simplified Chinese</string>
      <string name="bisub_source_lang_title">源字幕语言</string>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 15abee983..bc7f390f6 100644
+index 3af6ed8ba..82d0314c7 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1914,6 +1914,10 @@
+@@ -1916,6 +1916,10 @@
          <item>moonshot</item>
          <item>zhipu</item>
          <item>openrouter</item>
@@ -1192,7 +1192,7 @@ index 15abee983..bc7f390f6 100644
      </string-array>
      <string-array name="bisub_provider_descriptions">
          <item>@string/bisub_provider_custom</item>
-@@ -1922,5 +1926,9 @@
+@@ -1924,5 +1928,9 @@
          <item>@string/bisub_provider_moonshot</item>
          <item>@string/bisub_provider_zhipu</item>
          <item>@string/bisub_provider_openrouter</item>
@@ -1203,10 +1203,10 @@ index 15abee983..bc7f390f6 100644
      </string-array>
  </resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index eb4d1c617..47900259d 100644
+index c677c7c29..8cf721799 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1228,13 +1228,19 @@
+@@ -1229,13 +1229,19 @@
      <string name="bisub_provider_moonshot">Moonshot (Kimi)</string>
      <string name="bisub_provider_zhipu">Zhipu (GLM)</string>
      <string name="bisub_provider_openrouter">OpenRouter</string>

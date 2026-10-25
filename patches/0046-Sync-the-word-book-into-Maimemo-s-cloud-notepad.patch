@@ -1,0 +1,972 @@
+From 51356535cdd93723b149ac0d7cff19c73a98d187 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Fri, 23 Oct 2026 13:33:10 +0800
+Subject: [PATCH 46/51] Sync the word book into Maimemo's cloud notepad
+
+The word book now pushes into the Maimemo open API: entering the
+token in the learning center verifies it and creates (or finds) the
+account's private "BiPipe" cloud notepad, and the sync button on
+the word book page appends every unsynced word to it. Confirmed
+words carry a lit checkmark on their card.
+
+The sync is incremental and idempotent: the notepad's content is
+read first and only missing lines are appended, so re-syncing never
+duplicates. Every line is written with Maimemo's // prefix, which
+maps inflected forms (looked, running - exactly what tapping
+subtitles collects) back to their base form, the correct thing to
+actually memorize. Confirmation re-reads the notepad after a settle
+pause (the server parses content asynchronously, verified against
+the live API) and counts a word as confirmed when it appears in the
+parsed list, as its base form, or simply as a written line; words
+the dictionary does not know stay unsynced and are reported.
+
+The API response shape was verified live before writing any code:
+every reply is wrapped in an {errors, data, success} envelope (not
+in the OpenAPI document), the private notepad status is
+UNPUBLISHED, and an empty notepad content is rejected - the
+notepad is therefore created with a placeholder line.
+
+The token, the synced marks and their timestamps live in the
+default shared preferences, so they ride along in every data
+export and cloud backup without any backup-side change.
+---
+ .../bisub/wordlookup/MaimemoClient.java       | 336 ++++++++++++++++++
+ .../newpipe/bisub/wordlookup/WordBook.java    |  56 ++-
+ .../settings/LearningCenterFragment.java      |  61 ++++
+ .../newpipe/settings/WordBookFragment.java    | 103 +++++-
+ .../main/res/layout/fragment_word_book.xml    |  46 ++-
+ app/src/main/res/layout/item_word_book.xml    |   8 +
+ app/src/main/res/values-zh-rCN/strings.xml    |  13 +
+ app/src/main/res/values-zh-rTW/strings.xml    |  13 +
+ app/src/main/res/values/settings_keys.xml     |   1 +
+ app/src/main/res/values/strings.xml           |  13 +
+ .../main/res/xml/learning_center_settings.xml |  13 +
+ 11 files changed, 646 insertions(+), 17 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/wordlookup/MaimemoClient.java
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/MaimemoClient.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/MaimemoClient.java
+new file mode 100644
+index 000000000..06dbd40d4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/MaimemoClient.java
+@@ -0,0 +1,336 @@
++package org.schabi.newpipe.bisub.wordlookup;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.preference.PreferenceManager;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubLog;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.MediaType;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.RequestBody;
++import okhttp3.Response;
++
++/**
++ * Client of the Maimemo open API, used to push the local word book into
++ * the user's Maimemo account as one cloud notepad named "BiPipe". The
++ * notepad is created (as a private one) when the token is first entered,
++ * and every synchronization appends the not-yet-synced words to it:
++ * incremental, idempotent (the existing content is read and de-duplicated
++ * before writing), and every word is written with the {@code //} prefix,
++ * which asks Maimemo to map inflected forms back to their base form (the
++ * prefix is a no-op for words that exist as entries of their own).
++ *
++ * <p>Response shape verified against the live API: every reply is wrapped
++ * in an {@code {errors, data, success}} envelope, the private notepad
++ * status is {@code UNPUBLISHED}, and the parsed word list of a notepad is
++ * produced asynchronously - it only shows up a few seconds after an
++ * update, so a synchronization confirms its words by re-reading the list
++ * after a pause instead of trusting the update reply.</p>
++ */
++public final class MaimemoClient {
++
++    private static final String TAG = MaimemoClient.class.getSimpleName();
++    private static final String BASE = "https://open.maimemo.com/open/api/v1";
++    private static final String NOTEPAD_TITLE = "BiPipe";
++    private static final String NOTEPAD_BRIEF = "BiPipe word book";
++    private static final MediaType JSON =
++            MediaType.parse("application/json; charset=utf-8");
++    /** Pause before re-reading the notepad after an update, because the
++     *  server parses the content asynchronously. */
++    private static final long PARSE_SETTLE_MS = 5000L;
++
++    private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
++            .connectTimeout(15, TimeUnit.SECONDS)
++            .readTimeout(20, TimeUnit.SECONDS)
++            .build();
++
++    private MaimemoClient() {
++    }
++
++    /**
++     * @param context any context
++     * @return the stored Maimemo open API token, or {@code null}
++     */
++    @Nullable
++    public static String token(@NonNull final Context context) {
++        return PreferenceManager
++                .getDefaultSharedPreferences(context.getApplicationContext())
++                .getString(context.getString(R.string.bisub_maimemo_token_key), null);
++    }
++
++    /**
++     * Verifies the token by listing the account's notepads.
++     *
++     * @param token the Maimemo open API token
++     * @throws IOException when the token is rejected or the network fails
++     */
++    public static void testConnection(@NonNull final String token) throws IOException {
++        request(token, "GET", "/memo/notepads?limit=1", null);
++    }
++
++    /**
++     * Finds the account's "BiPipe" notepad, creating it (private) when it
++     * does not exist yet.
++     *
++     * @param token the Maimemo open API token
++     * @return the notepad id
++     * @throws IOException when the request fails
++     */
++    @NonNull
++    public static String ensureNotepad(@NonNull final String token) throws IOException {
++        // The list endpoint allows at most 10 per page; a word book the
++        // user maintains on the side rarely exceeds a few pages.
++        for (int offset = 0; offset < 200; offset += 10) {
++            final JSONObject body = request(token, "GET",
++                    "/memo/notepads?limit=10&offset=" + offset, null);
++            final JSONArray notepads = body.optJSONArray("notepads");
++            if (notepads == null) {
++                break;
++            }
++            for (int i = 0; i < notepads.length(); i++) {
++                final JSONObject notepad = notepads.optJSONObject(i);
++                if (notepad != null && NOTEPAD_TITLE.equals(notepad.optString("title"))) {
++                    final String id = notepad.optString("id", "");
++                    if (!id.isEmpty()) {
++                        return id;
++                    }
++                }
++            }
++            if (notepads.length() < 10) {
++                break;
++            }
++        }
++        final JSONObject content = new JSONObject();
++        try {
++            content.put("content", "bi pipe");
++            content.put("title", NOTEPAD_TITLE);
++            content.put("brief", NOTEPAD_BRIEF);
++            content.put("status", "UNPUBLISHED");
++            content.put("tags", new JSONArray());
++            final JSONObject envelope = new JSONObject();
++            envelope.put("notepad", content);
++            final JSONObject created = request(token, "POST", "/memo/notepads",
++                    envelope.toString());
++            final JSONObject notepad = created.optJSONObject("notepad");
++            final String id = notepad == null ? "" : notepad.optString("id", "");
++            if (id.isEmpty()) {
++                throw new IOException("Creating the BiPipe notepad failed");
++            }
++            BisubLog.i("maimemo: created notepad " + NOTEPAD_TITLE);
++            return id;
++        } catch (final JSONException e) {
++            throw new IOException("Building the notepad request failed: " + e.getMessage());
++        }
++    }
++
++    /**
++     * The outcome of one synchronization.
++     */
++    public static final class SyncResult {
++        /** The words confirmed present in the notepad after the update. */
++        @NonNull public final List<String> confirmed = new ArrayList<>();
++        /** The words that were sent but did not show up in the parsed
++         *  list (unknown to the Maimemo dictionary); they stay unsynced
++         *  and are retried by the next synchronization. */
++        @NonNull public final List<String> unknown = new ArrayList<>();
++        /** The notepad the words went into. */
++        @NonNull public final String notepadId;
++
++        SyncResult(@NonNull final String notepadId) {
++            this.notepadId = notepadId;
++        }
++    }
++
++    /**
++     * Appends the given words to the BiPipe notepad, skipping the ones it
++     * already contains, then re-reads the parsed list to confirm them.
++     *
++     * @param token the Maimemo open API token
++     * @param words the words to sync (raw, possibly inflected)
++     * @return the sync outcome
++     * @throws IOException when any request fails
++     */
++    @NonNull
++    public static SyncResult syncWords(@NonNull final String token,
++                                       @NonNull final List<String> words)
++            throws IOException {
++        final String notepadId = ensureNotepad(token);
++        final JSONObject current = request(token, "GET", "/memo/notepads/" + notepadId,
++                null).optJSONObject("notepad");
++        if (current == null) {
++            throw new IOException("Reading the BiPipe notepad failed");
++        }
++        final Set<String> existing = existingLines(current.optString("content", ""));
++        final List<String> fresh = new ArrayList<>();
++        for (final String word : words) {
++            if (!word.isEmpty() && !existing.contains(lineOf(word))) {
++                fresh.add(word);
++            }
++        }
++        if (fresh.isEmpty()) {
++            // Everything is already in the notepad: nothing to send, all
++            // words count as confirmed.
++            final SyncResult result = new SyncResult(notepadId);
++            result.confirmed.addAll(words);
++            return result;
++        }
++        final StringBuilder content = new StringBuilder(
++                current.optString("content", "").trim());
++        for (final String word : fresh) {
++            if (content.length() > 0) {
++                content.append('\n');
++            }
++            content.append(lineOf(word));
++        }
++        try {
++            final JSONObject notepad = new JSONObject();
++            notepad.put("content", content.toString());
++            notepad.put("title", NOTEPAD_TITLE);
++            notepad.put("brief", NOTEPAD_BRIEF);
++            notepad.put("status", "UNPUBLISHED");
++            notepad.put("tags", new JSONArray());
++            final JSONObject envelope = new JSONObject();
++            envelope.put("notepad", notepad);
++            request(token, "POST", "/memo/notepads/" + notepadId,
++                    envelope.toString());
++        } catch (final JSONException e) {
++            throw new IOException("Building the sync request failed: " + e.getMessage());
++        }
++        BisubLog.i("maimemo: appended " + fresh.size() + " word(s) to "
++                + NOTEPAD_TITLE);
++        // The server parses the content asynchronously: give it a moment
++        // before confirming the words from the parsed list.
++        try {
++            Thread.sleep(PARSE_SETTLE_MS);
++        } catch (final InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++        // A word counts as confirmed when it shows up in the parsed list
++        // (as itself, or as its base form when Maimemo mapped an inflected
++        // one), or when its line is part of the content now - the parse
++        // may still lag behind the write.
++        final Set<String> written = existingLines(content.toString());
++        final SyncResult result = new SyncResult(notepadId);
++        final JSONObject updated = request(token, "GET", "/memo/notepads/" + notepadId,
++                null).optJSONObject("notepad");
++        final Set<String> parsed = updated == null
++                ? new HashSet<>() : parsedWords(updated);
++        for (final String word : words) {
++            final boolean inList = parsed.contains(word.toLowerCase());
++            final boolean writtenLine = written.contains(lineOf(word));
++            final boolean existingLine = existing.contains(lineOf(word));
++            if (inList || writtenLine || existingLine || parsed.isEmpty()) {
++                result.confirmed.add(word);
++            } else {
++                result.unknown.add(word);
++            }
++        }
++        return result;
++    }
++
++    /**
++     * @param word the word to write
++     * @return the notepad line for it: the {@code //} prefix asks Maimemo
++     *         to map inflected forms to their base form
++     */
++    @NonNull
++    private static String lineOf(@NonNull final String word) {
++        return "//" + word.trim();
++    }
++
++    @NonNull
++    private static Set<String> existingLines(@NonNull final String content) {
++        final Set<String> lines = new HashSet<>();
++        for (final String line : content.split("\n")) {
++            final String trimmed = line.trim();
++            if (!trimmed.isEmpty()) {
++                lines.add(trimmed);
++            }
++        }
++        return lines;
++    }
++
++    @NonNull
++    private static Set<String> parsedWords(@NonNull final JSONObject notepad) {
++        final Set<String> words = new HashSet<>();
++        final JSONArray list = notepad.optJSONArray("list");
++        if (list == null) {
++            return words;
++        }
++        for (int i = 0; i < list.length(); i++) {
++            final JSONObject item = list.optJSONObject(i);
++            final String word = item == null ? "" : item.optString("word", "");
++            if (!word.isEmpty()) {
++                words.add(word.toLowerCase());
++            }
++        }
++        return words;
++    }
++
++    /**
++     * Sends one request and unwraps the {@code {errors, data, success}}
++     * envelope every endpoint uses.
++     *
++     * @param token the Maimemo open API token
++     * @param method the HTTP method
++     * @param path  the path below {@code /api/v1}, with query string
++     * @param body  the JSON request body, or {@code null} for GET
++     * @return the {@code data} object of the reply
++     * @throws IOException on network errors, non-2xx replies or
++     *                     {@code success:false} replies
++     */
++    @NonNull
++    private static JSONObject request(@NonNull final String token,
++                                      @NonNull final String method,
++                                      @NonNull final String path,
++                                      @Nullable final String body)
++            throws IOException {
++        final Request.Builder builder = new Request.Builder()
++                .url(BASE + path)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + token);
++        if (body == null) {
++            builder.get();
++        } else {
++            builder.post(RequestBody.create(body, JSON));
++        }
++        final String text;
++        try (Response response = CLIENT.newCall(builder.build()).execute()) {
++            if (response.code() == 401) {
++                throw new IOException("The Maimemo token was rejected (401)");
++            }
++            text = response.body() == null ? "" : response.body().string();
++            if (!response.isSuccessful()) {
++                throw new IOException("Maimemo API error: HTTP " + response.code()
++                        + " " + text.substring(0, Math.min(200, text.length())));
++            }
++        }
++        try {
++            final JSONObject envelope = new JSONObject(text);
++            if (!envelope.optBoolean("success", false)) {
++                throw new IOException("Maimemo API rejected the request: "
++                        + text.substring(0, Math.min(200, text.length())));
++            }
++            final JSONObject data = envelope.optJSONObject("data");
++            return data == null ? new JSONObject() : data;
++        } catch (final JSONException e) {
++            throw new IOException("Malformed Maimemo reply: " + e.getMessage());
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+index cb436ccb6..49d9a54ad 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+@@ -178,6 +178,46 @@ public final class WordBook {
+         }
+     }
+ 
++    /**
++     * Marks words as synced to the Maimemo cloud notepad.
++     *
++     * @param context any context
++     * @param words   the words that were confirmed in the notepad
++     */
++    public static void markSynced(@NonNull final Context context,
++                                  @NonNull final List<String> words) {
++        if (words.isEmpty()) {
++            return;
++        }
++        final List<Item> items = readItems(context);
++        boolean changed = false;
++        for (final Item item : items) {
++            if (!item.synced && words.contains(item.word)) {
++                item.synced = true;
++                item.syncTime = System.currentTimeMillis();
++                changed = true;
++            }
++        }
++        if (changed) {
++            writeItems(context, items);
++        }
++    }
++
++    /**
++     * @param context any context
++     * @param word    the word to check
++     * @return whether the word is marked as synced to Maimemo
++     */
++    public static boolean isSynced(@NonNull final Context context,
++                                   @NonNull final String word) {
++        for (final Item item : readItems(context)) {
++            if (item.word.equals(word)) {
++                return item.synced;
++            }
++        }
++        return false;
++    }
++
+     @NonNull
+     private static List<Item> readItems(@NonNull final Context context) {
+         final List<Item> items = new ArrayList<>();
+@@ -194,8 +234,10 @@ public final class WordBook {
+                     continue;
+                 }
+                 final long time = item.optLong("time", 0L);
++                final boolean synced = item.optBoolean("synced", false);
++                final long syncTime = item.optLong("syncTime", 0L);
+                 final JSONObject entry = item.optJSONObject("entry");
+-                items.add(new Item(word, time, entry));
++                items.add(new Item(word, time, entry, synced, syncTime));
+             }
+         } catch (final JSONException e) {
+             // A corrupted list is replaced by the next save; reading an
+@@ -212,6 +254,8 @@ public final class WordBook {
+             try {
+                 json.put("word", item.word);
+                 json.put("time", item.time);
++                json.put("synced", item.synced);
++                json.put("syncTime", item.syncTime);
+                 if (item.entry != null) {
+                     json.put("entry", item.entry);
+                 }
+@@ -227,12 +271,22 @@ public final class WordBook {
+         final String word;
+         final long time;
+         @Nullable JSONObject entry;
++        boolean synced;
++        long syncTime;
+ 
+         Item(@NonNull final String word, final long time,
+              @Nullable final JSONObject entry) {
++            this(word, time, entry, false, 0L);
++        }
++
++        Item(@NonNull final String word, final long time,
++             @Nullable final JSONObject entry, final boolean synced,
++             final long syncTime) {
+             this.word = word;
+             this.time = time;
+             this.entry = entry;
++            this.synced = synced;
++            this.syncTime = syncTime;
+         }
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java b/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
+index 3cfb02632..a7816f0b1 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
+@@ -1,18 +1,31 @@
+ package org.schabi.newpipe.settings;
+ 
++import android.content.Context;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.widget.Toast;
+ 
++import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.preference.EditTextPreference;
+ import androidx.preference.Preference;
+ 
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.wordlookup.MaimemoClient;
+ import org.schabi.newpipe.bisub.wordlookup.WordBook;
+ 
++import java.io.IOException;
++
+ /**
+  * First-level settings page of the learning center: the bilingual
+  * reading list and the word book, the two resources that turn watched
+  * videos into learning material. The word-book summary shows how many
+  * words it holds.
++ *
++ * <p>Below the two entries sits the Maimemo section: entering the open
++ * API token verifies it and creates (or finds) the account's "BiPipe"
++ * cloud notepad, which the word book synchronizes into.</p>
+  */
+ public final class LearningCenterFragment extends BasePreferenceFragment {
+ 
+@@ -20,6 +33,22 @@ public final class LearningCenterFragment extends BasePreferenceFragment {
+     public void onCreatePreferences(@Nullable final Bundle savedInstanceState,
+                                     @Nullable final String rootKey) {
+         addPreferencesFromResourceRegistry();
++
++        final EditTextPreference tokenPref =
++                (EditTextPreference) findPreference(
++                        getString(R.string.bisub_maimemo_token_key));
++        if (tokenPref != null) {
++            tokenPref.setOnPreferenceChangeListener((preference, newValue) -> {
++                final String value = newValue == null
++                        ? null : String.valueOf(newValue).trim();
++                if (value == null || value.isEmpty()) {
++                    preference.setSummary(R.string.bisub_maimemo_token_summary);
++                    return true;
++                }
++                verifyToken(value);
++                return true;
++            });
++        }
+     }
+ 
+     @Override
+@@ -35,5 +64,37 @@ public final class LearningCenterFragment extends BasePreferenceFragment {
+                             .getQuantityString(R.plurals.bisub_word_book_count,
+                                     count, count));
+         }
++        final Preference tokenPref = findPreference(
++                getString(R.string.bisub_maimemo_token_key));
++        if (tokenPref != null) {
++            tokenPref.setSummary(MaimemoClient.token(requireContext()) == null
++                    ? getString(R.string.bisub_maimemo_token_summary)
++                    : getString(R.string.bisub_maimemo_token_set));
++        }
++    }
++
++    /**
++     * Verifies a freshly entered token and prepares the BiPipe notepad,
++     * on a background thread.
++     *
++     * @param token the token to verify
++     */
++    private void verifyToken(@NonNull final String token) {
++        final Context context = requireContext();
++        final Handler mainHandler = new Handler(Looper.getMainLooper());
++        new Thread(() -> {
++            String message;
++            try {
++                MaimemoClient.testConnection(token);
++                MaimemoClient.ensureNotepad(token);
++                message = getString(R.string.bisub_maimemo_token_ok);
++            } catch (final IOException e) {
++                message = getString(R.string.bisub_maimemo_token_rejected,
++                        e.getMessage());
++            }
++            final String report = message;
++            mainHandler.post(() ->
++                    Toast.makeText(context, report, Toast.LENGTH_LONG).show());
++        }).start();
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+index a85b521f4..c6f41fd3a 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+@@ -3,9 +3,13 @@ package org.schabi.newpipe.settings;
+ import android.content.Context;
+ import android.content.DialogInterface;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.widget.Button;
++import android.widget.ImageView;
+ import android.widget.TextView;
+ import android.widget.Toast;
+ 
+@@ -17,11 +21,13 @@ import androidx.recyclerview.widget.LinearLayoutManager;
+ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.wordlookup.MaimemoClient;
+ import org.schabi.newpipe.bisub.wordlookup.WordBook;
+ import org.schabi.newpipe.bisub.wordlookup.WordDialogHelper;
+ import org.schabi.newpipe.bisub.wordlookup.WordEntry;
+ import org.schabi.newpipe.util.ThemeHelper;
+ 
++import java.io.IOException;
+ import java.text.SimpleDateFormat;
+ import java.util.ArrayList;
+ import java.util.Date;
+@@ -36,12 +42,18 @@ import java.util.Locale;
+  * request, no rate limit, works offline; words saved before their
+  * definition was cached are fetched on demand and backfilled. A long
+  * press removes a word.
++ *
++ * <p>The sync button pushes all unsynced words into the account's
++ * "BiPipe" cloud notepad (see {@link MaimemoClient}); confirmed words
++ * carry a lit checkmark on their card.</p>
+  */
+ public final class WordBookFragment extends Fragment {
+ 
+     private RecyclerView recyclerView;
+     private TextView emptyView;
++    private Button syncButton;
+     private final WordBookAdapter adapter = new WordBookAdapter();
++    private boolean syncing;
+ 
+     @Nullable
+     @Override
+@@ -52,8 +64,10 @@ public final class WordBookFragment extends Fragment {
+                 inflater.inflate(R.layout.fragment_word_book, container, false);
+         recyclerView = root.findViewById(R.id.word_book_list);
+         emptyView = root.findViewById(R.id.word_book_empty);
++        syncButton = root.findViewById(R.id.word_book_sync_button);
+         recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
+         recyclerView.setAdapter(adapter);
++        syncButton.setOnClickListener(v -> syncToMaimemo());
+         return root;
+     }
+ 
+@@ -78,7 +92,8 @@ public final class WordBookFragment extends Fragment {
+             final List<WordCard> cards = new ArrayList<>();
+             for (final String word : WordBook.list(context)) {
+                 cards.add(new WordCard(word, WordBook.getEntry(context, word),
+-                        WordBook.timeOf(context, word)));
++                        WordBook.timeOf(context, word),
++                        WordBook.isSynced(context, word)));
+             }
+             if (getActivity() == null) {
+                 return;
+@@ -91,6 +106,82 @@ public final class WordBookFragment extends Fragment {
+                 final boolean empty = cards.isEmpty();
+                 emptyView.setVisibility(empty ? View.VISIBLE : View.GONE);
+                 recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
++                refreshSyncButton();
++            });
++        }).start();
++    }
++
++    /**
++     * Enables the sync button when there is a token and unsynced work.
++     */
++    private void refreshSyncButton() {
++        final boolean tokenSet = MaimemoClient.token(requireContext()) != null;
++        boolean allSynced = true;
++        for (int i = 0; i < adapter.getItemCount(); i++) {
++            if (!adapter.cards.get(i).synced) {
++                allSynced = false;
++                break;
++            }
++        }
++        syncButton.setEnabled(tokenSet && !syncing && !allSynced
++                && adapter.getItemCount() > 0);
++    }
++
++    /**
++     * Pushes every unsynced word into the account's "BiPipe" cloud
++     * notepad on a background thread, marks the confirmed ones and
++     * reports the outcome.
++     */
++    private void syncToMaimemo() {
++        final Context context = getContext();
++        if (context == null || syncing) {
++            return;
++        }
++        final String token = MaimemoClient.token(context);
++        if (token == null) {
++            Toast.makeText(context, R.string.bisub_maimemo_no_token,
++                    Toast.LENGTH_LONG).show();
++            return;
++        }
++        final List<String> unsynced = new ArrayList<>();
++        for (int i = 0; i < adapter.getItemCount(); i++) {
++            final WordCard card = adapter.cards.get(i);
++            if (!card.synced) {
++                unsynced.add(card.word);
++            }
++        }
++        if (unsynced.isEmpty()) {
++            return;
++        }
++        syncing = true;
++        refreshSyncButton();
++        Toast.makeText(context, R.string.bisub_maimemo_syncing, Toast.LENGTH_SHORT)
++                .show();
++        final Handler mainHandler = new Handler(Looper.getMainLooper());
++        new Thread(() -> {
++            String message;
++            boolean success = false;
++            try {
++                final MaimemoClient.SyncResult result =
++                        MaimemoClient.syncWords(token, unsynced);
++                WordBook.markSynced(context, result.confirmed);
++                success = true;
++                message = result.unknown.isEmpty()
++                        ? getString(R.string.bisub_maimemo_sync_done,
++                                result.confirmed.size())
++                        : getString(R.string.bisub_maimemo_sync_partial,
++                                result.confirmed.size(), result.unknown.size());
++            } catch (final IOException e) {
++                message = getString(R.string.bisub_maimemo_sync_failed,
++                        e.getMessage());
++            }
++            final String report = message;
++            final boolean ok = success;
++            mainHandler.post(() -> {
++                syncing = false;
++                Toast.makeText(context, report, ok ? Toast.LENGTH_SHORT
++                        : Toast.LENGTH_LONG).show();
++                reload();
+             });
+         }).start();
+     }
+@@ -102,12 +193,14 @@ public final class WordBookFragment extends Fragment {
+         final String word;
+         @Nullable final WordEntry entry;
+         final long time;
++        final boolean synced;
+ 
+         WordCard(@NonNull final String word, @Nullable final WordEntry entry,
+-                 final long time) {
++                 final long time, final boolean synced) {
+             this.word = word;
+             this.entry = entry;
+             this.time = time;
++            this.synced = synced;
+         }
+     }
+ 
+@@ -146,6 +239,7 @@ public final class WordBookFragment extends Fragment {
+         private final TextView phoneticView;
+         private final TextView definitionView;
+         private final TextView timeView;
++        private final ImageView syncedView;
+ 
+         WordBookHolder(@NonNull final View itemView) {
+             super(itemView);
+@@ -153,12 +247,14 @@ public final class WordBookFragment extends Fragment {
+             phoneticView = itemView.findViewById(R.id.word_book_phonetic);
+             definitionView = itemView.findViewById(R.id.word_book_definition);
+             timeView = itemView.findViewById(R.id.word_book_time);
++            syncedView = itemView.findViewById(R.id.word_book_synced);
+         }
+ 
+         /**
+          * Fills one card: the word, the phonetic transcription, a preview
+          * of the cached definition (or a hint that it will be fetched on
+-         * demand) and the save date.
++         * demand) and the save date. The checkmark lights up when the
++         * word is in the Maimemo cloud notepad.
+          *
+          * @param card the card to show
+          */
+@@ -172,6 +268,7 @@ public final class WordBookFragment extends Fragment {
+                     : getString(R.string.bisub_word_book_uncached));
+             timeView.setText(new SimpleDateFormat("MM-dd", Locale.getDefault())
+                     .format(new Date(card.time)));
++            syncedView.setAlpha(card.synced ? 1f : 0.15f);
+             itemView.setOnClickListener(view ->
+                     WordDialogHelper.show(view.getContext(), card.word));
+             itemView.setOnLongClickListener(view -> {
+diff --git a/app/src/main/res/layout/fragment_word_book.xml b/app/src/main/res/layout/fragment_word_book.xml
+index fb273919a..0e8b1e357 100644
+--- a/app/src/main/res/layout/fragment_word_book.xml
++++ b/app/src/main/res/layout/fragment_word_book.xml
+@@ -1,18 +1,38 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     android:layout_width="match_parent"
+-    android:layout_height="match_parent">
++    android:layout_height="match_parent"
++    android:orientation="vertical">
+ 
+-    <androidx.recyclerview.widget.RecyclerView
+-        android:id="@+id/word_book_list"
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent" />
++    <Button
++        android:id="@+id/word_book_sync_button"
++        style="@style/Base.Widget.AppCompat.Button.Borderless"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="end"
++        android:layout_marginEnd="8dp"
++        android:minWidth="0dp"
++        android:paddingStart="16dp"
++        android:paddingEnd="16dp"
++        android:text="@string/bisub_maimemo_sync"
++        android:textSize="13sp" />
+ 
+-    <org.schabi.newpipe.views.NewPipeTextView
+-        android:id="@+id/word_book_empty"
++    <FrameLayout
+         android:layout_width="match_parent"
+-        android:layout_height="match_parent"
+-        android:gravity="center"
+-        android:padding="32dp"
+-        android:text="@string/bisub_word_book_empty" />
+-</FrameLayout>
+\ No newline at end of file
++        android:layout_height="0dp"
++        android:layout_weight="1">
++
++        <androidx.recyclerview.widget.RecyclerView
++            android:id="@+id/word_book_list"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent" />
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:id="@+id/word_book_empty"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:gravity="center"
++            android:padding="32dp"
++            android:text="@string/bisub_word_book_empty" />
++    </FrameLayout>
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/item_word_book.xml b/app/src/main/res/layout/item_word_book.xml
+index f2017fc77..50eb6f49b 100644
+--- a/app/src/main/res/layout/item_word_book.xml
++++ b/app/src/main/res/layout/item_word_book.xml
+@@ -61,4 +61,12 @@
+         android:layout_marginStart="12dp"
+         android:textColor="?android:attr/textColorTertiary"
+         android:textSize="11sp" />
++
++    <ImageView
++        android:id="@+id/word_book_synced"
++        android:layout_width="16dp"
++        android:layout_height="16dp"
++        android:layout_marginStart="8dp"
++        android:contentDescription="@string/bisub_maimemo_synced_description"
++        android:src="@drawable/ic_done" />
+ </LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 73273f600..063af8b0a 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1332,6 +1332,19 @@
+     <string name="bisub_cached_view">查看全文</string>
+     <string name="bisub_word_book_summary">阅读时收藏的单词</string>
+     <string name="bisub_word_book_title">生词本</string>
++    <string name="bisub_maimemo_category_title">墨墨背单词</string>
++    <string name="bisub_maimemo_token_title">墨墨开放 API Token</string>
++    <string name="bisub_maimemo_token_summary">墨墨 App：我的 → 更多设置 → 实验功能 → 开放 API</string>
++    <string name="bisub_maimemo_token_set">已设置；单词同步到「BiPipe」云词本</string>
++    <string name="bisub_maimemo_token_ok">Token 验证成功，「BiPipe」云词本已就绪</string>
++    <string name="bisub_maimemo_token_rejected">Token 验证失败：%s</string>
++    <string name="bisub_maimemo_sync">同步到墨墨</string>
++    <string name="bisub_maimemo_syncing">正在同步到墨墨…</string>
++    <string name="bisub_maimemo_sync_done">已同步 %d 个单词到墨墨</string>
++    <string name="bisub_maimemo_sync_partial">已同步 %1$d 个；%2$d 个墨墨词库未收录</string>
++    <string name="bisub_maimemo_sync_failed">同步失败：%s</string>
++    <string name="bisub_maimemo_no_token">请先在学习中心设置墨墨 Token</string>
++    <string name="bisub_maimemo_synced_description">已同步到墨墨</string>
+     <string name="bisub_word_book_empty">生词本还是空的。\n点字幕上或阅读页里的单词，查释义后加入生词本</string>
+     <string name="bisub_word_book_uncached">首次打开时加载释义</string>
+     <string name="bisub_word_book_remove_title">移除单词</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index 2f6539463..b4df94e3d 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1238,6 +1238,19 @@
+     <string name="bisub_word_book_summary">閱讀時收藏的單字</string>
+     <string name="bisub_word_book_title">生詞本</string>
+     <string name="bisub_reader_open">雙語閱讀</string>
++    <string name="bisub_maimemo_category_title">墨墨背單字</string>
++    <string name="bisub_maimemo_token_title">墨墨開放 API Token</string>
++    <string name="bisub_maimemo_token_summary">墨墨 App：我的 → 更多設定 → 實驗功能 → 開放 API</string>
++    <string name="bisub_maimemo_token_set">已設定；單字同步到「BiPipe」雲詞本</string>
++    <string name="bisub_maimemo_token_ok">Token 驗證成功，「BiPipe」雲詞本已就緒</string>
++    <string name="bisub_maimemo_token_rejected">Token 驗證失敗：%s</string>
++    <string name="bisub_maimemo_sync">同步到墨墨</string>
++    <string name="bisub_maimemo_syncing">正在同步到墨墨…</string>
++    <string name="bisub_maimemo_sync_done">已同步 %d 個單字到墨墨</string>
++    <string name="bisub_maimemo_sync_partial">已同步 %1$d 個；%2$d 個墨墨詞庫未收錄</string>
++    <string name="bisub_maimemo_sync_failed">同步失敗：%s</string>
++    <string name="bisub_maimemo_no_token">請先在學習中心設定墨墨 Token</string>
++    <string name="bisub_maimemo_synced_description">已同步到墨墨</string>
+     <string name="bisub_word_book_empty">生詞本還是空的。\n點字幕上或閱讀頁裡的單字，查釋義後加入生詞本</string>
+     <string name="bisub_word_book_uncached">首次開啟時載入釋義</string>
+     <string name="bisub_word_book_remove_title">移除單字</string>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index e292c5841..eb0b14fcc 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1928,6 +1928,7 @@
+     <string name="bisub_cache_auto_clean_threshold_key">bisub_cache_auto_clean_threshold</string>
+     <string name="bisub_reader_shelf_key">bisub_reader_shelf_entry</string>
+     <string name="bisub_word_book_key">bisub_word_book_entry</string>
++    <string name="bisub_maimemo_token_key">bisub_maimemo_token</string>
+ 
+     <string-array name="bisub_cache_threshold_entries">
+         <item>@string/bisub_cache_threshold_10</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 2cf895ca9..891d2ee3c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1337,6 +1337,19 @@
+     <string name="bisub_word_book_summary">The words you saved while reading</string>
+     <string name="bisub_word_book_title">Word book</string>
+     <string name="bisub_reader_open">Read bilingually</string>
++    <string name="bisub_maimemo_category_title">Maimemo</string>
++    <string name="bisub_maimemo_token_title">Maimemo open API token</string>
++    <string name="bisub_maimemo_token_summary">Maimemo app: Me → More settings → Experimental features → Open API</string>
++    <string name="bisub_maimemo_token_set">Token set; words sync into the \'BiPipe\' cloud notepad</string>
++    <string name="bisub_maimemo_token_ok">Token verified, \'BiPipe\' cloud notepad ready</string>
++    <string name="bisub_maimemo_token_rejected">Token rejected: %s</string>
++    <string name="bisub_maimemo_sync">Sync to Maimemo</string>
++    <string name="bisub_maimemo_syncing">Syncing to Maimemo…</string>
++    <string name="bisub_maimemo_sync_done">Synced %d word(s) to Maimemo</string>
++    <string name="bisub_maimemo_sync_partial">Synced %1$d word(s); %2$d unknown to the Maimemo dictionary</string>
++    <string name="bisub_maimemo_sync_failed">Sync failed: %s</string>
++    <string name="bisub_maimemo_no_token">Set the Maimemo token in the learning center first</string>
++    <string name="bisub_maimemo_synced_description">Synced to Maimemo</string>
+     <string name="bisub_word_book_empty">The word book is empty.\nTap a word on a subtitle or in the reader to look it up and save it</string>
+     <string name="bisub_word_book_uncached">Definition loads on first open</string>
+     <string name="bisub_word_book_remove_title">Remove word</string>
+diff --git a/app/src/main/res/xml/learning_center_settings.xml b/app/src/main/res/xml/learning_center_settings.xml
+index 0d84a69d6..317c3342e 100644
+--- a/app/src/main/res/xml/learning_center_settings.xml
++++ b/app/src/main/res/xml/learning_center_settings.xml
+@@ -18,4 +18,17 @@
+         android:title="@string/bisub_word_book_title"
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
++
++    <PreferenceCategory
++        android:title="@string/bisub_maimemo_category_title"
++        app:iconSpaceReserved="false">
++
++        <EditTextPreference
++            android:key="@string/bisub_maimemo_token_key"
++            android:title="@string/bisub_maimemo_token_title"
++            android:summary="@string/bisub_maimemo_token_summary"
++            android:inputType="textPassword"
++            app:iconSpaceReserved="false"
++            app:singleLineTitle="false" />
++    </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

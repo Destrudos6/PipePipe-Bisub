@@ -1,0 +1,409 @@
+From 2a8a855bfda61b83b45acf0171748567c2e7bf3f Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 21 Oct 2026 16:07:04 +0800
+Subject: [PATCH 36/51] Support both Baidu authentication schemes automatically
+
+The Baidu LLM translation API accepts two kinds of credentials: an
+API key (created on the console's 'API Key' page, sent as a Bearer
+token - the scheme the API recommends) and the classic secret (from
+the developer information page, used to sign requests). The engine
+only implemented the sign scheme, so a key field holding an API key
+produced nothing but '54001 invalid sign' replies - the error code
+that covers both wrong signatures and wrong tokens.
+
+Requests now try the Bearer scheme first and fall back to signing
+on an authentication failure, remembering the working scheme per
+App ID for the rest of the process. The key-field hint mentions
+both accepted credentials, and the sign-scheme failure message
+explains where each of them comes from.
+---
+ .../newpipe/bisub/SubtitleTranslator.java     | 297 ++++++++++++++----
+ app/src/main/res/values-zh-rCN/strings.xml    |   2 +-
+ app/src/main/res/values/strings.xml           |   2 +-
+ 3 files changed, 232 insertions(+), 69 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index 5db03aa6c..ee78df54a 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -20,6 +20,7 @@ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.TreeMap;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.TimeUnit;
+ 
+ import okhttp3.FormBody;
+@@ -66,6 +67,13 @@ public final class SubtitleTranslator {
+             .writeTimeout(20, TimeUnit.SECONDS)
+             .build();
+ 
++    /** Remembers per Baidu App ID whether Bearer authentication works,
++     *  so the request scheme is only probed once per process: the key
++     *  field may hold an API key (Bearer) or the classic secret
++     *  (signing), and a rejected attempt pins the working scheme. */
++    private static final Map<String, Boolean> BAIDU_BEARER_AUTH =
++            new ConcurrentHashMap<>();
++
+     /** Common spellings of the target language mapped to an internal
+      *  lower-case code like {@code zh-CN}, {@code zh-TW} or {@code en}. */
+     private static final Map<String, String> LANGUAGE_ALIASES = new HashMap<>();
+@@ -156,6 +164,30 @@ public final class SubtitleTranslator {
+         }
+     }
+ 
++    /** Baidu rejected the authentication of one request. For the Bearer
++     *  scheme this means the key field holds the classic secret, so the
++     *  caller falls back to the sign scheme. */
++    private static final class BaiduAuthException extends IOException {
++        private static final long serialVersionUID = 1L;
++
++        BaiduAuthException(@NonNull final String message) {
++            super(message);
++        }
++    }
++
++    /** Baidu replied busy or rate-limited; the request may be retried
++     *  after {@link #pauseMs} milliseconds. */
++    private static final class BaiduBusyException extends IOException {
++        private static final long serialVersionUID = 1L;
++
++        final long pauseMs;
++
++        BaiduBusyException(@NonNull final String message, final long pauseMs) {
++            super(message);
++            this.pauseMs = pauseMs;
++        }
++    }
++
+     /**
+      * @param provider the provider preset value of the active profile
+      * @return whether the provider is a traditional machine translation
+@@ -655,12 +687,13 @@ public final class SubtitleTranslator {
+ 
+     /**
+      * Translates the lines with the Baidu LLM text translation API. The
+-     * credentials are stored as {@code appid#secret} in the API key
+-     * field, and every request is signed with
+-     * {@code MD5(appid + q + salt + secret)} (the API also accepts
+-     * Bearer keys, but the sign scheme works with the classic appid and
+-     * secret pair every Baidu account has). Multiple lines are joined
+-     * with newlines into one request; the reply normally carries one
++     * App ID and key fields carry the Baidu credentials, and requests
++     * authenticate either with a Bearer token (when the key field holds
++     * an API key from the console's "API Key" page) or with the classic
++     * {@code MD5(appid + q + salt + secret)} signature (when it holds
++     * the secret from the developer information page); see
++     * {@link #baiduTranslateChunk}. Multiple lines are joined with
++     * newlines into one request; the reply normally carries one
+      * {@code trans_result} entry per line, and a single multi-line
+      * entry is split back apart, which keeps the alignment exact. The
+      * API recommends keeping one request below 2000 characters (the
+@@ -724,17 +757,24 @@ public final class SubtitleTranslator {
+     }
+ 
+     /**
+-     * Sends one signed request to the Baidu LLM translation API and
+-     * returns the translated {@code dst} values, one per input line. A
+-     * reply with a single multi-line entry is split back apart. Rate
+-     * limit and busy replies (54003, 59004, 54005) are retried after a
+-     * pause; configuration errors (bad signature, closed service,
+-     * exhausted quota) fail fast.
++     * Sends one request to the Baidu LLM translation API and returns the
++     * translated {@code dst} values, one per input line. The API accepts
++     * two authentication schemes, and which one works depends on what
++     * the user stored in the key field: an API key (console "API Key"
++     * page) authenticates as a Bearer token with a JSON body, while the
++     * classic secret (developer information page) signs the request as
++     * {@code MD5(appid + q + salt + secret)}. Bearer is tried first
++     * (the scheme the API recommends); an authentication failure falls
++     * back to the sign scheme, and whichever worked is remembered per
++     * App ID for the rest of the process. A reply with a single
++     * multi-line entry is split back apart. Rate limit and busy replies
++     * (54003, 59004, 54005) are retried after a pause; configuration
++     * errors fail fast.
+      *
+      * @param chunk  the lines of this request
+      * @param target the engine target language code
+      * @param appId  the Baidu application id
+-     * @param secret the Baidu secret key
++     * @param secret the Baidu API key or classic secret
+      * @return the translations, possibly fewer than requested
+      * @throws IOException   on network errors, HTTP errors or timeouts
+      * @throws JSONException when a response cannot be parsed
+@@ -746,69 +786,192 @@ public final class SubtitleTranslator {
+                                                     @NonNull final String secret)
+             throws IOException, JSONException {
+         final String joined = String.join("\n", chunk);
++        if (!Boolean.FALSE.equals(BAIDU_BEARER_AUTH.get(appId))) {
++            try {
++                final List<String> parsed =
++                        baiduSendWithRetries(joined, target, appId, secret, true);
++                BAIDU_BEARER_AUTH.put(appId, true);
++                return parsed;
++            } catch (final BaiduAuthException | TranslationConfigException e) {
++                // The Bearer scheme was rejected (the key field holds the
++                // classic secret, or the token is invalid): continue with
++                // the sign scheme instead.
++                BAIDU_BEARER_AUTH.put(appId, false);
++                BisubLog.w("baidu bearer auth was rejected (" + e.getMessage()
++                        + "), switching to the sign scheme");
++            }
++        }
++        return baiduSendWithRetries(joined, target, appId, secret, false);
++    }
++
++    /**
++     * Sends one Baidu request, retrying busy and rate-limit replies with
++     * a growing pause. Authentication failures are not retried here: the
++     * caller falls back to the other scheme or fails fast.
++     *
++     * @param joined    the newline-joined text of the request
++     * @param target    the engine target language code
++     * @param appId     the Baidu application id
++     * @param secret    the Baidu API key or classic secret
++     * @param useBearer whether to authenticate with the Bearer scheme
++     * @return the translations, possibly fewer than requested
++     * @throws IOException   on network errors or after exhausting retries
++     * @throws JSONException when a response cannot be parsed
++     */
++    @NonNull
++    private static List<String> baiduSendWithRetries(@NonNull final String joined,
++                                                     @NonNull final String target,
++                                                     @NonNull final String appId,
++                                                     @NonNull final String secret,
++                                                     final boolean useBearer)
++            throws IOException, JSONException {
++        IOException busy = null;
+         for (int attempt = 1; attempt <= 3; attempt++) {
+-            final String salt = String.valueOf(System.currentTimeMillis());
+-            final RequestBody form = new FormBody.Builder()
+-                    .add("q", joined)
+-                    .add("from", "auto")
+-                    .add("to", target)
+-                    .add("appid", appId)
+-                    .add("salt", salt)
+-                    .add("sign", md5Hex(appId + joined + salt + secret))
+-                    .build();
+-            final Request request = new Request.Builder()
+-                    .url("https://fanyi-api.baidu.com/ait/api/aiTextTranslate")
+-                    .post(form)
+-                    .build();
+-            final JSONObject reply = new JSONObject(executeRequest(request));
+-            final String errorCode = reply.optString("error_code", "");
+-            if (errorCode.isEmpty()) {
+-                final JSONArray items = reply.optJSONArray("trans_result");
+-                final List<String> parsed = new ArrayList<>();
+-                if (items != null) {
+-                    for (int i = 0; i < items.length(); i++) {
+-                        parsed.add(items.getJSONObject(i).optString("dst", ""));
+-                    }
++            try {
++                return baiduSendOnce(joined, target, appId, secret, useBearer);
++            } catch (final BaiduBusyException e) {
++                busy = e;
++                BisubLog.w("baidu busy on attempt " + attempt + " (" + e.getMessage()
++                        + "), pausing " + e.pauseMs * attempt + " ms");
++                if (attempt < 3) {
++                    sleepQuietly(e.pauseMs * attempt);
+                 }
+-                // The LLM model tends to merge the joined lines into one
+-                // reply entry; split it back so the line alignment holds.
+-                if (parsed.size() == 1 && chunk.size() > 1
+-                        && parsed.get(0).contains("\n")) {
+-                    final String merged = parsed.get(0);
+-                    parsed.clear();
+-                    for (final String part : merged.split("\n", -1)) {
+-                        parsed.add(part);
+-                    }
++            }
++        }
++        throw busy;
++    }
++
++    /**
++     * Sends one Baidu request and parses the reply: the translated
++     * {@code dst} values on success, or the matching exception for the
++     * reply's error code.
++     *
++     * @param joined    the newline-joined text of the request
++     * @param target    the engine target language code
++     * @param appId     the Baidu application id
++     * @param secret    the Baidu API key or classic secret
++     * @param useBearer whether to authenticate with the Bearer scheme
++     * @return the translations, possibly fewer than requested
++     * @throws IOException   on network errors, HTTP errors or timeouts
++     * @throws JSONException when a response cannot be parsed
++     */
++    @NonNull
++    private static List<String> baiduSendOnce(@NonNull final String joined,
++                                              @NonNull final String target,
++                                              @NonNull final String appId,
++                                              @NonNull final String secret,
++                                              final boolean useBearer)
++            throws IOException, JSONException {
++        final Request request = useBearer
++                ? baiduBearerRequest(joined, target, appId, secret)
++                : baiduSignedRequest(joined, target, appId, secret);
++        final JSONObject reply = new JSONObject(executeRequest(request));
++        final String errorCode = reply.optString("error_code", "");
++        if (errorCode.isEmpty()) {
++            final JSONArray items = reply.optJSONArray("trans_result");
++            final List<String> parsed = new ArrayList<>();
++            if (items != null) {
++                for (int i = 0; i < items.length(); i++) {
++                    parsed.add(items.getJSONObject(i).optString("dst", ""));
+                 }
+-                return parsed;
+             }
+-            final String message = reply.optString("error_msg", errorCode);
+-            if ("54003".equals(errorCode) || "59004".equals(errorCode)
+-                    || "52001".equals(errorCode) || "52002".equals(errorCode)) {
+-                // Rate limit / busy: pause and let the next attempt run.
+-                BisubLog.w("baidu error " + errorCode + " (" + message
+-                        + ") on attempt " + attempt + ", pausing");
+-                if (attempt < 3) {
+-                    sleepQuietly(1100 * attempt);
+-                    continue;
++            // The LLM model tends to merge the joined lines into one
++            // reply entry; split it back so the line alignment holds.
++            if (parsed.size() == 1 && joined.contains("\n")
++                    && parsed.get(0).contains("\n")) {
++                final String merged = parsed.get(0);
++                parsed.clear();
++                for (final String part : merged.split("\n", -1)) {
++                    parsed.add(part);
+                 }
+-                throw new IOException("Baidu API is busy (error " + errorCode + ")");
+             }
+-            if ("54005".equals(errorCode)) {
++            return parsed;
++        }
++        final String message = reply.optString("error_msg", errorCode);
++        switch (errorCode) {
++            case "54003":
++            case "59004":
++            case "52001":
++            case "52002":
++                // Rate limit / busy: pause and let the next attempt run.
++                throw new BaiduBusyException("error " + errorCode + ": " + message, 1100L);
++            case "54005":
+                 // Long-query flood: the API asks to wait 3 seconds.
+-                BisubLog.w("baidu error 54005 (" + message + ") on attempt "
+-                        + attempt + ", waiting 3 s");
+-                if (attempt < 3) {
+-                    sleepQuietly(3100L * attempt);
+-                    continue;
++                throw new BaiduBusyException("error 54005: " + message, 3100L);
++            case "54001":
++                if (useBearer) {
++                    throw new BaiduAuthException("invalid token (54001)");
+                 }
+-                throw new IOException("Baidu API is busy (error 54005)");
+-            }
+-            BisubLog.e("baidu error " + errorCode + ": " + message);
+-            throw new TranslationConfigException("Baidu API error " + errorCode
+-                    + ": " + message);
++                BisubLog.e("baidu error 54001: " + message);
++                throw new TranslationConfigException("Baidu authentication failed "
++                        + "(54001): check the App ID and the key. The key field accepts "
++                        + "an API key from the console's 'API Key' page or the classic "
++                        + "secret from the developer information page");
++            default:
++                BisubLog.e("baidu error " + errorCode + ": " + message);
++                throw new TranslationConfigException("Baidu API error " + errorCode
++                        + ": " + message);
+         }
+-        throw new IOException("Baidu API request failed");
++    }
++
++    /**
++     * Builds a Baidu request with Bearer token authentication and a JSON
++     * body, the scheme the API recommends for API keys.
++     *
++     * @param joined  the newline-joined text of the request
++     * @param target  the engine target language code
++     * @param appId   the Baidu application id
++     * @param apiKey  the Baidu API key
++     * @return the request to send
++     * @throws JSONException when the payload cannot be built
++     */
++    @NonNull
++    private static Request baiduBearerRequest(@NonNull final String joined,
++                                              @NonNull final String target,
++                                              @NonNull final String appId,
++                                              @NonNull final String apiKey)
++            throws JSONException {
++        final JSONObject payload = new JSONObject();
++        payload.put("appid", appId);
++        payload.put("from", "auto");
++        payload.put("to", target);
++        payload.put("q", joined);
++        return new Request.Builder()
++                .url("https://fanyi-api.baidu.com/ait/api/aiTextTranslate")
++                .header("Authorization", "Bearer " + apiKey)
++                .header("Content-Type", "application/json")
++                .post(RequestBody.create(payload.toString(), JSON))
++                .build();
++    }
++
++    /**
++     * Builds a Baidu request with the classic sign authentication
++     * ({@code MD5(appid + q + salt + secret)}) and a form body.
++     *
++     * @param joined the newline-joined text of the request
++     * @param target the engine target language code
++     * @param appId  the Baidu application id
++     * @param secret the Baidu classic secret key
++     * @return the request to send
++     */
++    @NonNull
++    private static Request baiduSignedRequest(@NonNull final String joined,
++                                              @NonNull final String target,
++                                              @NonNull final String appId,
++                                              @NonNull final String secret) {
++        final String salt = String.valueOf(System.currentTimeMillis());
++        final RequestBody form = new FormBody.Builder()
++                .add("q", joined)
++                .add("from", "auto")
++                .add("to", target)
++                .add("appid", appId)
++                .add("salt", salt)
++                .add("sign", md5Hex(appId + joined + salt + secret))
++                .build();
++        return new Request.Builder()
++                .url("https://fanyi-api.baidu.com/ait/api/aiTextTranslate")
++                .post(form)
++                .build();
+     }
+ 
+     /**
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 21855101d..ec33164cc 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1237,7 +1237,7 @@
+     <string name="bisub_api_key_title">API 密钥</string>
+     <string name="bisub_api_key_unset">未设置</string>
+     <string name="bisub_api_key_set">已设置</string>
+-    <string name="bisub_api_key_baidu_hint">百度翻译开放平台“开发者信息”页的密钥</string>
++    <string name="bisub_api_key_baidu_hint">API Key（控制台“API Key管理”页）或传统密钥（“开发者信息”页），两者均可</string>
+     <string name="bisub_api_key_niutrans_hint">小牛翻译云平台控制台“API应用”中的 API-KEY</string>
+     <string name="bisub_app_id_title">App ID</string>
+     <string name="bisub_app_id_summary">百度翻译与小牛翻译需要在 API 密钥之外填写</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 59ffab20b..011ba4686 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1240,7 +1240,7 @@
+     <string name="bisub_api_key_title">API key</string>
+     <string name="bisub_api_key_unset">Not set</string>
+     <string name="bisub_api_key_set">Set</string>
+-    <string name="bisub_api_key_baidu_hint">The secret key from the Baidu console (developer information)</string>
++    <string name="bisub_api_key_baidu_hint">API key (console \'API Key\' page) or classic secret (developer information) — both work</string>
+     <string name="bisub_api_key_niutrans_hint">The API-KEY from the Niutrans console (API applications)</string>
+     <string name="bisub_app_id_title">App ID</string>
+     <string name="bisub_app_id_summary">Needed by Baidu and Niutrans, next to the API key</string>
+-- 
+2.54.0.windows.1
+

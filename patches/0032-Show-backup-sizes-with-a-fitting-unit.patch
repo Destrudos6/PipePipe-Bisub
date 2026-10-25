@@ -1,7 +1,7 @@
-From 7a53d605a85c9dcae438d17fa5213af2caa0286f Mon Sep 17 00:00:00 2001
+From bc5899f38a3909de8b0b0988a64e5a89c6713804 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Wed, 21 Oct 2026 12:47:04 +0800
-Subject: [PATCH] Show backup sizes with a fitting unit
+Subject: [PATCH 32/51] Show backup sizes with a fitting unit
 
 The restore list formatted every file size as megabytes with one
 decimal, so small backups (a fresh install produces a zip of a few

@@ -1,0 +1,1703 @@
+From e1a42c547d9f19b1a1c0f76967b4798b0d544bfe Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 20:41:44 +0800
+Subject: [PATCH 19/51] 0019: remove extra services, update checker, first-run
+ announcements; classic danmaku default
+
+- Compile-time removal of SoundCloud, media.ccc.de, PeerTube (incl.
+  FramaTube) and Bandcamp from the app side: manifest URL filters,
+  PeerTube instance UI and helpers, SoundCloud subscription import,
+  Kore/exception/cache special cases, service icons. The service list
+  keeps original ids, so menu lookups now use findItem/getService by id
+  instead of menu indexes or ServiceList.all()[id] (which would crash on
+  the now-sparse list)
+- Remove the upstream update checker: NewVersionWorker,
+  UpdateSettingsFragment, its settings entry and preference keys
+- Remove first-run announcement/update/donation dialogs and the GitHub
+  announcement fetcher; keep only the notification permission request
+- Default bullet comments to classic scrolling mode instead of the chat
+  panel (xml default plus both code fallbacks)
+---
+ app/src/main/AndroidManifest.xml              | 100 +---
+ .../java/org/schabi/newpipe/MainActivity.java | 149 +-----
+ .../org/schabi/newpipe/NewVersionWorker.kt    | 271 -----------
+ .../org/schabi/newpipe/RouterActivity.java    |   4 +-
+ .../org/schabi/newpipe/error/ErrorInfo.kt     |   6 +-
+ .../schabi/newpipe/error/ErrorPanelHelper.kt  |   4 +-
+ .../fragments/detail/VideoDetailFragment.java |   2 +-
+ .../player/BulletCommentsController.kt        |   2 +-
+ .../settings/BackupSettingsFragment.java      |   8 -
+ .../settings/MainSettingsFragment.java        |   7 -
+ .../newpipe/settings/NewPipeSettings.java     |   2 +-
+ .../PeertubeInstanceListFragment.java         | 431 ------------------
+ .../settings/SettingsResourceRegistry.java    |   2 +-
+ .../settings/UpdateSettingsFragment.java      |  39 --
+ .../newpipe/util/AnnouncementParser.java      |  69 ---
+ .../schabi/newpipe/util/PeertubeHelper.java   |  71 ---
+ .../schabi/newpipe/util/ServiceHelper.java    |  41 +-
+ .../external_communication/KoreUtils.java     |   3 +-
+ .../main/res/layout/instance_spinner_item.xml |   6 -
+ .../res/layout/instance_spinner_layout.xml    |   9 -
+ app/src/main/res/values/settings_keys.xml     |   6 -
+ app/src/main/res/xml/appearance_settings.xml  |   5 +-
+ app/src/main/res/xml/backup_settings.xml      |   6 -
+ app/src/main/res/xml/content_settings.xml     |   7 -
+ app/src/main/res/xml/main_settings.xml        |   6 -
+ app/src/main/res/xml/update_settings.xml      |  29 --
+ 26 files changed, 40 insertions(+), 1245 deletions(-)
+ delete mode 100644 app/src/main/java/org/schabi/newpipe/NewVersionWorker.kt
+ delete mode 100644 app/src/main/java/org/schabi/newpipe/settings/PeertubeInstanceListFragment.java
+ delete mode 100644 app/src/main/java/org/schabi/newpipe/settings/UpdateSettingsFragment.java
+ delete mode 100644 app/src/main/java/org/schabi/newpipe/util/AnnouncementParser.java
+ delete mode 100644 app/src/main/java/org/schabi/newpipe/util/PeertubeHelper.java
+ delete mode 100644 app/src/main/res/layout/instance_spinner_item.xml
+ delete mode 100644 app/src/main/res/layout/instance_spinner_layout.xml
+ delete mode 100644 app/src/main/res/xml/update_settings.xml
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index c27189e54..cdfc7496b 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -362,21 +362,9 @@
+             </intent-filter>
+ 
+             <!-- Soundcloud filter -->
+-            <intent-filter>
+-                <action android:name="android.intent.action.VIEW" />
+-                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+-                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+-
+-                <category android:name="android.intent.category.DEFAULT" />
+-                <category android:name="android.intent.category.BROWSABLE" />
+-
+-                <data android:scheme="http" />
+-                <data android:scheme="https" />
+-                <data android:host="soundcloud.com" />
+-                <data android:host="m.soundcloud.com" />
+-                <data android:host="www.soundcloud.com" />
+-                <data android:pathPrefix="/" />
+-            </intent-filter>
++            <!-- BISUB: the intent filters for SoundCloud, media.ccc.de,
++                 PeerTube and Bandcamp URLs were removed together with the
++                 services themselves. -->
+ 
+             <!-- Share filter -->
+             <intent-filter>
+@@ -385,88 +373,6 @@
+                 <data android:mimeType="text/plain" />
+             </intent-filter>
+ 
+-            <!-- media.ccc.de filter -->
+-            <intent-filter>
+-                <action android:name="android.intent.action.VIEW" />
+-                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+-                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+-
+-                <category android:name="android.intent.category.DEFAULT" />
+-                <category android:name="android.intent.category.BROWSABLE" />
+-
+-                <data android:scheme="http" />
+-                <data android:scheme="https" />
+-                <data android:host="media.ccc.de" />
+-                <!-- video prefix -->
+-                <data android:pathPrefix="/v/" />
+-                <!-- channel prefix-->
+-                <data android:pathPrefix="/c/" />
+-                <data android:pathPrefix="/b/" />
+-            </intent-filter>
+-
+-            <!-- PeerTube filter -->
+-            <intent-filter>
+-                <action android:name="android.intent.action.VIEW" />
+-                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+-                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+-
+-                <category android:name="android.intent.category.DEFAULT" />
+-                <category android:name="android.intent.category.BROWSABLE" />
+-
+-                <data android:scheme="http" />
+-                <data android:scheme="https" />
+-
+-                <data android:host="eduvid.org" />
+-                <data android:host="framatube.org" />
+-                <data android:host="media.assassinate-you.net" />
+-                <data android:host="peertube.co.uk" />
+-                <data android:host="peertube.cpy.re" />
+-                <data android:host="peertube.mastodon.host" />
+-                <data android:host="peertube.fr" />
+-                <data android:host="tilvids.com" />
+-                <data android:host="tube.privacytools.io" />
+-                <data android:host="video.ploud.fr" />
+-                <data android:host="video.lqdn.fr" />
+-                <data android:host="skeptikon.fr" />
+-                <data android:host="media.fsfe.org" />
+-
+-                <data android:pathPrefix="/videos/" /> <!-- it contains playlists -->
+-                <data android:pathPrefix="/w/" /> <!-- short video URLs -->
+-                <data android:pathPrefix="/w/p/" /> <!-- short playlist URLs -->
+-                <data android:pathPrefix="/accounts/" />
+-                <data android:pathPrefix="/a/" /> <!-- short account URLs -->
+-                <data android:pathPrefix="/video-channels/" />
+-                <data android:pathPrefix="/c/" /> <!-- short video-channels URLs -->
+-            </intent-filter>
+-
+-            <!-- Bandcamp filter for tracks, albums and playlists -->
+-            <intent-filter>
+-                <action android:name="android.intent.action.VIEW"/>
+-                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH"/>
+-                <action android:name="android.nfc.action.NDEF_DISCOVERED"/>
+-
+-                <category android:name="android.intent.category.DEFAULT"/>
+-                <category android:name="android.intent.category.BROWSABLE"/>
+-
+-                <data android:scheme="http"/>
+-                <data android:scheme="https"/>
+-                <data android:host="*.bandcamp.com"/>
+-            </intent-filter>
+-
+-            <!-- Bandcamp filter for radio -->
+-            <intent-filter>
+-                <action android:name="android.intent.action.VIEW"/>
+-                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH"/>
+-                <action android:name="android.nfc.action.NDEF_DISCOVERED"/>
+-
+-                <category android:name="android.intent.category.DEFAULT"/>
+-                <category android:name="android.intent.category.BROWSABLE"/>
+-
+-                <data android:scheme="http"/>
+-                <data android:scheme="https"/>
+-                <data android:sspPattern="bandcamp.com/?show=*"/>
+-            </intent-filter>
+-
+             <!-- BiliBili filter -->
+             <intent-filter>
+                 <action android:name="android.intent.action.VIEW" />
+diff --git a/app/src/main/java/org/schabi/newpipe/MainActivity.java b/app/src/main/java/org/schabi/newpipe/MainActivity.java
+index 61d9d5d5a..b9a24b4b6 100644
+--- a/app/src/main/java/org/schabi/newpipe/MainActivity.java
++++ b/app/src/main/java/org/schabi/newpipe/MainActivity.java
+@@ -20,10 +20,8 @@
+ 
+ package org.schabi.newpipe;
+ 
+-import static org.schabi.newpipe.util.AnnouncementParser.parseContentsBeforeId;
+ import static org.schabi.newpipe.util.Localization.assureCorrectAppLanguage;
+ 
+-import android.app.AlertDialog;
+ import android.app.Dialog;
+ import android.content.*;
+ import android.content.pm.PackageManager;
+@@ -57,14 +55,12 @@ import com.google.android.material.bottomsheet.BottomSheetBehavior;
+ import org.schabi.newpipe.databinding.ActivityMainBinding;
+ import org.schabi.newpipe.databinding.DrawerHeaderBinding;
+ import org.schabi.newpipe.databinding.DrawerLayoutBinding;
+-import org.schabi.newpipe.databinding.InstanceSpinnerLayoutBinding;
+ import org.schabi.newpipe.databinding.ToolbarLayoutBinding;
+ import org.schabi.newpipe.error.ErrorUtil;
+ import org.schabi.newpipe.extractor.NewPipe;
+ import org.schabi.newpipe.extractor.StreamingService;
+ import org.schabi.newpipe.extractor.exceptions.ExtractionException;
+ import org.schabi.newpipe.extractor.exceptions.ReCaptchaException;
+-import org.schabi.newpipe.extractor.services.peertube.PeertubeInstance;
+ import org.schabi.newpipe.fragments.BackPressable;
+ import org.schabi.newpipe.fragments.MainFragment;
+ import org.schabi.newpipe.fragments.detail.VideoDetailFragment;
+@@ -77,14 +73,14 @@ import org.schabi.newpipe.player.helper.PlayerHolder;
+ import org.schabi.newpipe.player.playqueue.PlayQueue;
+ import org.schabi.newpipe.util.selection.SelectionToolbar;
+ import org.schabi.newpipe.util.*;
+-import org.schabi.newpipe.util.external_communication.ShareUtils;
++
+ import org.schabi.newpipe.views.FocusOverlayView;
+ 
+ import java.io.IOException;
+ import java.security.SecureRandom;
+ import java.security.cert.CertificateException;
+ import java.security.cert.X509Certificate;
+-import java.util.ArrayList;
++
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Objects;
+@@ -181,84 +177,15 @@ public class MainActivity extends AppCompatActivity {
+         final App app = App.getApp();
+         final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(app);
+ 
+-        if (prefs.getBoolean(app.getString(R.string.update_app_key), false)) {
+-            // Start the worker which is checking all conditions
+-            // and eventually searching for a new version.
+-                NewVersionWorker.enqueueNewVersionCheckingWork(app, false);
+-        }
+-
+-        int currentVersionCode = BuildConfig.VERSION_CODE;
+-        int storedVersionCode = prefs.getInt("version_code", 0);
+-        long lastShowDonationTime = prefs.getLong("last_show_donation_time", 0);
+-        long currentTime = System.currentTimeMillis();
+-
+-        if (currentVersionCode > storedVersionCode + 90) {
+-            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+-            builder.setTitle(R.string.fragment_feed_title);
+-            builder.setMessage(R.string.update_log);
+-            builder.setPositiveButton(R.string.ok, null);
+-
+-            AlertDialog.Builder builder2 = new AlertDialog.Builder(this);
+-            builder2.setTitle(R.string.donation_dialog_title);
+-            builder2.setMessage(R.string.donation_dialog_message);
+-
+-            builder2.setPositiveButton(R.string.sponsor_promote, (dialog, which) -> {
+-                ShareUtils.openUrlInBrowser(this, getString(R.string.donation_url));
+-            });
+-            builder2.setNegativeButton(R.string.no, null);
+-
+-            final AlertDialog dialog2 = builder2.create();
+-
+-            final AlertDialog dialog1 = builder.create();
+-            dialog1.setOnDismissListener(new DialogInterface.OnDismissListener() {
+-                @Override
+-                public void onDismiss(DialogInterface dialog) {
+-                    if((storedVersionCode / 100 < 1110 && currentTime - lastShowDonationTime > 14 * 24 * 60 * 60 * 1000)
+-                            || currentTime - lastShowDonationTime > 30L * 24 * 60 * 60 * 1000) {
+-                        prefs.edit().putLong("last_show_donation_time", currentTime).apply();
+-                        dialog2.show();
+-                    }
+-                }
+-            });
+-
+-            dialog1.show();
+-            prefs.edit().putInt("version_code", currentVersionCode).apply();
+-        }
+-        String lastAnnouncementId = prefs.getString("last_announcement_id", null);
+-        try {
+-            NewPipe.getDownloader().getAsync("https://github.com/InfinityLoop1308/PipePipe/wiki/Announcement", resp -> {
+-                AnnouncementParser.ParsedResult result = parseContentsBeforeId(resp.responseBody(), lastAnnouncementId);
+-                if(result.latestId != null) {
+-                    Handler handler = new Handler(Looper.getMainLooper());
+-                    handler.post(() -> {
+-                        AlertDialog.Builder builder3 = new AlertDialog.Builder(this);
+-                        builder3.setMessage(result.contents);
+-                        builder3.setTitle(R.string.announcement);
+-                        builder3.setPositiveButton(R.string.ok, (dialog, which) -> {
+-                            prefs.edit().putString("last_announcement_id", result.latestId).apply();
+-                        });
+-                        builder3.show();
+-                    });
+-                }
+-            });
+-        } catch (Exception ignore) {
+-        }
+-
+-
+-        int isFirstRun = prefs.getInt("isFirstRun", 0);
+-        if (isFirstRun == 0) {
+-            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+-            builder.setTitle(R.string.dialog_title_enable_update_checker);
+-            builder.setMessage(R.string.dialog_message_enable_update_checker);
+-            builder.setPositiveButton(R.string.ok, (dialog, which) -> {
+-                prefs.edit().putBoolean(app.getString(R.string.update_app_key), true).apply();
+-                NewVersionWorker.enqueueNewVersionCheckingWork(app, true);
+-            });
+-            builder.setNegativeButton(R.string.no, (dialog, which) -> prefs.edit().putBoolean(app.getString(R.string.update_app_key), false).apply());
+-            builder.show();
++        // BISUB-BEGIN: the upstream update checker, the update announcement,
++        // the donation dialog and the first-run "enable update checker"
++        // dialog were removed; only the notification permission request is
++        // kept for first runs.
++        if (prefs.getInt("isFirstRun", 0) == 0) {
+             prefs.edit().putInt("isFirstRun", 1).apply();
+             PermissionChecker.checkNotificationPermission(this);
+         }
++        // BISUB-END
+     }
+ 
+     private void setupDrawer() throws ExtractionException {
+@@ -357,13 +284,15 @@ public class MainActivity extends AppCompatActivity {
+     }
+ 
+     private void changeService(final MenuItem item) {
++        // BISUB: look up menu items by service id (findItem) instead of by
++        // menu index (getItem), see showServices().
+         drawerLayoutBinding.navigation.getMenu()
+-                .getItem(ServiceHelper.getSelectedServiceId(this))
++                .findItem(ServiceHelper.getSelectedServiceId(this))
+                 .setChecked(false);
+         ServiceHelper.setSelectedServiceId(this, item.getItemId());
+         SearchFragment.setPersistedSearchServiceId(this, item.getItemId());
+         drawerLayoutBinding.navigation.getMenu()
+-                .getItem(ServiceHelper.getSelectedServiceId(this))
++                .findItem(ServiceHelper.getSelectedServiceId(this))
+                 .setChecked(true);
+     }
+ 
+@@ -462,61 +391,15 @@ public class MainActivity extends AppCompatActivity {
+             final MenuItem menuItem = drawerLayoutBinding.navigation.getMenu()
+                     .add(R.id.menu_services_group, s.getServiceId(), ORDER, title)
+                     .setIcon(ServiceHelper.getIcon(s.getServiceId()));
+-
+-            // peertube specifics
+-            if (s.getServiceId() == 3) {
+-                enhancePeertubeMenu(s, menuItem);
+-            }
+         }
++        // BISUB: services are addressed by their (unchanged) service id, not
++        // by the menu index, because the service list no longer contains every
++        // id between 0 and the highest one.
+         drawerLayoutBinding.navigation.getMenu()
+-                .getItem(ServiceHelper.getSelectedServiceId(this))
++                .findItem(ServiceHelper.getSelectedServiceId(this))
+                 .setChecked(true);
+     }
+ 
+-    private void enhancePeertubeMenu(final StreamingService s, final MenuItem menuItem) {
+-        final PeertubeInstance currentInstance = PeertubeHelper.getCurrentInstance();
+-        menuItem.setTitle(currentInstance.getName() + (ServiceHelper.isBeta(s) ? " (Legacy)" : ""));
+-        final Spinner spinner = InstanceSpinnerLayoutBinding.inflate(LayoutInflater.from(this))
+-                .getRoot();
+-        final List<PeertubeInstance> instances = PeertubeHelper.getInstanceList(this);
+-        final List<String> items = new ArrayList<>();
+-        int defaultSelect = 0;
+-        for (final PeertubeInstance instance : instances) {
+-            items.add(instance.getName());
+-            if (instance.getUrl().equals(currentInstance.getUrl())) {
+-                defaultSelect = items.size() - 1;
+-            }
+-        }
+-        final ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+-                R.layout.instance_spinner_item, items);
+-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+-        spinner.setAdapter(adapter);
+-        spinner.setSelection(defaultSelect, false);
+-        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+-            @Override
+-            public void onItemSelected(final AdapterView<?> parent, final View view,
+-                                       final int position, final long id) {
+-                final PeertubeInstance newInstance = instances.get(position);
+-                if (newInstance.getUrl().equals(PeertubeHelper.getCurrentInstance().getUrl())) {
+-                    return;
+-                }
+-                PeertubeHelper.selectInstance(newInstance, getApplicationContext());
+-                changeService(menuItem);
+-                mainBinding.getRoot().closeDrawers();
+-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+-                    getSupportFragmentManager().popBackStack(null,
+-                            FragmentManager.POP_BACK_STACK_INCLUSIVE);
+-                    ActivityCompat.recreate(MainActivity.this);
+-                }, 300);
+-            }
+-
+-            @Override
+-            public void onNothingSelected(final AdapterView<?> parent) {
+-
+-            }
+-        });
+-        menuItem.setActionView(spinner);
+-    }
+ 
+     @Override
+     protected void onDestroy() {
+diff --git a/app/src/main/java/org/schabi/newpipe/NewVersionWorker.kt b/app/src/main/java/org/schabi/newpipe/NewVersionWorker.kt
+deleted file mode 100644
+index 06e61e8d4..000000000
+--- a/app/src/main/java/org/schabi/newpipe/NewVersionWorker.kt
++++ /dev/null
+@@ -1,271 +0,0 @@
+-package org.schabi.newpipe
+-
+-import android.app.PendingIntent
+-import android.content.Context
+-import android.content.Intent
+-import android.os.Build
+-import android.util.Log
+-import android.widget.Toast
+-import androidx.core.app.NotificationCompat
+-import androidx.core.app.NotificationManagerCompat
+-import androidx.core.content.ContextCompat
+-import androidx.core.content.edit
+-import androidx.core.net.toUri
+-import androidx.preference.PreferenceManager
+-import androidx.work.OneTimeWorkRequestBuilder
+-import androidx.work.WorkManager
+-import androidx.work.Worker
+-import androidx.work.WorkerParameters
+-import androidx.work.workDataOf
+-import com.grack.nanojson.JsonObject
+-import com.grack.nanojson.JsonParser
+-import com.grack.nanojson.JsonParserException
+-import org.schabi.newpipe.extractor.downloader.Response
+-import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+-import org.schabi.newpipe.util.ReleaseVersionUtil.coerceUpdateCheckExpiry
+-import org.schabi.newpipe.util.ReleaseVersionUtil.isLastUpdateCheckExpired
+-import java.io.IOException
+-
+-class NewVersionWorker(
+-    context: Context,
+-    workerParams: WorkerParameters
+-) : Worker(context, workerParams) {
+-
+-    private fun compareVersionName(buildVersionCodes: List<String>, versionCodes: List<String>): Boolean {
+-        return versionCodes[0].toInt() > buildVersionCodes[0].toInt() ||
+-            versionCodes[0].toInt() == buildVersionCodes[0].toInt() && versionCodes[1].toInt() > buildVersionCodes[1].toInt() ||
+-            versionCodes[0].toInt() == buildVersionCodes[0].toInt() && versionCodes[1].toInt() == buildVersionCodes[1].toInt() && versionCodes[2].toInt() > buildVersionCodes[2].toInt()
+-    }
+-    /**
+-     * Method to compare the current and latest available app version.
+-     * If a newer version is available, we show the update notification.
+-     *
+-     * @param versionName    Name of new version
+-     * @param apkLocationUrl Url with the new apk
+-     * @param versionCode    Code of new version
+-     */
+-    private fun compareAppVersionAndShowNotification(
+-        versionName: String,
+-        apkLocationUrl: String?,
+-        isManual: Boolean
+-    ) {
+-        val currentVersion = parseVersion(BuildConfig.VERSION_NAME)
+-        val newVersion = parseVersion(versionName)
+-        if (compareVersions(currentVersion, newVersion) >= 0) {
+-            if (isManual) {
+-                ContextCompat.getMainExecutor(applicationContext).execute {
+-                    Toast.makeText(
+-                        applicationContext, R.string.app_update_unavailable_toast,
+-                        Toast.LENGTH_SHORT
+-                    ).show()
+-                }
+-            }
+-            return
+-        }
+-
+-        // A pending intent to open the apk location url in the browser.
+-        val intent = Intent(Intent.ACTION_VIEW, apkLocationUrl?.toUri())
+-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+-        val pendingIntent = PendingIntent.getActivity(
+-            applicationContext, 0, intent,
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+-            else PendingIntent.FLAG_UPDATE_CURRENT
+-        )
+-        val channelId = applicationContext.getString(R.string.app_update_notification_channel_id)
+-        val notificationBuilder = NotificationCompat.Builder(applicationContext, channelId)
+-            .setSmallIcon(R.drawable.ic_newpipe_update)
+-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+-            .setContentIntent(pendingIntent)
+-            .setAutoCancel(true)
+-            .setContentTitle(applicationContext.getString(R.string.app_update_notification_content_title_new))
+-            .setContentText(
+-                applicationContext.getString(R.string.app_update_notification_content_text) +
+-                    " " + versionName
+-            )
+-        val notificationManager = NotificationManagerCompat.from(applicationContext)
+-        notificationManager.notify(2000, notificationBuilder.build())
+-    }
+-
+-    @Throws(IOException::class, ReCaptchaException::class)
+-    private fun checkNewVersion() {
+-        // Check if the current apk is a github one or not.
+-//        if (!isReleaseApk()) {
+-//            return
+-//        }
+-
+-        if (!inputData.getBoolean(IS_MANUAL, false)) {
+-            val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+-            // Check if the last request has happened a certain time ago
+-            // to reduce the number of API requests.
+-            val expiry = prefs.getLong(applicationContext.getString(R.string.update_expiry_key), 0)
+-            if (!isLastUpdateCheckExpired(expiry)) {
+-                return
+-            }
+-        }
+-
+-        // Make a network request to get latest NewPipe data.
+-        val response = DownloaderImpl.getInstance().get(NEWPIPE_API_URL)
+-        handleResponse(response)
+-    }
+-
+-    private fun handleResponse(response: Response) {
+-        val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+-        try {
+-            // Store a timestamp which needs to be exceeded,
+-            // before a new request to the API is made.
+-            val newExpiry = coerceUpdateCheckExpiry(response.getHeader("expires"))
+-            prefs.edit {
+-                putLong(applicationContext.getString(R.string.update_expiry_key), newExpiry)
+-            }
+-        } catch (e: Exception) {
+-            if (DEBUG) {
+-                Log.w(TAG, "Could not extract and save new expiry date", e)
+-            }
+-        }
+-
+-        // Parse the json from the response.
+-        try {
+-            val githubReleases = JsonParser.`array`().from(response.responseBody())
+-            val includePreRelease = prefs.getBoolean(applicationContext.getString(R.string.show_prerelease_key), false)
+-            var selectedRelease: JsonObject? = null
+-
+-            // 选择最新符合要求的版本（稳定版或包括预发布）
+-            for (i in 0 until githubReleases.size) {
+-                val release = githubReleases.getObject(i)
+-                if (!includePreRelease && release.getBoolean("prerelease")) continue
+-                if (selectedRelease == null || isNewerRelease(release, selectedRelease)) {
+-                    selectedRelease = release
+-                }
+-            }
+-
+-            selectedRelease?.let { release ->
+-                val versionName = release.getString("name").removePrefix("v")
+-                val apkUrl = findCompatibleApkUrl(release, Build.SUPPORTED_ABIS)
+-                compareAppVersionAndShowNotification(versionName, apkUrl, inputData.getBoolean(IS_MANUAL, false))
+-            }
+-        } catch (e: JsonParserException) {
+-            if (DEBUG) Log.w(TAG, "JSON解析错误", e)
+-        }
+-    }
+-
+-    private fun isNewerRelease(newRelease: JsonObject, currentRelease: JsonObject): Boolean {
+-        val newVersion = parseVersion(newRelease.getString("name").removePrefix("v"))
+-        val currentVersion = parseVersion(currentRelease.getString("name").removePrefix("v"))
+-        return compareVersions(newVersion, currentVersion) > 0
+-    }
+-
+-    private fun findCompatibleApkUrl(release: JsonObject, abis: Array<String>): String? {
+-        val assets = release.getArray("assets")
+-        val apkAssets = (0 until assets.size)
+-            .map { assets.getObject(it) }
+-            .filter { it.getString("name").endsWith(".apk") }
+-
+-        abis.forEach { abi ->
+-            val compatibleAsset = apkAssets.firstOrNull { asset ->
+-                getReleaseApkAbi(asset.getString("name")) == abi
+-            }
+-            if (compatibleAsset != null) {
+-                return compatibleAsset.getString("browser_download_url")
+-            }
+-        }
+-
+-        return apkAssets.firstOrNull { it.getString("name").contains("universal") }
+-            ?.getString("browser_download_url")
+-    }
+-
+-
+-
+-    override fun doWork(): Result {
+-        return try {
+-            checkNewVersion()
+-            Result.success()
+-        } catch (e: IOException) {
+-            Log.w(TAG, "Could not fetch NewPipe API: probably network problem", e)
+-            Result.failure()
+-        } catch (e: ReCaptchaException) {
+-            Log.e(TAG, "ReCaptchaException should never happen here.", e)
+-            Result.failure()
+-        }
+-    }
+-
+-    companion object {
+-        private val DEBUG = MainActivity.DEBUG
+-        private val TAG = NewVersionWorker::class.java.simpleName
+-        private val RELEASE_APK_ABIS = listOf("armeabi-v7a", "arm64-v8a", "x86_64", "x86")
+-        private const val NEWPIPE_API_URL = "https://api.github.com/repositories/490984887/releases"
+-        private const val IS_MANUAL = "isManual"
+-
+-        private fun getReleaseApkAbi(name: String): String? {
+-            return RELEASE_APK_ABIS.firstOrNull { name.contains("-$it-") }
+-        }
+-        /**
+-         * Start a new worker which checks if all conditions for performing a version check are met,
+-         * fetches the API endpoint [.NEWPIPE_API_URL] containing info about the latest NewPipe
+-         * version and displays a notification about an available update if one is available.
+-         * <br></br>
+-         * Following conditions need to be met, before data is requested from the server:
+-         *
+-         *  *  The app is signed with the correct signing key (by TeamNewPipe / schabi).
+-         * If the signing key differs from the one used upstream, the update cannot be installed.
+-         *  * The user enabled searching for and notifying about updates in the settings.
+-         *  * The app did not recently check for updates.
+-         * We do not want to make unnecessary connections and DOS our servers.
+-         */
+-        @JvmStatic
+-        fun enqueueNewVersionCheckingWork(context: Context, isManual: Boolean) {
+-            val workRequest = OneTimeWorkRequestBuilder<NewVersionWorker>()
+-                .setInputData(workDataOf(IS_MANUAL to isManual))
+-                .build()
+-            WorkManager.getInstance(context).enqueue(workRequest)
+-        }
+-    }
+-}
+-
+-data class Version(
+-    val major: Int,
+-    val minor: Int,
+-    val patch: Int,
+-    val betaVersion: Int? // null表示正式版，数字表示beta版本号
+-)
+-
+-private fun parseVersion(versionStr: String): Version {
+-    val normalized = versionStr.removePrefix("v")
+-    val parts = normalized.split("-beta", limit = 2)
+-    val mainPart = parts[0]
+-
+-    val mainParts = mainPart.split(".").map {
+-        it.toIntOrNull() ?: throw IllegalArgumentException("Invalid version part: $it")
+-    }
+-
+-    val (major, minor, patch) = mainParts
+-
+-    // beta版本号处理
+-    val betaVersion = when {
+-        parts.size == 1 -> null  // 没有beta部分，是正式版
+-        parts[1].isEmpty() -> 0  // 是 "-beta" 结尾
+-        else -> parts[1].toIntOrNull() // 是 "-beta1" 这样的格式
+-    }
+-
+-    return Version(major, minor, patch, betaVersion)
+-}
+-
+-private fun compareVersions(v1: Version, v2: Version): Int {
+-    // 先比较主版本号
+-    val mainCompare = when {
+-        v1.major != v2.major -> v1.major.compareTo(v2.major)
+-        v1.minor != v2.minor -> v1.minor.compareTo(v2.minor)
+-        v1.patch != v2.patch -> v1.patch.compareTo(v2.patch)
+-        else -> 0
+-    }
+-
+-    if (mainCompare != 0) return mainCompare
+-
+-    // 主版本号相同，比较beta版本
+-    return when {
+-        v1.betaVersion == null && v2.betaVersion == null -> 0  // 都是正式版
+-        v1.betaVersion == null -> 1  // v1是正式版，比beta版大
+-        v2.betaVersion == null -> -1 // v2是正式版，比beta版大
+-        else -> v1.betaVersion.compareTo(v2.betaVersion) // 比较beta版本号
+-    }
+-}
+diff --git a/app/src/main/java/org/schabi/newpipe/RouterActivity.java b/app/src/main/java/org/schabi/newpipe/RouterActivity.java
+index 90e20a515..2a6a94a50 100644
+--- a/app/src/main/java/org/schabi/newpipe/RouterActivity.java
++++ b/app/src/main/java/org/schabi/newpipe/RouterActivity.java
+@@ -224,9 +224,7 @@ public class RouterActivity extends AppCompatActivity {
+             Toast.makeText(context, R.string.paid_content_new, Toast.LENGTH_LONG).show();
+         } else if (throwable instanceof PrivateContentException) {
+             Toast.makeText(context, R.string.private_content_new, Toast.LENGTH_LONG).show();
+-        } else if (throwable instanceof SoundCloudGoPlusContentException) {
+-            Toast.makeText(context, R.string.soundcloud_go_plus_content_new,
+-                    Toast.LENGTH_LONG).show();
++
+         } else if (throwable instanceof YoutubeMusicPremiumContentException) {
+             Toast.makeText(context, R.string.youtube_music_premium_content_new,
+                     Toast.LENGTH_LONG).show();
+diff --git a/app/src/main/java/org/schabi/newpipe/error/ErrorInfo.kt b/app/src/main/java/org/schabi/newpipe/error/ErrorInfo.kt
+index 68b5c7e94..9db192da5 100644
+--- a/app/src/main/java/org/schabi/newpipe/error/ErrorInfo.kt
++++ b/app/src/main/java/org/schabi/newpipe/error/ErrorInfo.kt
+@@ -104,7 +104,11 @@ class ErrorInfo(
+ 
+         private fun getServiceNameFromId(serviceId: Int) = NewPipe.getNameOfService(serviceId) +
+                 if (serviceId != -1) {
+-                    " (" + (if (ServiceList.all()[serviceId].hasTokens()) "Logged in" else "Anonymous") + ")"
++                    // BISUB: the service list is sparse (ids 1-4 were removed
++                    // from the build), so the service must be looked up by id
++                    // instead of by indexing ServiceList.all().
++                    val service = ServiceList.all().firstOrNull { it.serviceId == serviceId }
++                    " (" + (if (service?.hasTokens() == true) "Logged in" else "Anonymous") + ")"
+                 } else {
+                     ""
+                 }
+diff --git a/app/src/main/java/org/schabi/newpipe/error/ErrorPanelHelper.kt b/app/src/main/java/org/schabi/newpipe/error/ErrorPanelHelper.kt
+index cf007be73..0a3f31b1b 100644
+--- a/app/src/main/java/org/schabi/newpipe/error/ErrorPanelHelper.kt
++++ b/app/src/main/java/org/schabi/newpipe/error/ErrorPanelHelper.kt
+@@ -27,7 +27,7 @@ import org.schabi.newpipe.extractor.exceptions.NeedLoginException
+ import org.schabi.newpipe.extractor.exceptions.PaidContentException
+ import org.schabi.newpipe.extractor.exceptions.PrivateContentException
+ import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+-import org.schabi.newpipe.extractor.exceptions.SoundCloudGoPlusContentException
++
+ import org.schabi.newpipe.extractor.exceptions.WebViewUnavailableException
+ import org.schabi.newpipe.extractor.exceptions.YoutubeMusicPremiumContentException
+ import org.schabi.newpipe.extractor.utils.Utils.isNullOrEmpty
+@@ -221,7 +221,7 @@ class ErrorPanelHelper(
+                 is GeographicRestrictionException -> R.string.georestricted_content
+                 is PaidContentException -> R.string.paid_content_new
+                 is PrivateContentException -> R.string.private_content_new
+-                is SoundCloudGoPlusContentException -> R.string.soundcloud_go_plus_content_new
++
+                 is YoutubeMusicPremiumContentException -> R.string.youtube_music_premium_content_new
+                 is WebViewUnavailableException -> R.string.webview_unavailable_youtube_hint
+                 is ContentNotAvailableException -> R.string.content_not_available
+diff --git a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+index b29f28b72..b0b6b1d1c 100644
+--- a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+@@ -1459,7 +1459,7 @@ public final class VideoDetailFragment
+                 PreferenceManager.getDefaultSharedPreferences(requireContext());
+         // the video tabs option only controls whether the tab is added, fullscreen chat is unaffected
+         return getVideoTabs(prefs).contains(VIDEO_TAB_CHAT)
+-                && prefs.getBoolean(getString(R.string.bullet_comments_chat_mode_key), true);
++                && prefs.getBoolean(getString(R.string.bullet_comments_chat_mode_key), false);
+     }
+ 
+     /** Ignores page changes caused by tab rebuilds until the pager has laid out again. */
+diff --git a/app/src/main/java/org/schabi/newpipe/player/BulletCommentsController.kt b/app/src/main/java/org/schabi/newpipe/player/BulletCommentsController.kt
+index 464911f61..d1792881f 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/BulletCommentsController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/BulletCommentsController.kt
+@@ -48,7 +48,7 @@ class BulletCommentsController(private val player: Player) {
+     val isChatMode: Boolean
+         get() = player.prefs.getBoolean(
+             player.context.getString(R.string.bullet_comments_chat_mode_key),
+-            true,
++            false,
+         )
+ 
+     /**
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BackupSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BackupSettingsFragment.java
+index ebb0fb0de..66bb0c3ec 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BackupSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BackupSettingsFragment.java
+@@ -124,14 +124,6 @@ public class BackupSettingsFragment extends BasePreferenceFragment {
+             return true;
+         });
+ 
+-        final Preference importSoundCloudSubscriptionsPreference =
+-                requirePreference(R.string.import_soundcloud_subscriptions_key);
+-        importSoundCloudSubscriptionsPreference.setOnPreferenceClickListener(
+-                (final Preference p) -> {
+-                    NavigationHelper.openSubscriptionsImportFragment(getParentFragmentManager(),
+-                            R.id.settings_fragment_holder, ServiceList.SoundCloud.getServiceId());
+-                    return true;
+-                });
+ 
+         final Preference exportSubscriptionsPreference =
+                 requirePreference(R.string.export_subscriptions_key);
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/MainSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/MainSettingsFragment.java
+index 3df7dc05c..28190d37f 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/MainSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/MainSettingsFragment.java
+@@ -22,13 +22,6 @@ public class MainSettingsFragment extends BasePreferenceFragment {
+ 
+         setHasOptionsMenu(true); // Otherwise onCreateOptionsMenu is not called
+ 
+-        // Check if the app is updatable
+-//        if (!ReleaseVersionUtil.isReleaseApk()) {
+-//            getPreferenceScreen().removePreference(
+-//                    findPreference(getString(R.string.update_pref_screen_key)));
+-//
+-//            defaultPreferences.edit().putBoolean(getString(R.string.update_app_key), false).apply();
+-//        }
+ 
+         // Hide debug preferences in RELEASE build variant
+         if (!DEBUG) {
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/NewPipeSettings.java b/app/src/main/java/org/schabi/newpipe/settings/NewPipeSettings.java
+index 282d54e8f..739b2cf28 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/NewPipeSettings.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/NewPipeSettings.java
+@@ -79,7 +79,7 @@ public final class NewPipeSettings {
+         PreferenceManager.setDefaultValues(context, R.xml.history_settings, true);
+         PreferenceManager.setDefaultValues(context, R.xml.content_settings, true);
+         PreferenceManager.setDefaultValues(context, R.xml.player_notification_settings, true);
+-        PreferenceManager.setDefaultValues(context, R.xml.update_settings, true);
++
+         PreferenceManager.setDefaultValues(context, R.xml.debug_settings, true);
+         PreferenceManager.setDefaultValues(context, R.xml.sponsor_block_category_settings, true);
+         PreferenceManager.setDefaultValues(context, R.xml.sponsor_block_settings, true);
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/PeertubeInstanceListFragment.java b/app/src/main/java/org/schabi/newpipe/settings/PeertubeInstanceListFragment.java
+deleted file mode 100644
+index c7eb0be40..000000000
+--- a/app/src/main/java/org/schabi/newpipe/settings/PeertubeInstanceListFragment.java
++++ /dev/null
+@@ -1,431 +0,0 @@
+-package org.schabi.newpipe.settings;
+-
+-import android.annotation.SuppressLint;
+-import android.content.Context;
+-import android.content.SharedPreferences;
+-import android.os.Bundle;
+-import android.text.InputType;
+-import android.view.LayoutInflater;
+-import android.view.Menu;
+-import android.view.MenuInflater;
+-import android.view.MenuItem;
+-import android.view.MotionEvent;
+-import android.view.View;
+-import android.view.ViewGroup;
+-import android.widget.ImageView;
+-import android.widget.ProgressBar;
+-import android.widget.RadioButton;
+-import android.widget.TextView;
+-import android.widget.Toast;
+-
+-import androidx.annotation.NonNull;
+-import androidx.annotation.Nullable;
+-import androidx.appcompat.app.AlertDialog;
+-import androidx.appcompat.widget.AppCompatImageView;
+-import androidx.fragment.app.Fragment;
+-import androidx.preference.PreferenceManager;
+-import androidx.recyclerview.widget.ItemTouchHelper;
+-import androidx.recyclerview.widget.LinearLayoutManager;
+-import androidx.recyclerview.widget.RecyclerView;
+-
+-import com.google.android.material.floatingactionbutton.FloatingActionButton;
+-import com.grack.nanojson.JsonStringWriter;
+-import com.grack.nanojson.JsonWriter;
+-
+-import org.schabi.newpipe.R;
+-import org.schabi.newpipe.databinding.DialogEditTextBinding;
+-import org.schabi.newpipe.extractor.services.peertube.PeertubeInstance;
+-import org.schabi.newpipe.util.Constants;
+-import org.schabi.newpipe.util.PeertubeHelper;
+-import org.schabi.newpipe.util.ThemeHelper;
+-
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.List;
+-
+-import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
+-import io.reactivex.rxjava3.core.Single;
+-import io.reactivex.rxjava3.disposables.CompositeDisposable;
+-import io.reactivex.rxjava3.disposables.Disposable;
+-import io.reactivex.rxjava3.schedulers.Schedulers;
+-
+-public class PeertubeInstanceListFragment extends Fragment {
+-    private final List<PeertubeInstance> instanceList = new ArrayList<>();
+-    private PeertubeInstance selectedInstance;
+-    private String savedInstanceListKey;
+-    private InstanceListAdapter instanceListAdapter;
+-
+-    private ProgressBar progressBar;
+-    private SharedPreferences sharedPreferences;
+-
+-    private CompositeDisposable disposables = new CompositeDisposable();
+-
+-    /*//////////////////////////////////////////////////////////////////////////
+-    // Lifecycle
+-    //////////////////////////////////////////////////////////////////////////*/
+-
+-    @Override
+-    public void onCreate(@Nullable final Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-
+-        sharedPreferences = PreferenceManager.getDefaultSharedPreferences(requireContext());
+-        savedInstanceListKey = getString(R.string.peertube_instance_list_key);
+-        selectedInstance = PeertubeHelper.getCurrentInstance();
+-        updateInstanceList();
+-
+-        setHasOptionsMenu(true);
+-    }
+-
+-    @Override
+-    public View onCreateView(@NonNull final LayoutInflater inflater, final ViewGroup container,
+-                             final Bundle savedInstanceState) {
+-        return inflater.inflate(R.layout.fragment_instance_list, container, false);
+-    }
+-
+-    @Override
+-    public void onViewCreated(@NonNull final View rootView,
+-                              @Nullable final Bundle savedInstanceState) {
+-        super.onViewCreated(rootView, savedInstanceState);
+-
+-        initViews(rootView);
+-    }
+-
+-    private void initViews(@NonNull final View rootView) {
+-        final TextView instanceHelpTV = rootView.findViewById(R.id.instanceHelpTV);
+-        instanceHelpTV.setText(getString(R.string.peertube_instance_url_help,
+-                getString(R.string.peertube_instance_list_url)));
+-
+-        initButton(rootView);
+-
+-        final RecyclerView listInstances = rootView.findViewById(R.id.instances);
+-        listInstances.setLayoutManager(new LinearLayoutManager(requireContext()));
+-
+-        final ItemTouchHelper itemTouchHelper = new ItemTouchHelper(getItemTouchCallback());
+-        itemTouchHelper.attachToRecyclerView(listInstances);
+-
+-        instanceListAdapter = new InstanceListAdapter(requireContext(), itemTouchHelper);
+-        listInstances.setAdapter(instanceListAdapter);
+-
+-        progressBar = rootView.findViewById(R.id.loading_progress_bar);
+-    }
+-
+-    @Override
+-    public void onResume() {
+-        super.onResume();
+-        ThemeHelper.setTitleToAppCompatActivity(getActivity(),
+-                getString(R.string.peertube_instance_url_title));
+-    }
+-
+-    @Override
+-    public void onPause() {
+-        super.onPause();
+-        saveChanges();
+-    }
+-
+-    @Override
+-    public void onDestroy() {
+-        super.onDestroy();
+-        if (disposables != null) {
+-            disposables.clear();
+-        }
+-        disposables = null;
+-    }
+-
+-    /*//////////////////////////////////////////////////////////////////////////
+-    // Menu
+-    //////////////////////////////////////////////////////////////////////////*/
+-
+-    @Override
+-    public void onCreateOptionsMenu(@NonNull final Menu menu,
+-                                    @NonNull final MenuInflater inflater) {
+-        super.onCreateOptionsMenu(menu, inflater);
+-        inflater.inflate(R.menu.menu_chooser_fragment, menu);
+-    }
+-
+-    @Override
+-    public boolean onOptionsItemSelected(final MenuItem item) {
+-        if (item.getItemId() == R.id.menu_item_restore_default) {
+-            restoreDefaults();
+-            return true;
+-        }
+-
+-        return super.onOptionsItemSelected(item);
+-    }
+-
+-    /*//////////////////////////////////////////////////////////////////////////
+-    // Utils
+-    //////////////////////////////////////////////////////////////////////////*/
+-
+-    private void updateInstanceList() {
+-        instanceList.clear();
+-        instanceList.addAll(PeertubeHelper.getInstanceList(requireContext()));
+-    }
+-
+-    private void selectInstance(final PeertubeInstance instance) {
+-        selectedInstance = PeertubeHelper.selectInstance(instance, requireContext());
+-        sharedPreferences.edit().putBoolean(Constants.KEY_MAIN_PAGE_CHANGE, true).apply();
+-    }
+-
+-    private void saveChanges() {
+-        final JsonStringWriter jsonWriter = JsonWriter.string().object().array("instances");
+-        for (final PeertubeInstance instance : instanceList) {
+-            jsonWriter.object();
+-            jsonWriter.value("name", instance.getName());
+-            jsonWriter.value("url", instance.getUrl());
+-            jsonWriter.end();
+-        }
+-        final String jsonToSave = jsonWriter.end().end().done();
+-        sharedPreferences.edit().putString(savedInstanceListKey, jsonToSave).apply();
+-    }
+-
+-    private void restoreDefaults() {
+-        new AlertDialog.Builder(requireContext())
+-                .setTitle(R.string.restore_defaults)
+-                .setMessage(R.string.restore_defaults_confirmation)
+-                .setNegativeButton(R.string.cancel, null)
+-                .setPositiveButton(R.string.ok, (dialog, which) -> {
+-                    sharedPreferences.edit().remove(savedInstanceListKey).apply();
+-                    selectInstance(PeertubeInstance.DEFAULT_INSTANCE);
+-                    updateInstanceList();
+-                    instanceListAdapter.notifyDataSetChanged();
+-                })
+-                .show();
+-    }
+-
+-    private void initButton(final View rootView) {
+-        final FloatingActionButton fab = rootView.findViewById(R.id.addInstanceButton);
+-        fab.setOnClickListener(v ->
+-                showAddItemDialog(requireContext()));
+-    }
+-
+-    private void showAddItemDialog(final Context c) {
+-        final DialogEditTextBinding dialogBinding
+-                = DialogEditTextBinding.inflate(getLayoutInflater());
+-        dialogBinding.dialogEditText.setInputType(
+-                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+-        dialogBinding.dialogEditText.setHint(R.string.peertube_instance_add_help);
+-
+-        new AlertDialog.Builder(c)
+-                .setTitle(R.string.peertube_instance_add_title)
+-                .setIcon(R.drawable.place_holder_peertube)
+-                .setView(dialogBinding.getRoot())
+-                .setNegativeButton(R.string.cancel, null)
+-                .setPositiveButton(R.string.ok, (dialog1, which) -> {
+-                    final String url = dialogBinding.dialogEditText.getText().toString();
+-                    addInstance(url);
+-                })
+-                .show();
+-    }
+-
+-    private void addInstance(final String url) {
+-        final String cleanUrl = cleanUrl(url);
+-        if (cleanUrl == null) {
+-            return;
+-        }
+-        progressBar.setVisibility(View.VISIBLE);
+-        final Disposable disposable = Single.fromCallable(() -> {
+-            final PeertubeInstance instance = new PeertubeInstance(cleanUrl);
+-            instance.fetchInstanceMetaData();
+-            return instance;
+-        }).subscribeOn(Schedulers.io()).observeOn(AndroidSchedulers.mainThread())
+-                .subscribe((instance) -> {
+-                    progressBar.setVisibility(View.GONE);
+-                    add(instance);
+-                }, e -> {
+-                    progressBar.setVisibility(View.GONE);
+-                    Toast.makeText(getActivity(), R.string.peertube_instance_add_fail,
+-                            Toast.LENGTH_SHORT).show();
+-                });
+-        disposables.add(disposable);
+-    }
+-
+-    @Nullable
+-    private String cleanUrl(final String url) {
+-        String cleanUrl = url.trim();
+-        // if protocol not present, add https
+-        if (!cleanUrl.startsWith("http")) {
+-            cleanUrl = "https://" + cleanUrl;
+-        }
+-        // remove trailing slash
+-        cleanUrl = cleanUrl.replaceAll("/$", "");
+-        // only allow https
+-        if (!cleanUrl.startsWith("https://")) {
+-            Toast.makeText(getActivity(), R.string.peertube_instance_add_https_only,
+-                    Toast.LENGTH_SHORT).show();
+-            return null;
+-        }
+-        // only allow if not already exists
+-        for (final PeertubeInstance instance : instanceList) {
+-            if (instance.getUrl().equals(cleanUrl)) {
+-                Toast.makeText(getActivity(), R.string.peertube_instance_add_exists,
+-                        Toast.LENGTH_SHORT).show();
+-                return null;
+-            }
+-        }
+-        return cleanUrl;
+-    }
+-
+-    private void add(final PeertubeInstance instance) {
+-        instanceList.add(instance);
+-        instanceListAdapter.notifyDataSetChanged();
+-    }
+-
+-    private ItemTouchHelper.SimpleCallback getItemTouchCallback() {
+-        return new ItemTouchHelper.SimpleCallback(ItemTouchHelper.UP | ItemTouchHelper.DOWN,
+-                ItemTouchHelper.START | ItemTouchHelper.END) {
+-            @Override
+-            public int interpolateOutOfBoundsScroll(@NonNull final RecyclerView recyclerView,
+-                                                    final int viewSize,
+-                                                    final int viewSizeOutOfBounds,
+-                                                    final int totalSize,
+-                                                    final long msSinceStartScroll) {
+-                final int standardSpeed = super.interpolateOutOfBoundsScroll(recyclerView, viewSize,
+-                        viewSizeOutOfBounds, totalSize, msSinceStartScroll);
+-                final int minimumAbsVelocity = Math.max(12,
+-                        Math.abs(standardSpeed));
+-                return minimumAbsVelocity * (int) Math.signum(viewSizeOutOfBounds);
+-            }
+-
+-            @Override
+-            public boolean onMove(@NonNull final RecyclerView recyclerView,
+-                                  @NonNull final RecyclerView.ViewHolder source,
+-                                  @NonNull final RecyclerView.ViewHolder target) {
+-                if (source.getItemViewType() != target.getItemViewType()
+-                        || instanceListAdapter == null) {
+-                    return false;
+-                }
+-
+-                final int sourceIndex = source.getBindingAdapterPosition();
+-                final int targetIndex = target.getBindingAdapterPosition();
+-                instanceListAdapter.swapItems(sourceIndex, targetIndex);
+-                return true;
+-            }
+-
+-            @Override
+-            public boolean isLongPressDragEnabled() {
+-                return false;
+-            }
+-
+-            @Override
+-            public boolean isItemViewSwipeEnabled() {
+-                return true;
+-            }
+-
+-            @Override
+-            public void onSwiped(@NonNull final RecyclerView.ViewHolder viewHolder,
+-                                 final int swipeDir) {
+-                final int position = viewHolder.getBindingAdapterPosition();
+-                // do not allow swiping the selected instance
+-                if (instanceList.get(position).getUrl().equals(selectedInstance.getUrl())) {
+-                    instanceListAdapter.notifyItemChanged(position);
+-                    return;
+-                }
+-                instanceList.remove(position);
+-                instanceListAdapter.notifyItemRemoved(position);
+-
+-                if (instanceList.isEmpty()) {
+-                    instanceList.add(selectedInstance);
+-                    instanceListAdapter.notifyItemInserted(0);
+-                }
+-            }
+-        };
+-    }
+-
+-    /*//////////////////////////////////////////////////////////////////////////
+-    // List Handling
+-    //////////////////////////////////////////////////////////////////////////*/
+-
+-    private class InstanceListAdapter
+-            extends RecyclerView.Adapter<InstanceListAdapter.TabViewHolder> {
+-        private final LayoutInflater inflater;
+-        private final ItemTouchHelper itemTouchHelper;
+-        private RadioButton lastChecked;
+-
+-        InstanceListAdapter(final Context context, final ItemTouchHelper itemTouchHelper) {
+-            this.itemTouchHelper = itemTouchHelper;
+-            this.inflater = LayoutInflater.from(context);
+-        }
+-
+-        public void swapItems(final int fromPosition, final int toPosition) {
+-            Collections.swap(instanceList, fromPosition, toPosition);
+-            notifyItemMoved(fromPosition, toPosition);
+-        }
+-
+-        @NonNull
+-        @Override
+-        public InstanceListAdapter.TabViewHolder onCreateViewHolder(@NonNull final ViewGroup parent,
+-                                                                    final int viewType) {
+-            final View view = inflater.inflate(R.layout.item_instance, parent, false);
+-            return new InstanceListAdapter.TabViewHolder(view);
+-        }
+-
+-        @Override
+-        public void onBindViewHolder(@NonNull final InstanceListAdapter.TabViewHolder holder,
+-                                     final int position) {
+-            holder.bind(position, holder);
+-        }
+-
+-        @Override
+-        public int getItemCount() {
+-            return instanceList.size();
+-        }
+-
+-        class TabViewHolder extends RecyclerView.ViewHolder {
+-            private final AppCompatImageView instanceIconView;
+-            private final TextView instanceNameView;
+-            private final TextView instanceUrlView;
+-            private final RadioButton instanceRB;
+-            private final ImageView handle;
+-
+-            TabViewHolder(final View itemView) {
+-                super(itemView);
+-
+-                instanceIconView = itemView.findViewById(R.id.instanceIcon);
+-                instanceNameView = itemView.findViewById(R.id.instanceName);
+-                instanceUrlView = itemView.findViewById(R.id.instanceUrl);
+-                instanceRB = itemView.findViewById(R.id.selectInstanceRB);
+-                handle = itemView.findViewById(R.id.handle);
+-            }
+-
+-            @SuppressLint("ClickableViewAccessibility")
+-            void bind(final int position, final TabViewHolder holder) {
+-                handle.setOnTouchListener(getOnTouchListener(holder));
+-
+-                final PeertubeInstance instance = instanceList.get(position);
+-                instanceNameView.setText(instance.getName());
+-                instanceUrlView.setText(instance.getUrl());
+-                instanceRB.setOnCheckedChangeListener(null);
+-                if (selectedInstance.getUrl().equals(instance.getUrl())) {
+-                    if (lastChecked != null && lastChecked != instanceRB) {
+-                        lastChecked.setChecked(false);
+-                    }
+-                    instanceRB.setChecked(true);
+-                    lastChecked = instanceRB;
+-                }
+-                instanceRB.setOnCheckedChangeListener((buttonView, isChecked) -> {
+-                    if (isChecked) {
+-                        selectInstance(instance);
+-                        if (lastChecked != null && lastChecked != instanceRB) {
+-                            lastChecked.setChecked(false);
+-                        }
+-                        lastChecked = instanceRB;
+-                    }
+-                });
+-                instanceIconView.setImageResource(R.drawable.place_holder_peertube);
+-            }
+-
+-            @SuppressLint("ClickableViewAccessibility")
+-            private View.OnTouchListener getOnTouchListener(final RecyclerView.ViewHolder item) {
+-                return (view, motionEvent) -> {
+-                    if (motionEvent.getActionMasked() == MotionEvent.ACTION_DOWN) {
+-                        if (itemTouchHelper != null && getItemCount() > 1) {
+-                            itemTouchHelper.startDrag(item);
+-                            return true;
+-                        }
+-                    }
+-                    return false;
+-                };
+-            }
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+index 7d486cbc9..930daa1a9 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+@@ -38,7 +38,7 @@ public final class SettingsResourceRegistry {
+         add(HistorySettingsFragment.class, R.xml.history_settings);
+         add(NotificationsSettingsFragment.class, R.xml.notifications_settings);
+         add(PlayerNotificationSettingsFragment.class, R.xml.player_notification_settings);
+-        add(UpdateSettingsFragment.class, R.xml.update_settings);
++
+         add(VideoAudioSettingsFragment.class, R.xml.video_audio_settings);
+         add(BisubSettingsFragment.class, R.xml.bisub_settings);
+         add(GestureSettingsFragment.class, R.xml.gesture_settings);
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/UpdateSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/UpdateSettingsFragment.java
+deleted file mode 100644
+index 619f65e81..000000000
+--- a/app/src/main/java/org/schabi/newpipe/settings/UpdateSettingsFragment.java
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package org.schabi.newpipe.settings;
+-
+-import android.os.Bundle;
+-import android.widget.Toast;
+-
+-import androidx.preference.Preference;
+-
+-import org.schabi.newpipe.NewVersionWorker;
+-import org.schabi.newpipe.R;
+-
+-public class UpdateSettingsFragment extends BasePreferenceFragment {
+-    private final Preference.OnPreferenceChangeListener updatePreferenceChange
+-            = (preference, checkForUpdates) -> {
+-        defaultPreferences.edit()
+-                .putBoolean(getString(R.string.update_app_key), (boolean) checkForUpdates).apply();
+-
+-        if ((boolean) checkForUpdates) {
+-            NewVersionWorker.enqueueNewVersionCheckingWork(requireContext(), true);
+-        }
+-        return true;
+-    };
+-
+-    private final Preference.OnPreferenceClickListener manualUpdateClick
+-            = preference -> {
+-        Toast.makeText(getContext(), R.string.checking_updates_toast, Toast.LENGTH_SHORT).show();
+-        NewVersionWorker.enqueueNewVersionCheckingWork(requireContext(), true);
+-        return true;
+-    };
+-
+-    @Override
+-    public void onCreatePreferences(final Bundle savedInstanceState, final String rootKey) {
+-        addPreferencesFromResourceRegistry();
+-
+-        findPreference(getString(R.string.update_app_key))
+-                .setOnPreferenceChangeListener(updatePreferenceChange);
+-        findPreference(getString(R.string.manual_update_key))
+-                .setOnPreferenceClickListener(manualUpdateClick);
+-    }
+-}
+diff --git a/app/src/main/java/org/schabi/newpipe/util/AnnouncementParser.java b/app/src/main/java/org/schabi/newpipe/util/AnnouncementParser.java
+deleted file mode 100644
+index b15f7a047..000000000
+--- a/app/src/main/java/org/schabi/newpipe/util/AnnouncementParser.java
++++ /dev/null
+@@ -1,69 +0,0 @@
+-package org.schabi.newpipe.util;
+-
+-import org.jsoup.Jsoup;
+-import org.jsoup.nodes.Document;
+-import org.jsoup.nodes.Element;
+-import org.jsoup.select.Elements;
+-
+-import java.time.LocalDate;
+-import java.time.format.DateTimeFormatter;
+-
+-public class AnnouncementParser {
+-
+-    public static class ParsedResult {
+-        public final String contents;
+-        public final String latestId;
+-
+-        public ParsedResult(String contents, String latestId) {
+-            this.contents = contents;
+-            this.latestId = latestId;
+-        }
+-    }
+-
+-
+-    /**
+-     * Parses HTML content and returns all text before a certain heading ID
+-     *
+-     * @param html The HTML content to parse
+-     * @param beforeId The ID to stop before (exclusive)
+-     * @return ParsedResult containing combined contents and latest ID
+-     */
+-    public static ParsedResult parseContentsBeforeId(String html, String beforeId) {
+-        StringBuilder contents = new StringBuilder();
+-        String latestId = null;
+-
+-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyMMdd");
+-
+-        Document doc = Jsoup.parse(html);
+-        Elements headings = doc.select("div.markdown-heading");
+-
+-        for (Element heading : headings) {
+-            String currentId = heading.selectFirst("h2.heading-element").text();
+-
+-            // Stop if we reach the target ID
+-            if (currentId.equals(beforeId) || (beforeId != null && LocalDate.parse(currentId, formatter).isBefore(LocalDate.parse(beforeId, formatter)))) {
+-                break;
+-            }
+-
+-            // Add the section ID in Markdown format
+-            if (contents.length() > 0) {
+-                contents.append("\n");
+-            }
+-            contents.append("## ").append(currentId).append("\n");
+-
+-            // Get all content between this heading and the next one
+-            Element nextElement = heading.nextElementSibling();
+-            while (nextElement != null && !nextElement.hasClass("markdown-heading")) {
+-                if (!nextElement.tagName().equals("hr")) {
+-                    contents.append(nextElement.text()).append("\n");
+-                }
+-                nextElement = nextElement.nextElementSibling();
+-            }
+-            if (latestId == null) {
+-                latestId = currentId;
+-            }
+-        }
+-
+-        return new ParsedResult(contents.toString(), latestId);
+-    }
+-}
+diff --git a/app/src/main/java/org/schabi/newpipe/util/PeertubeHelper.java b/app/src/main/java/org/schabi/newpipe/util/PeertubeHelper.java
+deleted file mode 100644
+index dcc39eccf..000000000
+--- a/app/src/main/java/org/schabi/newpipe/util/PeertubeHelper.java
++++ /dev/null
+@@ -1,71 +0,0 @@
+-package org.schabi.newpipe.util;
+-
+-import android.content.Context;
+-import android.content.SharedPreferences;
+-
+-import androidx.preference.PreferenceManager;
+-
+-import com.grack.nanojson.JsonArray;
+-import com.grack.nanojson.JsonObject;
+-import com.grack.nanojson.JsonParser;
+-import com.grack.nanojson.JsonParserException;
+-import com.grack.nanojson.JsonStringWriter;
+-import com.grack.nanojson.JsonWriter;
+-
+-import org.schabi.newpipe.R;
+-import org.schabi.newpipe.extractor.ServiceList;
+-import org.schabi.newpipe.extractor.services.peertube.PeertubeInstance;
+-
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.List;
+-
+-public final class PeertubeHelper {
+-    private PeertubeHelper() { }
+-
+-    public static List<PeertubeInstance> getInstanceList(final Context context) {
+-        final SharedPreferences sharedPreferences = PreferenceManager
+-                .getDefaultSharedPreferences(context);
+-        final String savedInstanceListKey = context.getString(R.string.peertube_instance_list_key);
+-        final String savedJson = sharedPreferences.getString(savedInstanceListKey, null);
+-        if (null == savedJson) {
+-            return Collections.singletonList(getCurrentInstance());
+-        }
+-
+-        try {
+-            final JsonArray array = JsonParser.object().from(savedJson).getArray("instances");
+-            final List<PeertubeInstance> result = new ArrayList<>();
+-            for (final Object o : array) {
+-                if (o instanceof JsonObject) {
+-                    final JsonObject instance = (JsonObject) o;
+-                    final String name = instance.getString("name");
+-                    final String url = instance.getString("url");
+-                    result.add(new PeertubeInstance(url, name));
+-                }
+-            }
+-            return result;
+-        } catch (final JsonParserException e) {
+-            return Collections.singletonList(getCurrentInstance());
+-        }
+-
+-    }
+-
+-    public static PeertubeInstance selectInstance(final PeertubeInstance instance,
+-                                                  final Context context) {
+-        final SharedPreferences sharedPreferences = PreferenceManager
+-                .getDefaultSharedPreferences(context);
+-        final String selectedInstanceKey
+-                = context.getString(R.string.peertube_selected_instance_key);
+-        final JsonStringWriter jsonWriter = JsonWriter.string().object();
+-        jsonWriter.value("name", instance.getName());
+-        jsonWriter.value("url", instance.getUrl());
+-        final String jsonToSave = jsonWriter.end().done();
+-        sharedPreferences.edit().putString(selectedInstanceKey, jsonToSave).apply();
+-        ServiceList.PeerTube.setInstance(instance);
+-        return instance;
+-    }
+-
+-    public static PeertubeInstance getCurrentInstance() {
+-        return ServiceList.PeerTube.getInstance();
+-    }
+-}
+diff --git a/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java b/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
+index a438d7369..8e189d46a 100644
+--- a/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
++++ b/app/src/main/java/org/schabi/newpipe/util/ServiceHelper.java
+@@ -7,16 +7,11 @@ import androidx.annotation.DrawableRes;
+ import androidx.annotation.StringRes;
+ import androidx.preference.PreferenceManager;
+ 
+-import com.grack.nanojson.JsonObject;
+-import com.grack.nanojson.JsonParser;
+-import com.grack.nanojson.JsonParserException;
+-
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.extractor.NewPipe;
+ import org.schabi.newpipe.extractor.ServiceList;
+ import org.schabi.newpipe.extractor.StreamingService;
+ import org.schabi.newpipe.extractor.exceptions.ExtractionException;
+-import org.schabi.newpipe.extractor.services.peertube.PeertubeInstance;
+ import org.schabi.newpipe.extractor.sponsorblock.SponsorBlockApiSettings;
+ import org.schabi.newpipe.extractor.InfoItemsCollector.FilterConfig;
+ import org.schabi.newpipe.extractor.comments.CommentsFilterConfig;
+@@ -27,7 +22,6 @@ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ 
+ import static org.schabi.newpipe.extractor.ServiceList.NicoNico;
+-import static org.schabi.newpipe.extractor.ServiceList.SoundCloud;
+ public final class ServiceHelper {
+     private static final StreamingService DEFAULT_FALLBACK_SERVICE = ServiceList.YouTube;
+ 
+@@ -35,17 +29,11 @@ public final class ServiceHelper {
+ 
+     @DrawableRes
+     public static int getIcon(final int serviceId) {
++        // BISUB: SoundCloud, PeerTube, media.ccc.de and Bandcamp were removed;
++        // their ids (1-4) simply fall through to the placeholder icon.
+         switch (serviceId) {
+             case 0:
+                 return R.drawable.ic_youtube;
+-            case 1:
+-                return R.drawable.place_holder_cloud;
+-            case 2:
+-                return R.drawable.place_holder_gadse;
+-            case 3:
+-                return R.drawable.place_holder_peertube;
+-            case 4:
+-                return R.drawable.place_holder_bandcamp;
+             case 5:
+                 return R.drawable.ic_bilibili;
+             case 6:
+@@ -247,9 +235,7 @@ public final class ServiceHelper {
+     }
+ 
+     public static long getCacheExpirationMillis(final int serviceId) {
+-        if (serviceId == SoundCloud.getServiceId()) {
+-            return TimeUnit.MILLISECONDS.convert(5, TimeUnit.MINUTES);
+-        } else if (serviceId == NicoNico.getServiceId()) {
++        if (serviceId == NicoNico.getServiceId()) {
+             return TimeUnit.MILLISECONDS.convert(2, TimeUnit.MINUTES);
+         } else {
+             return TimeUnit.MILLISECONDS.convert(1, TimeUnit.HOURS);
+@@ -268,26 +254,7 @@ public final class ServiceHelper {
+     }
+ 
+     public static void initService(final Context context, final int serviceId) {
+-        if (serviceId == ServiceList.PeerTube.getServiceId()) {
+-            final SharedPreferences sharedPreferences = PreferenceManager
+-                    .getDefaultSharedPreferences(context);
+-            final String json = sharedPreferences.getString(context.getString(
+-                    R.string.peertube_selected_instance_key), null);
+-            if (null == json) {
+-                return;
+-            }
+-
+-            final JsonObject jsonObject;
+-            try {
+-                jsonObject = JsonParser.object().from(json);
+-            } catch (final JsonParserException e) {
+-                return;
+-            }
+-            final String name = jsonObject.getString("name");
+-            final String url = jsonObject.getString("url");
+-            final PeertubeInstance instance = new PeertubeInstance(url, name);
+-            ServiceList.PeerTube.setInstance(instance);
+-        } else if (serviceId == ServiceList.NicoNico.getServiceId()) {
++        if (serviceId == ServiceList.NicoNico.getServiceId()) {
+             final SharedPreferences sharedPreferences = PreferenceManager
+                     .getDefaultSharedPreferences(context);
+             final String tokens = sharedPreferences.getString(context.getString(
+diff --git a/app/src/main/java/org/schabi/newpipe/util/external_communication/KoreUtils.java b/app/src/main/java/org/schabi/newpipe/util/external_communication/KoreUtils.java
+index f45d35030..3e2e4ee22 100644
+--- a/app/src/main/java/org/schabi/newpipe/util/external_communication/KoreUtils.java
++++ b/app/src/main/java/org/schabi/newpipe/util/external_communication/KoreUtils.java
+@@ -18,8 +18,7 @@ public final class KoreUtils {
+     private KoreUtils() { }
+ 
+     public static boolean isServiceSupportedByKore(final int serviceId) {
+-        return (serviceId == ServiceList.YouTube.getServiceId()
+-                || serviceId == ServiceList.SoundCloud.getServiceId());
++        return serviceId == ServiceList.YouTube.getServiceId();
+     }
+ 
+     public static boolean shouldShowPlayWithKodi(@NonNull final Context context,
+diff --git a/app/src/main/res/layout/instance_spinner_item.xml b/app/src/main/res/layout/instance_spinner_item.xml
+deleted file mode 100644
+index 1edac71af..000000000
+--- a/app/src/main/res/layout/instance_spinner_item.xml
++++ /dev/null
+@@ -1,6 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:id="@android:id/text1"
+-    android:layout_width="wrap_content"
+-    android:layout_height="match_parent"
+-    android:maxLength="0" />
+diff --git a/app/src/main/res/layout/instance_spinner_layout.xml b/app/src/main/res/layout/instance_spinner_layout.xml
+deleted file mode 100644
+index 556d59785..000000000
+--- a/app/src/main/res/layout/instance_spinner_layout.xml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<Spinner xmlns:android="http://schemas.android.com/apk/res/android"
+-    xmlns:tools="http://schemas.android.com/tools"
+-    android:id="@+id/spinner"
+-    android:layout_width="wrap_content"
+-    android:layout_height="wrap_content"
+-    android:gravity="end"
+-    android:prompt="@string/choose_instance_prompt"
+-    tools:listitem="@layout/instance_spinner_item" />
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index fdee5f366..30f980e55 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -463,12 +463,6 @@
+         <item>@string/always_ask_open_action_key</item>
+     </string-array>
+ 
+-    <!-- Updates -->
+-    <string name="update_app_key">update_app_key</string>
+-    <string name="manual_update_key">manual_update_key</string>
+-    <string name="update_pref_screen_key">update_pref_screen_key</string>
+-    <string name="update_expiry_key">update_expiry_key</string>
+-
+ 
+     <!-- SponsorBlock -->
+     <string name="sponsor_block_home_page_key" translatable="false">sponsor_block_home_page</string>
+diff --git a/app/src/main/res/xml/appearance_settings.xml b/app/src/main/res/xml/appearance_settings.xml
+index 0a52aac2d..06b2fa18c 100644
+--- a/app/src/main/res/xml/appearance_settings.xml
++++ b/app/src/main/res/xml/appearance_settings.xml
+@@ -115,8 +115,11 @@
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
+ 
++    <!-- BISUB: default to classic scrolling bullet comments (Bilibili style)
++         instead of the chat panel, which matches how most bisub users expect
++         danmaku to look. -->
+     <SwitchPreferenceCompat
+-        android:defaultValue="true"
++        android:defaultValue="false"
+         android:key="@string/bullet_comments_chat_mode_key"
+         android:summary="@string/bullet_comments_chat_mode_summary"
+         android:title="@string/bullet_comments_chat_mode_title"
+diff --git a/app/src/main/res/xml/backup_settings.xml b/app/src/main/res/xml/backup_settings.xml
+index 0391e83fa..e76837f84 100644
+--- a/app/src/main/res/xml/backup_settings.xml
++++ b/app/src/main/res/xml/backup_settings.xml
+@@ -37,13 +37,7 @@
+                 app:iconSpaceReserved="false" />
+ 
+         <Preference
+-                android:key="@string/import_soundcloud_subscriptions_key"
+-                android:summary="@string/import_soundcloud_subscriptions_summary"
+-                android:title="@string/import_soundcloud_subscriptions_title"
+-                app:singleLineTitle="false"
+-                app:iconSpaceReserved="false" />
+ 
+-        <Preference
+                 android:key="@string/export_subscriptions_key"
+                 android:summary="@string/export_subscriptions_summary"
+                 android:title="@string/export_subscriptions_title"
+diff --git a/app/src/main/res/xml/content_settings.xml b/app/src/main/res/xml/content_settings.xml
+index 282964af5..9693ca190 100644
+--- a/app/src/main/res/xml/content_settings.xml
++++ b/app/src/main/res/xml/content_settings.xml
+@@ -33,11 +33,4 @@
+         app:singleLineTitle="false"
+         app:iconSpaceReserved="false" />
+ 
+-    <PreferenceScreen
+-        android:fragment="org.schabi.newpipe.settings.PeertubeInstanceListFragment"
+-        android:key="@string/peertube_instance_setup_key"
+-        android:summary="@string/peertube_instance_url_summary"
+-        android:title="@string/peertube_instance_url_title"
+-        app:singleLineTitle="false"
+-        app:iconSpaceReserved="false" />
+ </PreferenceScreen>
+diff --git a/app/src/main/res/xml/main_settings.xml b/app/src/main/res/xml/main_settings.xml
+index 13cad822c..535de4d29 100644
+--- a/app/src/main/res/xml/main_settings.xml
++++ b/app/src/main/res/xml/main_settings.xml
+@@ -59,13 +59,7 @@
+         app:iconSpaceReserved="false" />
+ 
+     <PreferenceScreen
+-        android:fragment="org.schabi.newpipe.settings.UpdateSettingsFragment"
+-        android:icon="@drawable/ic_update_new"
+-        android:key="update_pref_screen_key"
+-        android:title="@string/settings_category_updates_title"
+-        app:iconSpaceReserved="false" />
+ 
+-    <PreferenceScreen
+             android:fragment="org.schabi.newpipe.settings.BackupSettingsFragment"
+             android:icon="@drawable/ic_content_save"
+             android:title="@string/settings_category_backup_title"
+diff --git a/app/src/main/res/xml/update_settings.xml b/app/src/main/res/xml/update_settings.xml
+deleted file mode 100644
+index c150eceac..000000000
+--- a/app/src/main/res/xml/update_settings.xml
++++ /dev/null
+@@ -1,29 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+-    xmlns:app="http://schemas.android.com/apk/res-auto"
+-    android:title="@string/settings_category_updates_title">
+-
+-    <SwitchPreferenceCompat
+-        android:defaultValue="true"
+-        android:key="@string/update_app_key"
+-        android:summary="@string/updates_setting_description"
+-        android:title="@string/updates_setting_title"
+-        app:singleLineTitle="false"
+-        app:iconSpaceReserved="false" />
+-
+-    <SwitchPreferenceCompat
+-            android:defaultValue="false"
+-            android:key="@string/show_prerelease_key"
+-            android:summary="@string/show_prerelease_description"
+-            android:title="@string/show_prerelease_title"
+-            app:singleLineTitle="false"
+-            app:iconSpaceReserved="false" />
+-
+-    <Preference
+-        android:key="@string/manual_update_key"
+-        android:summary="@string/manual_update_description"
+-        android:title="@string/manual_update_title"
+-        app:singleLineTitle="false"
+-        app:iconSpaceReserved="false" />
+-
+-</PreferenceScreen>
+-- 
+2.54.0.windows.1
+

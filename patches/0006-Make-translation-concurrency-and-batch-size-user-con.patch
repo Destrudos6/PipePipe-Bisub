@@ -1,7 +1,7 @@
-From 342ead2ca4e216e9ae3b143e3f0101e83214f21f Mon Sep 17 00:00:00 2001
+From e3d668e2ddd2e3cf22f18e0fe2af69f26ba7f9d1 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 11:36:08 +0800
-Subject: [PATCH 06/12] Make translation concurrency and batch size
+Subject: [PATCH 06/51] Make translation concurrency and batch size
  user-configurable
 
 Some providers reject high concurrency, and single huge requests suit
@@ -237,7 +237,7 @@ index e06cd4d80..af2a3c992 100644
              if (!response.isSuccessful()) {
                  throw new IOException("Translation API returned HTTP " + response.code()
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 4fa7be84e..f63a5d46e 100644
+index e346e3e18..fda6062fd 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1224,6 +1224,10 @@
@@ -252,10 +252,10 @@ index 4fa7be84e..f63a5d46e 100644
      <string name="bisub_status_incomplete">配置不完整：缺少 %1$s</string>
      <string name="bisub_missing_base_url">API 地址</string>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 2658ed8fb..f705fb8be 100644
+index fbd27022e..1aa52a5c4 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1891,6 +1891,8 @@
+@@ -1893,6 +1893,8 @@
      <string name="bisub_model_key">bisub_model</string>
      <string name="bisub_target_lang_key">bisub_target_lang</string>
      <string name="bisub_source_lang_key">bisub_source_lang</string>
@@ -265,10 +265,10 @@ index 2658ed8fb..f705fb8be 100644
      <string name="bisub_caption_style_key">bisub_caption_style</string>
      <string name="bisub_style_base_scale_key">bisub_style_base_scale</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index cfe0c7ee3..859ecb5a7 100644
+index 6abea7b27..5b4bd9481 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1228,6 +1228,10 @@
+@@ -1229,6 +1229,10 @@
      <string name="bisub_target_lang_summary">Language to translate subtitles into, e.g. Simplified Chinese</string>
      <string name="bisub_source_lang_title">Source subtitle language</string>
      <string name="bisub_source_lang_summary">ISO code of the subtitle track to translate, e.g. en. Leave empty to use the first available track</string>

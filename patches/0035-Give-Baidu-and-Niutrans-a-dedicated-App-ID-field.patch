@@ -1,7 +1,7 @@
-From 36a82f93511a906c579a3d5100eb00e98493d0cf Mon Sep 17 00:00:00 2001
+From 88c0f3d1d30e00c943db0d97fe8e6d0fcdaccafa Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Wed, 21 Oct 2026 15:27:44 +0800
-Subject: [PATCH] Give Baidu and Niutrans a dedicated App ID field
+Subject: [PATCH 35/51] Give Baidu and Niutrans a dedicated App ID field
 
 The two new engines kept both credentials joined as "appid#secret"
 in the single API key field, which failed in practice: switching
@@ -449,7 +449,7 @@ index 26b3eca15..60be13be6 100644
          }
  
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 43aa8daf8..6243b69e6 100644
+index 9b3c0f28b..21855101d 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1237,8 +1237,11 @@
@@ -467,10 +467,10 @@ index 43aa8daf8..6243b69e6 100644
      <string name="bisub_model_summary">模型名称，如 deepseek-chat</string>
  
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 47c4ec7b5..9d7641afd 100644
+index 23b5f58ec..30c946dbf 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1902,6 +1902,7 @@
+@@ -1904,6 +1904,7 @@
      <string name="bisub_style_translation_alpha_key">bisub_style_translation_alpha</string>
  
      <string name="bisub_cloud_backup_key">bisub_cloud_backup</string>
@@ -479,10 +479,10 @@ index 47c4ec7b5..9d7641afd 100644
      <string name="bisub_cloud_backup_webdav_url_key">bisub_cloud_backup_webdav_url</string>
      <string name="bisub_cloud_backup_webdav_username_key">bisub_cloud_backup_webdav_username</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 03370d737..9443e8d17 100644
+index 5589fe8d2..59ffab20b 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1239,8 +1239,11 @@
+@@ -1240,8 +1240,11 @@
      <string name="bisub_api_key_title">API key</string>
      <string name="bisub_api_key_unset">Not set</string>
      <string name="bisub_api_key_set">Set</string>

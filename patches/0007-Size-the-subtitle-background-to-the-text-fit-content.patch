@@ -1,7 +1,7 @@
-From 85d4cdf83a30e652746806dfda05d69e43b9375f Mon Sep 17 00:00:00 2001
+From 6248942054251a3903c8d712d2dd8fc5fe33f8a8 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 12:35:45 +0800
-Subject: [PATCH 07/12] Size the subtitle background to the text (fit-content)
+Subject: [PATCH 07/51] Size the subtitle background to the text (fit-content)
  and slim the horizontal padding
 
 The background bar used to be a fixed-width container spanning nearly
@@ -202,7 +202,7 @@ index ac09cda42..dc995fed6 100644
  
      private static float measureWidth(@NonNull final StaticLayout layout) {
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index f63a5d46e..b62266345 100644
+index fda6062fd..5277f6e43 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1246,7 +1246,7 @@
@@ -215,10 +215,10 @@ index f63a5d46e..b62266345 100644
      <string name="bisub_style_max_width">文字最大宽度</string>
      <string name="bisub_style_position">垂直位置</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 859ecb5a7..817331631 100644
+index 5b4bd9481..92622ae7d 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1251,7 +1251,7 @@
+@@ -1252,7 +1252,7 @@
      <string name="bisub_style_base_size">Subtitle size</string>
      <string name="bisub_style_text_color">Text color</string>
      <string name="bisub_style_background">Background</string>

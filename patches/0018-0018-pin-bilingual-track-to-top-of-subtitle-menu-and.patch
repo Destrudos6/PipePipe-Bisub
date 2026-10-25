@@ -1,0 +1,143 @@
+From 928aff74380f07084f60d7fedbfdc5d3eaad201a Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 20 Oct 2026 20:17:25 +0800
+Subject: [PATCH 18/51] 0018: pin bilingual track to top of subtitle menu and
+ auto-apply after translation
+
+- VideoPlaybackResolver: insert the cached bilingual source at the front
+  of the subtitle section (firstSubtitleIndex) instead of appending it
+  behind every language, so it is always the first entry under Off
+- Player.refreshSourcesAndSelectBilingualTrack(): rebuild media sources
+  in place (save progress + recovery, keep resolution and mode) and
+  pre-select the bilingual track through the track selector; the stored
+  caption preference is kept in sync so buildCaptionMenu does not
+  override it
+- VideoDetailFragment: on translation success, when the player is
+  showing this very video, call the new refresh method so the bilingual
+  track appears and is applied without leaving and re-entering
+---
+ .../fragments/detail/VideoDetailFragment.java | 12 +++++++
+ .../org/schabi/newpipe/player/Player.java     | 34 +++++++++++++++++++
+ .../resolver/VideoPlaybackResolver.java       | 16 ++++++---
+ 3 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+index cf4ff94d5..b29f28b72 100644
+--- a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+@@ -287,7 +287,19 @@ public final class VideoDetailFragment
+                     if (!success) {
+                         Toast.makeText(getContext(), R.string.bisub_toast_failed,
+                                 Toast.LENGTH_SHORT).show();
++                        return;
++                    }
++                    // BISUB-BEGIN: the translation finished while the player is
++                    // showing this very video, so rebuild the sources in place
++                    // and apply the bilingual track right away instead of
++                    // asking the user to leave and re-enter the video.
++                    if (player != null && currentInfo != null
++                            && player.getCurrentStreamInfo()
++                                    .map(info -> currentInfo.getUrl().equals(info.getUrl()))
++                                    .orElse(false)) {
++                        player.refreshSourcesAndSelectBilingualTrack();
+                     }
++                    // BISUB-END
+                 }
+             };
+     // BISUB-END
+diff --git a/app/src/main/java/org/schabi/newpipe/player/Player.java b/app/src/main/java/org/schabi/newpipe/player/Player.java
+index 0530b7e45..31fc41374 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/Player.java
++++ b/app/src/main/java/org/schabi/newpipe/player/Player.java
+@@ -45,6 +45,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton;
+ import org.schabi.newpipe.DownloaderImpl;
+ import org.schabi.newpipe.MainActivity;
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubManager;
+ import org.schabi.newpipe.database.stream.model.StreamEntity;
+ import org.schabi.newpipe.databinding.PlayerBinding;
+ import org.schabi.newpipe.extractor.*;
+@@ -507,6 +508,39 @@ public final class Player {
+         }
+     }
+ 
++    // BISUB-BEGIN
++    /**
++     * Rebuilds the media sources of the current item and pre-selects the
++     * bilingual subtitle track. Called when a bisub translation just finished,
++     * so the new track shows up (and gets applied) without leaving and
++     * re-entering the video. Mirrors the quality-change sequence: the playback
++     * position is saved and recovered, the selected resolution and the
++     * playback mode are kept.
++     */
++    public void refreshSourcesAndSelectBilingualTrack() {
++        if (exoPlayerIsNull()) {
++            return;
++        }
++        saveStreamProgressState();
++        setRecovery();
++        final int textRendererIndex = getCaptionRendererIndex();
++        if (textRendererIndex != RENDERER_UNAVAILABLE) {
++            trackSelector.setParameters(trackSelector.buildUponParameters()
++                    .setPreferredTextLanguages(BisubManager.bilingualTrackLanguage())
++                    .setPreferredTextRoleFlags(C.ROLE_FLAG_CAPTION)
++                    .setRendererDisabled(textRendererIndex, false));
++            // Keep the stored caption preference in sync, otherwise
++            // buildCaptionMenu would re-apply a previously chosen language or
++            // disable the text renderer when no preference was ever stored.
++            prefs.edit()
++                    .putString(context.getString(R.string.caption_user_set_key),
++                            BisubManager.bilingualTrackLanguage())
++                    .apply();
++        }
++        reloadPlayQueueManager();
++    }
++    // BISUB-END
++
+     /**
+      * Whether the source of a live stream was released because it is not actually playing.
+      *
+diff --git a/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java b/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
+index 81cc7ccd6..d02af903a 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
++++ b/app/src/main/java/org/schabi/newpipe/player/resolver/VideoPlaybackResolver.java
+@@ -205,6 +205,11 @@ public class VideoPlaybackResolver implements PlaybackResolver {
+         // Create subtitle sources
+         final List<SubtitlesStream> subtitlesStreams = info.getSubtitles();
+         if (subtitlesStreams != null) {
++            // BISUB-BEGIN: remember where the subtitle tracks start, so the
++            // bilingual track can be inserted at the front of the subtitle
++            // section instead of being appended behind every language.
++            final int firstSubtitleIndex = mediaSources.size();
++            // BISUB-END
+             // Torrent and non URL subtitles are not supported by ExoPlayer
+             final List<SubtitlesStream> nonTorrentAndUrlStreams = removeTorrentStreams(
+                     subtitlesStreams);
+@@ -240,10 +245,11 @@ public class VideoPlaybackResolver implements PlaybackResolver {
+                     mediaSources.add(textSource);
+                 }
+             }
+-            // BISUB-BEGIN: append the cached bilingual subtitle as an extra
+-            // track once its translation is complete, so the user can pick
+-            // "Bilingual" in the player's subtitle selection. This only
+-            // reads the cache and never starts or waits for a translation.
++            // BISUB-BEGIN: insert the cached bilingual subtitle at the front
++            // of the subtitle section (not behind all other languages), so it
++            // is always the first entry under "Off" in the player's subtitle
++            // selection menu. This only reads the cache and never starts or
++            // waits for a translation.
+             final Uri bilingualUri = BisubManager.getInstance(context)
+                     .getCompletedBilingualSubtitle(info);
+             if (bilingualUri != null) {
+@@ -255,7 +261,7 @@ public class VideoPlaybackResolver implements PlaybackResolver {
+                                 .build();
+                 final MediaSource bilingualSource = dataSource.getSingleSampleMediaSourceFactory()
+                         .createMediaSource(bilingualMediaItem, TIME_UNSET);
+-                mediaSources.add(bilingualSource);
++                mediaSources.add(firstSubtitleIndex, bilingualSource);
+             }
+             // BISUB-END
+         }
+-- 
+2.54.0.windows.1
+

@@ -1,8 +1,8 @@
-From 6e0dd984dd12c73bc1d736f9e08ec1025cf89302 Mon Sep 17 00:00:00 2001
+From 15f4fddd4950b2f89fa32eec74b43c19d81b5a27 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 20:08:59 +0800
-Subject: [PATCH] Fix preview-to-playback size mismatch, split paddings and
- per-layer opacity
+Subject: [PATCH 17/51] Fix preview-to-playback size mismatch, split paddings
+ and per-layer opacity
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -573,7 +573,7 @@ index 92e6e12c7..ad15f3e43 100644
              android:layout_width="match_parent"
              android:layout_height="wrap_content"
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 593c34c4d..d9545122e 100644
+index 6406779a7..83a0ce23d 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1265,6 +1265,7 @@
@@ -593,10 +593,10 @@ index 593c34c4d..d9545122e 100644
      <string name="bisub_style_preview_translation">史上最难的题</string>
      <string name="bisub_button_starting">准备中…</string>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 6b80351ce..334297483 100644
+index f7d7a40a9..fdee5f366 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1905,10 +1905,13 @@
+@@ -1907,10 +1907,13 @@
      <string name="bisub_style_background_key">bisub_style_background</string>
      <string name="bisub_style_background_opacity_key">bisub_style_background_opacity</string>
      <string name="bisub_style_padding_key">bisub_style_padding</string>
@@ -611,10 +611,10 @@ index 6b80351ce..334297483 100644
      <string-array name="bisub_provider_values">
          <item>custom</item>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 4f3f973b7..fa43eeba0 100644
+index 0a14f306d..a616ced24 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1268,6 +1268,7 @@
+@@ -1269,6 +1269,7 @@
      <string name="bisub_style_text_color">Text color</string>
      <string name="bisub_style_background">Background</string>
      <string name="bisub_style_padding">Vertical padding</string>
@@ -622,7 +622,7 @@ index 4f3f973b7..fa43eeba0 100644
      <string name="bisub_style_corner_radius">Corner radius</string>
      <string name="bisub_style_max_width">Maximum text width</string>
      <string name="bisub_style_position">Vertical position</string>
-@@ -1275,6 +1276,7 @@
+@@ -1276,6 +1277,7 @@
      <string name="bisub_style_bg_none">None (outline)</string>
      <string name="bisub_style_background_opacity">Background opacity</string>
      <string name="bisub_style_original_alpha">Original text opacity</string>

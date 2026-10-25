@@ -1,0 +1,891 @@
+From f627e121394ceec2b074bdc3370f34bfa4c12ba4 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Thu, 22 Oct 2026 14:34:02 +0800
+Subject: [PATCH 40/51] Fix the dictionary parse and add tap-to-lookup on the
+ player subtitles
+
+Two related fixes for the word-lookup feature:
+
+The Youdao parser never produced dictionary senses: the sense text
+sits at trs[i].tr[0].l.i (the tr element is an array), but the code
+read it one level short, so every lookup only ever showed the web
+translations. The structure was verified against the live API before
+fixing (and the whole parse path re-validated against a captured
+response: phonetics, exam labels, word forms and web translations
+all resolve).
+
+The player now also supports tapping a word directly on the bilingual
+subtitles while watching - the actual tap-to-lookup feature. While
+the controls are hidden the subtitle view is the topmost touchable
+view, so it sees every touch first: a tap that hits a word of the
+original layer takes the gesture and opens the dictionary popup;
+every other touch returns false and flows on to the player gestures
+untouched (tap-to-show-controls, double-tap seek, swipes). The gate
+is re-evaluated on every touch-down, so nothing needs syncing when
+the controls appear or the player locks. Hit-testing reuses the
+StaticLayouts the draw already builds (getLineForVertical +
+getOffsetForHorizontal plus word-boundary expansion), with a little
+slack so thin lines stay tappable.
+
+The dictionary popup itself moved into a shared WordDialogHelper, now
+used by both the bilingual reader and the player.
+---
+ .../newpipe/bisub/BisubSubtitleView.java      | 220 +++++++++++++++++
+ .../bisub/wordlookup/WordDialogHelper.java    | 230 ++++++++++++++++++
+ .../bisub/wordlookup/YoudaoDictionary.java    |  20 +-
+ .../newpipe/player/PlayerLayoutController.kt  |  21 ++
+ .../settings/BisubSubtitleReaderFragment.java | 196 +--------------
+ 5 files changed, 493 insertions(+), 194 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+index 610796822..f1b31b1a0 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+@@ -9,7 +9,9 @@ import android.text.Layout;
+ import android.text.StaticLayout;
+ import android.text.TextPaint;
+ import android.util.AttributeSet;
++import android.view.MotionEvent;
+ import android.view.View;
++import android.view.ViewConfiguration;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -17,6 +19,7 @@ import androidx.annotation.Nullable;
+ import com.google.android.exoplayer2.text.Cue;
+ import com.google.android.exoplayer2.ui.SubtitleView;
+ 
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ 
+@@ -80,6 +83,214 @@ public final class BisubSubtitleView extends View {
+     /** Reference player height the preview lays out at; 0 disables it. */
+     private float referenceHeightPx;
+ 
++    /**
++     * Receiver of the tap-to-lookup feature of the player: called with
++     * the word a tap landed on.
++     */
++    public interface OnWordClickListener {
++        /**
++         * @param word the tapped word of the original layer
++         */
++        void onWordClick(@NonNull String word);
++    }
++
++    /**
++     * Live gate evaluated on every touch-down, so tap-to-lookup follows
++     * the player state without this view holding a player reference.
++     */
++    public interface LookupGate {
++        /**
++         * @return whether tapping words is currently allowed
++         */
++        boolean isTapToLookupEnabled();
++    }
++
++    private OnWordClickListener wordClickListener;
++    private LookupGate lookupGate;
++
++    /** The text layers of the last draw, with their view offsets, for
++     *  the touch hit-test. Rebuilt on every draw. */
++    private final List<HitLayer> hitLayers = new ArrayList<>();
++
++    /** The word the ongoing gesture started on; null when it did not. */
++    @Nullable private String pressedWord;
++    private float downX;
++    private float downY;
++    private long downTime;
++    private int scaledTouchSlop;
++    /** Maximum duration of a tap that opens the dictionary. */
++    private static final long TAP_TIMEOUT_MS = 350L;
++
++    private static final class HitLayer {
++        final StaticLayout layout;
++        final String text;
++        final float x;
++        final float y;
++
++        HitLayer(@NonNull final StaticLayout layout, @NonNull final String text,
++                 final float x, final float y) {
++            this.layout = layout;
++            this.text = text;
++            this.x = x;
++            this.y = y;
++        }
++    }
++
++    /**
++     * Installs the tap-to-lookup callback: tapping a word of the
++     * original layer reports it here. The gate decides per touch-down
++     * whether the feature is active at all.
++     *
++     * @param listener the callback, or {@code null} to remove it
++     * @param gate     the gate, or {@code null} to disable the feature
++     */
++    public void setTapToLookup(@Nullable final OnWordClickListener listener,
++                               @Nullable final LookupGate gate) {
++        this.wordClickListener = listener;
++        this.lookupGate = listener == null ? null : gate;
++        this.scaledTouchSlop = listener == null
++                ? 0 : ViewConfiguration.get(getContext()).getScaledTouchSlop();
++        this.pressedWord = null;
++    }
++
++    /**
++     * Maps a touch position onto the word of the original layer it lands
++     * on, using the layout recorded by the last draw. Latin words
++     * (including embedded apostrophes and hyphens) are hit; anything
++     * else — punctuation, CJK text, digits — returns {@code null}, so
++     * those taps keep flowing to the player gestures.
++     *
++     * @param viewX the x position in view coordinates
++     * @param viewY the y position in view coordinates
++     * @return the tapped word, or {@code null} when none was hit
++     */
++    @Nullable
++    public String hitWord(final float viewX, final float viewY) {
++        if (isPreview()) {
++            return null;
++        }
++        // A little slack around each layer makes thin lines hittable.
++        final float slop = 12f * getResources().getDisplayMetrics().density;
++        for (int i = 0; i < hitLayers.size(); i++) {
++            final HitLayer layer = hitLayers.get(i);
++            if (viewY < layer.y - slop || viewY > layer.y + layer.layout.getHeight() + slop) {
++                continue;
++            }
++            if (viewX < layer.x - slop
++                    || viewX > layer.x + layer.layout.getWidth() + slop) {
++                continue;
++            }
++            final int line = layer.layout.getLineForVertical((int) (viewY - layer.y));
++            final int offset = layer.layout.getOffsetForHorizontal(line, viewX - layer.x);
++            final String word = wordAt(layer.text, offset);
++            if (word != null) {
++                return word;
++            }
++        }
++        return null;
++    }
++
++    /**
++     * Expands a character offset to the word it sits in.
++     *
++     * @param text   the layer text
++     * @param offset the character offset from the hit-test
++     * @return the word, or {@code null} when the offset is not inside
++     *         a Latin word
++     */
++    @Nullable
++    private static String wordAt(@NonNull final String text, int offset) {
++        if (offset < 0 || offset >= text.length()) {
++            return null;
++        }
++        if (!isWordChar(text.charAt(offset))) {
++            // The tap fell between characters: accept the one to the right.
++            if (offset + 1 < text.length() && isWordChar(text.charAt(offset + 1))) {
++                offset++;
++            } else {
++                return null;
++            }
++        }
++        int start = offset;
++        while (start > 0 && isWordChar(text.charAt(start - 1))) {
++            start--;
++        }
++        int end = offset;
++        while (end < text.length() && isWordChar(text.charAt(end))) {
++            end++;
++        }
++        // Trim dangling apostrophes or hyphens at the word edges.
++        while (start < end && !isLatinLetter(text.charAt(start))) {
++            start++;
++        }
++        while (end > start && !isLatinLetter(text.charAt(end - 1))) {
++            end--;
++        }
++        if (end - start < 1) {
++            return null;
++        }
++        final String word = text.substring(start, end);
++        if (word.length() == 1) {
++            final char c = word.charAt(0);
++            if (c != 'a' && c != 'A' && c != 'i' && c != 'I') {
++                return null;
++            }
++        }
++        return word;
++    }
++
++    private static boolean isWordChar(final char c) {
++        return isLatinLetter(c) || c == '\'' || c == '’' || c == '-';
++    }
++
++    private static boolean isLatinLetter(final char c) {
++        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++    }
++
++    @Override
++    public boolean onTouchEvent(@NonNull final MotionEvent event) {
++        if (wordClickListener == null || lookupGate == null || isPreview()) {
++            return false;
++        }
++        switch (event.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++                if (!lookupGate.isTapToLookupEnabled()) {
++                    return false;
++                }
++                downX = event.getX();
++                downY = event.getY();
++                downTime = event.getDownTime();
++                pressedWord = hitWord(downX, downY);
++                // Taking the gesture only when a word was hit keeps every
++                // other touch (tap-to-show-controls, double-tap seek,
++                // swipes) flowing to the player gestures untouched.
++                return pressedWord != null;
++            case MotionEvent.ACTION_UP:
++                if (pressedWord != null) {
++                    final float dx = event.getX() - downX;
++                    final float dy = event.getY() - downY;
++                    final boolean isTap = dx * dx + dy * dy
++                            <= (float) scaledTouchSlop * scaledTouchSlop
++                            && event.getEventTime() - downTime <= TAP_TIMEOUT_MS;
++                    if (isTap) {
++                        wordClickListener.onWordClick(pressedWord);
++                    }
++                    pressedWord = null;
++                    return true;
++                }
++                return false;
++            case MotionEvent.ACTION_CANCEL:
++                pressedWord = null;
++                return false;
++            default:
++                return pressedWord != null;
++        }
++    }
++
++    private boolean isPreview() {
++        return referenceWidthPx > 0 && referenceHeightPx > 0;
++    }
++
+     public BisubSubtitleView(@NonNull final Context context,
+                              @Nullable final AttributeSet attrs) {
+         super(context, attrs);
+@@ -142,6 +353,8 @@ public final class BisubSubtitleView extends View {
+         final int viewWidth = getWidth() - getPaddingLeft() - getPaddingRight();
+         final int viewHeight = getHeight() - getPaddingTop() - getPaddingBottom();
+         if (viewWidth <= 0 || viewHeight <= 0 || cues.isEmpty()) {
++            // No drawing also means nothing to hit-test anymore.
++            hitLayers.clear();
+             return;
+         }
+ 
+@@ -195,6 +408,10 @@ public final class BisubSubtitleView extends View {
+             canvas.scale(scale, scale);
+         }
+ 
++        // The layers of this draw, for the touch hit-test. Rebuilt every
++        // draw, so the recorded offsets always match what is on screen.
++        hitLayers.clear();
++
+         textPaint.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+ 
+         // The bottom anchor sits at the bottom of the (centered) video area
+@@ -277,10 +494,13 @@ public final class BisubSubtitleView extends View {
+             final float translationAlpha =
+                     Math.max(0.3f, Math.min(1f, style.translationAlpha));
+             float y = top + padYPx;
++            hitLayers.add(new HitLayer(originalLayout, original, left + padXPx, y));
+             y = drawLayout(canvas, originalLayout, left + padXPx, y,
+                     style.backgroundMode == BisubStyle.BG_NONE, originalSize,
+                     originalAlpha);
+             if (translationLayout != null) {
++                hitLayers.add(new HitLayer(translationLayout, translation,
++                        left + padXPx, y + gapPx));
+                 drawLayout(canvas, translationLayout, left + padXPx, y + gapPx,
+                         style.backgroundMode == BisubStyle.BG_NONE,
+                         translationSize, translationAlpha);
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+new file mode 100644
+index 000000000..73047da8c
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+@@ -0,0 +1,230 @@
++package org.schabi.newpipe.bisub.wordlookup;
++
++import android.content.Context;
++import android.media.MediaPlayer;
++import android.os.Handler;
++import android.os.Looper;
++import android.text.TextUtils;
++import android.util.TypedValue;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.Button;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AlertDialog;
++
++import org.schabi.newpipe.R;
++
++import java.io.IOException;
++
++/**
++ * The dictionary popup for a tapped word, shared by the bilingual
++ * reader and the player's tap-to-lookup: it opens instantly with a
++ * "looking up" state, runs the (cached) Youdao lookup on a background
++ * thread and fills the phonetic transcription (tappable to play the
++ * pronunciation), the exam labels, the senses, the word forms and the
++ * web translations in place. The word-book button works on both the
++ * success and the failure path.
++ */
++public final class WordDialogHelper {
++
++    private static MediaPlayer speechPlayer;
++
++    private WordDialogHelper() {
++    }
++
++    /**
++     * Opens the dictionary popup for one word.
++     *
++     * @param context an activity context (the popup is a dialog)
++     * @param word    the tapped word
++     */
++    public static void show(@NonNull final Context context, @NonNull final String word) {
++        stopSpeech();
++        final View view = LayoutInflater.from(context)
++                .inflate(R.layout.dialog_bisub_word, null);
++        final TextView wordView = view.findViewById(R.id.bisub_word);
++        wordView.setText(word);
++        final ViewGroup content = view.findViewById(R.id.bisub_word_content);
++        content.addView(row(context, context.getString(R.string.bisub_word_looking_up), false));
++        final AlertDialog dialog;
++        try {
++            dialog = new AlertDialog.Builder(context)
++                    .setView(view)
++                    .show();
++        } catch (final IllegalArgumentException e) {
++            // The activity is finishing and cannot host a dialog.
++            return;
++        }
++        dialog.setOnDismissListener(d -> stopSpeech());
++
++        final Button bookButton = view.findViewById(R.id.bisub_word_book_button);
++        refreshBookButton(bookButton, word);
++        bookButton.setOnClickListener(v -> {
++            if (WordBook.contains(v.getContext(), word)) {
++                WordBook.remove(v.getContext(), word);
++                Toast.makeText(v.getContext(), R.string.bisub_word_book_removed,
++                        Toast.LENGTH_SHORT).show();
++            } else {
++                WordBook.add(v.getContext(), word);
++                Toast.makeText(v.getContext(), R.string.bisub_word_book_added,
++                        Toast.LENGTH_SHORT).show();
++            }
++            refreshBookButton(bookButton, word);
++        });
++
++        final Handler mainHandler = new Handler(Looper.getMainLooper());
++        new Thread(() -> {
++            WordEntry entry = null;
++            try {
++                entry = YoudaoDictionary.lookup(word);
++            } catch (final IOException e) {
++                // keep null: shown as a lookup failure below
++            }
++            final WordEntry result = entry;
++            mainHandler.post(() -> {
++                if (!dialog.isShowing()) {
++                    return;
++                }
++                fill(context, view, word, result);
++            });
++        }).start();
++    }
++
++    /**
++     * Fills the popup with the lookup result.
++     *
++     * @param context the popup's context
++     * @param view    the inflated popup layout
++     * @param word    the looked-up word
++     * @param entry   the lookup result, or {@code null} on failure
++     */
++    private static void fill(@NonNull final Context context, @NonNull final View view,
++                             @NonNull final String word, @Nullable final WordEntry entry) {
++        final TextView phoneticView = view.findViewById(R.id.bisub_word_phonetic);
++        final TextView examView = view.findViewById(R.id.bisub_word_exam);
++        final ViewGroup content = view.findViewById(R.id.bisub_word_content);
++        content.removeAllViews();
++        if (entry == null) {
++            content.addView(row(context,
++                    context.getString(R.string.bisub_word_lookup_failed), false));
++            return;
++        }
++        if (entry.phonetic != null) {
++            phoneticView.setText("/" + entry.phonetic + "/");
++            phoneticView.setOnClickListener(v -> {
++                if (entry.speechUrl != null) {
++                    playSpeech(context, entry.speechUrl);
++                } else {
++                    playSpeech(context, entry.word);
++                }
++            });
++        } else {
++            phoneticView.setOnClickListener(v -> playSpeech(context, entry.word));
++        }
++        examView.setText(TextUtils.join(" · ", entry.examTypes));
++        if (entry.isEmpty()) {
++            content.addView(row(context,
++                    context.getString(R.string.bisub_word_no_result), false));
++        }
++        for (final String translation : entry.translations) {
++            content.addView(row(context, translation, false));
++        }
++        if (!entry.forms.isEmpty()) {
++            final StringBuilder forms = new StringBuilder();
++            for (final String[] form : entry.forms) {
++                if (forms.length() > 0) {
++                    forms.append("；");
++                }
++                forms.append(form[0]).append(' ').append(form[1]);
++            }
++            content.addView(row(context, forms.toString(), true));
++        }
++        for (final String[] web : entry.webTranslations) {
++            content.addView(row(context, web[0] + "：" + web[1], false));
++        }
++    }
++
++    /**
++     * @param button the word book button
++     * @param word   the looked-up word
++     */
++    private static void refreshBookButton(@NonNull final Button button,
++                                          @NonNull final String word) {
++        if (WordBook.contains(button.getContext(), word)) {
++            button.setText(R.string.bisub_word_book_remove);
++        } else {
++            button.setText(R.string.bisub_word_book_add);
++        }
++    }
++
++    /**
++     * @param context   the popup's context
++     * @param text      the row text
++     * @param secondary whether the row renders as secondary (word forms)
++     * @return one row of the popup content
++     */
++    @NonNull
++    private static TextView row(@NonNull final Context context, @NonNull final String text,
++                                final boolean secondary) {
++        final TextView textView = new TextView(context);
++        textView.setLayoutParams(new ViewGroup.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        final float density = context.getResources().getDisplayMetrics().density;
++        final int pad = (int) (secondary ? 2 * density : 4 * density);
++        textView.setPadding(0, pad, 0, pad);
++        textView.setTextSize(secondary ? 13 : 15);
++        textView.setTextColor(secondary
++                ? resolveThemeColor(context, android.R.attr.textColorTertiary)
++                : resolveThemeColor(context, android.R.attr.textColorPrimary));
++        return textView;
++    }
++
++    /**
++     * @param context the popup's context
++     * @param attr     a theme attribute like {@code android.R.attr.textColorPrimary}
++     * @return the resolved color for the current theme
++     */
++    private static int resolveThemeColor(@NonNull final Context context, final int attr) {
++        final TypedValue typedValue = new TypedValue();
++        context.getTheme().resolveAttribute(attr, typedValue, true);
++        if (typedValue.resourceId != 0) {
++            return context.getResources().getColor(typedValue.resourceId, null);
++        }
++        return typedValue.data;
++    }
++
++    /**
++     * Plays the pronunciation of the popup word, streaming the Youdao
++     * audio clip; when no clip exists, the word itself is spoken.
++     *
++     * @param context the popup's context
++     * @param audio   the audio URL or the word itself
++     */
++    private static void playSpeech(@NonNull final Context context,
++                                   @NonNull final String audio) {
++        stopSpeech();
++        try {
++            speechPlayer = new MediaPlayer();
++            speechPlayer.setDataSource(audio.startsWith("http")
++                    ? audio : "https://dict.youdao.com/dictvoice?audio=" + audio);
++            speechPlayer.setOnPreparedListener(MediaPlayer::start);
++            speechPlayer.setOnCompletionListener(MediaPlayer::release);
++            speechPlayer.prepareAsync();
++        } catch (final IOException e) {
++            Toast.makeText(context, R.string.bisub_word_lookup_failed,
++                    Toast.LENGTH_SHORT).show();
++        }
++    }
++
++    private static void stopSpeech() {
++        if (speechPlayer != null) {
++            speechPlayer.release();
++            speechPlayer = null;
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+index 41d44e7d0..1c6a5e5fa 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+@@ -214,14 +214,24 @@ public final class YoudaoDictionary {
+     }
+ 
+     /**
+-     * Reads one sense of the ec dictionary: {@code tr.l.i} holds the
+-     * text, and {@code l.pos} may hold the part of speech.
++     * Reads one sense of the ec dictionary: {@code trs[i].tr[0].l.i}
++     * holds the text (verified against the live API: the {@code tr}
++     * element is an array, and the part of speech is usually already
++     * part of the text, like "n. 苹果").
+      *
+-     * @param tr one element of the {@code trs} array
+-     * @return the sense text like "n. 苹果", or {@code null}
++     * @param trsItem one element of the {@code trs} array
++     * @return the sense text, or {@code null}
+      */
+     @Nullable
+-    private static String senseText(@Nullable final JSONObject tr) {
++    private static String senseText(@Nullable final JSONObject trsItem) {
++        if (trsItem == null) {
++            return null;
++        }
++        final JSONArray trArray = trsItem.optJSONArray("tr");
++        if (trArray == null || trArray.length() == 0) {
++            return null;
++        }
++        final JSONObject tr = trArray.optJSONObject(0);
+         if (tr == null) {
+             return null;
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+index 8a8b2115f..27755900e 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
++++ b/app/src/main/java/org/schabi/newpipe/player/PlayerLayoutController.kt
+@@ -15,6 +15,7 @@ import androidx.core.view.WindowInsetsCompat
+ import com.google.android.exoplayer2.PlaybackParameters
+ import com.google.android.exoplayer2.text.CueGroup
+ import org.schabi.newpipe.R
++import org.schabi.newpipe.bisub.wordlookup.WordDialogHelper
+ import org.schabi.newpipe.databinding.PlayerBinding
+ import org.schabi.newpipe.extractor.stream.StreamInfo
+ import org.schabi.newpipe.extractor.stream.StreamType
+@@ -56,6 +57,26 @@ class PlayerLayoutController(private val player: Player) {
+ 
+         // Prevent hiding of bottom sheet via swipe inside queue
+         binding.itemsList.isNestedScrollingEnabled = false
++
++        // BISUB-BEGIN: tap-to-lookup on the bilingual subtitle view. While
++        // the controls are hidden the subtitle view is the topmost touchable
++        // view, so it sees every touch first: a tap that hits a word of the
++        // original layer opens the shared dictionary popup, and every other
++        // touch returns false and flows on to the player gestures untouched
++        // (tap-to-show-controls, double-tap seek, swipes). The gate is
++        // re-evaluated on every touch-down, so no state needs syncing here.
++        binding.bisubSubtitleView.setTapToLookup(
++            { word ->
++                player.parentActivity?.let { activity ->
++                    WordDialogHelper.show(activity, word)
++                }
++            },
++            {
++                !player.controlsVisibilityController.isControlsVisible &&
++                    !player.controlsVisibilityController.isLocked
++            }
++        )
++        // BISUB-END
+     }
+ 
+     /**
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+index 4847bfda4..09ae9c0d2 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSubtitleReaderFragment.java
+@@ -2,9 +2,7 @@ package org.schabi.newpipe.settings;
+ 
+ import android.content.Context;
+ import android.graphics.Color;
+-import android.media.MediaPlayer;
+ import android.os.Bundle;
+-
+ import android.text.SpannableStringBuilder;
+ import android.text.Spanned;
+ import android.text.TextPaint;
+@@ -14,10 +12,8 @@ import android.util.TypedValue;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
+-import android.widget.Button;
+ import android.widget.RadioGroup;
+ import android.widget.TextView;
+-import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -27,9 +23,7 @@ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.VttParser;
+-import org.schabi.newpipe.bisub.wordlookup.WordBook;
+-import org.schabi.newpipe.bisub.wordlookup.WordEntry;
+-import org.schabi.newpipe.bisub.wordlookup.YoudaoDictionary;
++import org.schabi.newpipe.bisub.wordlookup.WordDialogHelper;
+ import org.schabi.newpipe.util.ThemeHelper;
+ 
+ import java.io.File;
+@@ -53,10 +47,9 @@ import java.util.regex.Pattern;
+  * as a comprehension exercise: cover the translation first, then reveal
+  * it line by line.</p>
+  *
+- * <p>Every word of the original line is tappable: tapping it looks the
+- * word up in the Youdao dictionary (cached) and shows the definition in
+- * a popup with the phonetic transcription, exam labels, word forms and
+- * a button to save the word into the local word book.</p>
++ * <p>Every word of the original line is tappable: tapping it opens the
++ * shared dictionary popup (see {@link WordDialogHelper}) with the
++ * definition, the pronunciation and the word-book button.</p>
+  */
+ public final class BisubSubtitleReaderFragment extends Fragment {
+ 
+@@ -84,8 +77,6 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+ 
+     /** Accent color for tappable words, resolved from the theme. */
+     private int wordColor;
+-    /** The pronunciation clip of the currently open word popup. */
+-    private MediaPlayer speechPlayer;
+ 
+     /**
+      * Builds the arguments of a reader page for one cache entry.
+@@ -142,11 +133,6 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+         }
+     }
+ 
+-    @Override
+-    public void onDestroy() {
+-        stopSpeech();
+-        super.onDestroy();
+-    }
+ 
+     /**
+      * Reads the cached file and parses it into parallel lines on a
+@@ -208,157 +194,17 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+     }
+ 
+     /**
+-     * Opens the dictionary popup for one word: the popup appears
+-     * immediately with a "looking up" state, the lookup runs on a
+-     * background thread (the dictionary cache makes repeated taps
+-     * instant), and the result fills the popup in place.
++     * Opens the shared dictionary popup for one tapped word.
+      *
+      * @param word the tapped word
+      */
+     private void showWordDialog(@NonNull final String word) {
+         final Context context = getContext();
+-        if (context == null) {
+-            return;
+-        }
+-        stopSpeech();
+-        final View view = LayoutInflater.from(context)
+-                .inflate(R.layout.dialog_bisub_word, null);
+-        final TextView wordView = view.findViewById(R.id.bisub_word);
+-        wordView.setText(word);
+-        final android.view.ViewGroup content =
+-                view.findViewById(R.id.bisub_word_content);
+-        content.addView(row(getString(R.string.bisub_word_looking_up), false));
+-        final androidx.appcompat.app.AlertDialog dialog =
+-                new androidx.appcompat.app.AlertDialog.Builder(context)
+-                        .setView(view)
+-                        .show();
+-        // The book button state does not depend on the lookup result,
+-        // so it is set right away (also covers lookup failures).
+-        final Button bookButton = view.findViewById(R.id.bisub_word_book_button);
+-        refreshBookButton(bookButton, word);
+-        bookButton.setOnClickListener(v -> {
+-            final Context buttonContext = v.getContext();
+-            if (WordBook.contains(buttonContext, word)) {
+-                WordBook.remove(buttonContext, word);
+-                Toast.makeText(buttonContext, R.string.bisub_word_book_removed,
+-                        Toast.LENGTH_SHORT).show();
+-            } else {
+-                WordBook.add(buttonContext, word);
+-                Toast.makeText(buttonContext, R.string.bisub_word_book_added,
+-                        Toast.LENGTH_SHORT).show();
+-            }
+-            refreshBookButton(bookButton, word);
+-        });
+-        new Thread(() -> {
+-            WordEntry entry = null;
+-            try {
+-                entry = YoudaoDictionary.lookup(word);
+-            } catch (final IOException e) {
+-                // keep null: shown as a lookup failure below
+-            }
+-            final WordEntry result = entry;
+-            if (getActivity() == null) {
+-                return;
+-            }
+-            getActivity().runOnUiThread(() -> {
+-                if (getActivity() == null || !dialog.isShowing()) {
+-                    return;
+-                }
+-                fillWordDialog(view, word, result);
+-            });
+-        }).start();
+-    }
+-
+-    /**
+-     * Fills the popup with the lookup result: phonetic transcription
+-     * (tappable to play the pronunciation), exam labels, senses, word
+-     * forms, web translations as a fallback, and the word book button.
+-     *
+-     * @param view  the inflated popup layout
+-     * @param word  the looked-up word
+-     * @param entry the lookup result, or {@code null} on failure
+-     */
+-    private void fillWordDialog(@NonNull final View view, @NonNull final String word,
+-                                @Nullable final WordEntry entry) {
+-        final TextView phoneticView = view.findViewById(R.id.bisub_word_phonetic);
+-        final TextView examView = view.findViewById(R.id.bisub_word_exam);
+-        final android.view.ViewGroup content = view.findViewById(R.id.bisub_word_content);
+-        content.removeAllViews();
+-        if (entry == null) {
+-            content.addView(row(getString(R.string.bisub_word_lookup_failed), false));
+-            return;
+-        }
+-        if (entry.phonetic != null) {
+-            phoneticView.setText("/" + entry.phonetic + "/");
+-            phoneticView.setOnClickListener(v -> {
+-                if (entry.speechUrl != null) {
+-                    playSpeech(entry.speechUrl);
+-                } else {
+-                    playSpeech(entry.word);
+-                }
+-            });
+-        } else {
+-            phoneticView.setOnClickListener(v -> playSpeech(entry.word));
+-        }
+-        examView.setText(android.text.TextUtils.join(" · ", entry.examTypes));
+-        if (entry.isEmpty()) {
+-            content.addView(row(getString(R.string.bisub_word_no_result), false));
+-        }
+-        for (final String translation : entry.translations) {
+-            content.addView(row(translation, false));
+-        }
+-        if (!entry.forms.isEmpty()) {
+-            final StringBuilder forms = new StringBuilder();
+-            for (final String[] form : entry.forms) {
+-                if (forms.length() > 0) {
+-                    forms.append("；");
+-                }
+-                forms.append(form[0]).append(' ').append(form[1]);
+-            }
+-            content.addView(row(forms.toString(), true));
+-        }
+-        for (final String[] web : entry.webTranslations) {
+-            content.addView(row(web[0] + "：" + web[1], false));
+-        }
+-
+-    }
+-
+-    /**
+-     * @param button the word book button
+-     * @param word   the looked-up word
+-     */
+-    private void refreshBookButton(@NonNull final Button button,
+-                                   @NonNull final String word) {
+-        if (WordBook.contains(button.getContext(), word)) {
+-            button.setText(R.string.bisub_word_book_remove);
+-        } else {
+-            button.setText(R.string.bisub_word_book_add);
++        if (context != null) {
++            WordDialogHelper.show(context, word);
+         }
+     }
+ 
+-    /**
+-     * @param text      the row text
+-     * @param secondary whether the row renders as secondary (word forms)
+-     * @return one row of the popup content
+-     */
+-    @NonNull
+-    private TextView row(@NonNull final String text, final boolean secondary) {
+-        final TextView textView = new TextView(requireContext());
+-        textView.setLayoutParams(new android.view.ViewGroup.LayoutParams(
+-                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+-        final float density = getResources().getDisplayMetrics().density;
+-        final int pad = (int) (secondary ? 2 * density : 4 * density);
+-        textView.setPadding(0, pad, 0, pad);
+-        textView.setTextSize(secondary ? 13 : 15);
+-        // Theme attributes resolve differently per day/night theme, so
+-        // they cannot be read as a static color.
+-        textView.setTextColor(secondary
+-                ? resolveThemeColor(android.R.attr.textColorTertiary)
+-                : resolveThemeColor(android.R.attr.textColorPrimary));
+-        return textView;
+-    }
+-
+     /**
+      * @param attr a theme attribute like {@code android.R.attr.textColorPrimary}
+      * @return the resolved color for the current theme
+@@ -372,34 +218,6 @@ public final class BisubSubtitleReaderFragment extends Fragment {
+         return typedValue.data;
+     }
+ 
+-    /**
+-     * Plays the pronunciation of the popup word, streaming the Youdao
+-     * audio clip; when no clip exists, the word itself is spoken.
+-     *
+-     * @param audio the audio URL or the word itself
+-     */
+-    private void playSpeech(@NonNull final String audio) {
+-        stopSpeech();
+-        try {
+-            speechPlayer = new MediaPlayer();
+-            speechPlayer.setDataSource(audio.startsWith("http")
+-                    ? audio : "https://dict.youdao.com/dictvoice?audio=" + audio);
+-            speechPlayer.setOnPreparedListener(MediaPlayer::start);
+-            speechPlayer.setOnCompletionListener(MediaPlayer::release);
+-            speechPlayer.prepareAsync();
+-        } catch (final IOException e) {
+-            Toast.makeText(requireContext(), R.string.bisub_word_lookup_failed,
+-                    Toast.LENGTH_SHORT).show();
+-        }
+-    }
+-
+-    private void stopSpeech() {
+-        if (speechPlayer != null) {
+-            speechPlayer.release();
+-            speechPlayer = null;
+-        }
+-    }
+-
+     private final class BisubReaderAdapter
+             extends RecyclerView.Adapter<BisubReaderHolder> {
+         private final List<String[]> lines = new ArrayList<>();
+-- 
+2.54.0.windows.1
+

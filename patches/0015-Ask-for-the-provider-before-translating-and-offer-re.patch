@@ -1,7 +1,7 @@
-From 23ea50da6aa9814274471928f81b6f2fbb698e3b Mon Sep 17 00:00:00 2001
+From 82e757466f093c07b2de9e499aa5721a0a484c51 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 19:11:20 +0800
-Subject: [PATCH] Ask for the provider before translating and offer
+Subject: [PATCH 15/51] Ask for the provider before translating and offer
  re-translation
 
 Tapping the Bilingual control used to start translating immediately
@@ -179,7 +179,7 @@ index b1162bb87..75981b1c6 100644
      }
  
 diff --git a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
-index 83a9e1211..c2fb86ed9 100644
+index c944f50cc..cf4ff94d5 100644
 --- a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
 +++ b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
 @@ -56,6 +56,7 @@ import io.reactivex.rxjava3.core.Single;
@@ -190,7 +190,7 @@ index 83a9e1211..c2fb86ed9 100644
  import org.schabi.newpipe.database.stream.model.StreamEntity;
  import org.schabi.newpipe.databinding.FragmentVideoDetailBinding;
  import org.schabi.newpipe.download.DownloadDialog;
-@@ -289,6 +290,83 @@ public final class VideoDetailFragment
+@@ -290,6 +291,83 @@ public final class VideoDetailFragment
                  }
              };
      // BISUB-END
@@ -274,7 +274,7 @@ index 83a9e1211..c2fb86ed9 100644
      @NonNull
      private final CompositeDisposable disposables = new CompositeDisposable();
      @Nullable
-@@ -620,10 +698,12 @@ public final class VideoDetailFragment
+@@ -621,10 +699,12 @@ public final class VideoDetailFragment
                  this.openDownloadDialog();
              }
          } else if (id == R.id.detail_controls_bisub) {
@@ -291,7 +291,7 @@ index 83a9e1211..c2fb86ed9 100644
              // BISUB-END
          } else if (id == R.id.detail_controls_share) {
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index a86424f06..c343cca1d 100644
+index 1b9b3f458..9f5f5b866 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1278,6 +1278,14 @@
@@ -310,10 +310,10 @@ index a86424f06..c343cca1d 100644
      <string name="bisub_button_failed">重试</string>
      <string name="bisub_button_desc">使用翻译模型生成双语字幕</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index fe9362759..96935f8df 100644
+index a1b0a4d2e..118866e2e 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1281,6 +1281,14 @@
+@@ -1282,6 +1282,14 @@
      <string name="bisub_toast_ready">Bilingual subtitles ready (%1$d of %2$d lines). Reopen the video and pick “%3$s” in the subtitle menu.</string>
      <string name="bisub_button_idle">Bilingual</string>
      <string name="bisub_button_progress">%1$d%%</string>

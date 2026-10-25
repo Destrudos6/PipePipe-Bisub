@@ -1,8 +1,8 @@
-From 1018a9946762754ccfb5b3827872f4c5180dc2f5 Mon Sep 17 00:00:00 2001
+From 826c3fbb4cd05249d6a322925a6ce171a67de74e Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 19:21:44 +0800
-Subject: [PATCH] Move the cached subtitles browser to a second-level page with
- thumbnails and export
+Subject: [PATCH 16/51] Move the cached subtitles browser to a second-level
+ page with thumbnails and export
 
 The cache browser used to be a plain two-line list inside a dialog.
 It is now a proper settings sub-page reached through the standard
@@ -820,7 +820,7 @@ index 000000000..225686aac
 +    </LinearLayout>
 +</LinearLayout>
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index c343cca1d..593c34c4d 100644
+index 9f5f5b866..6406779a7 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1291,11 +1291,15 @@
@@ -841,10 +841,10 @@ index c343cca1d..593c34c4d 100644
      <string name="bisub_cached_delete_message">双语字幕文件将被删除，下次需要时会重新翻译。</string>
      <string name="bisub_cached_deleted">已删除</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 96935f8df..4f3f973b7 100644
+index 118866e2e..0a14f306d 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1294,11 +1294,15 @@
+@@ -1295,11 +1295,15 @@
      <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
      <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
      <string name="bisub_cached_list_title">Cached subtitles</string>

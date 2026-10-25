@@ -1,0 +1,1707 @@
+From 8bf8305059747b35a5fe0070bf190c22b7784d42 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Thu, 22 Oct 2026 18:51:27 +0800
+Subject: [PATCH 45/51] Add the learning center: reading shelf, word book page,
+ cache cleanup
+
+The learning resources - the bilingual reading list and the word
+book - were buried under the subtitle settings, and the word book had
+no page at all: words could be saved, but nowhere to be seen. The
+settings now carry a first-level Learning center entry with the two
+resources side by side.
+
+The reading shelf: a cached subtitle can be moved onto it from the
+cache list's action menu (the cache entry now opens an action menu
+instead of jumping straight into the viewer). Shelved subtitles are
+exempt from the automatic cleanup, so reading material survives;
+taking one off the shelf returns it to plain cache semantics.
+
+The word book page: one compact card per saved word - the word, its
+phonetic transcription, a preview of the definition and the save
+date. Tapping a card opens the shared dictionary popup, and the
+popup now reads the stored definition first: saving a word stores
+the entry of the finished lookup with it (and a lookup finishing
+after an early save backfills it), so browsing the book costs no
+requests, hits no rate limit and works offline. Words saved before
+this cache existed are fetched on demand and backfilled.
+
+The cache cleanup: a switch (on by default) and a threshold (10 to
+1000, default 100) in the subtitle settings. When the cache list
+opens, the oldest unpinned entries beyond the threshold are deleted.
+
+Backup coverage: the word book (with the stored definitions), the
+reading shelf and the cleanup settings all live in the default
+shared preferences, so they ride along in every export and cloud
+backup without any backup-side change - the subtitle files
+themselves have been part of the backup since patch 0029.
+---
+ .../schabi/newpipe/bisub/BisubManager.java    |  73 +++++-
+ .../org/schabi/newpipe/bisub/ReaderShelf.java | 129 ++++++++++
+ .../newpipe/bisub/wordlookup/WordBook.java    | 175 +++++++++++---
+ .../bisub/wordlookup/WordDialogHelper.java    |  37 ++-
+ .../newpipe/bisub/wordlookup/WordEntry.java   |  99 ++++++++
+ .../newpipe/settings/BisubCacheFragment.java  |  74 +++++-
+ .../settings/LearningCenterFragment.java      |  39 ++++
+ .../newpipe/settings/ReaderListFragment.java  | 221 ++++++++++++++++++
+ .../settings/SettingsResourceRegistry.java    |   3 +
+ .../newpipe/settings/WordBookFragment.java    | 210 +++++++++++++++++
+ .../main/res/layout/fragment_word_book.xml    |  18 ++
+ app/src/main/res/layout/item_word_book.xml    |  64 +++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  32 +++
+ app/src/main/res/values-zh-rTW/strings.xml    |  32 +++
+ app/src/main/res/values/settings_keys.xml     |  20 ++
+ app/src/main/res/values/strings.xml           |  32 +++
+ app/src/main/res/xml/bisub_settings.xml       |  24 ++
+ .../main/res/xml/learning_center_settings.xml |  21 ++
+ app/src/main/res/xml/main_settings.xml        |   6 +
+ 19 files changed, 1273 insertions(+), 36 deletions(-)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/ReaderShelf.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/ReaderListFragment.java
+ create mode 100644 app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+ create mode 100644 app/src/main/res/layout/fragment_word_book.xml
+ create mode 100644 app/src/main/res/layout/item_word_book.xml
+ create mode 100644 app/src/main/res/xml/learning_center_settings.xml
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index 249f649a6..49695c2e3 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -9,10 +9,13 @@ import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.preference.PreferenceManager;
+ 
+ import org.json.JSONException;
+ import org.json.JSONObject;
+ import org.schabi.newpipe.DownloaderImpl;
++import android.content.SharedPreferences;
++
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.extractor.downloader.Response;
+ import org.schabi.newpipe.extractor.exceptions.ReCaptchaException;
+@@ -642,6 +645,10 @@ public final class BisubManager {
+         public final int cueCount;
+         /** When the file was last written, in epoch milliseconds. */
+         public final long timestamp;
++        /** Whether the learner moved this subtitle onto the reader shelf
++         *  (the learning center's reading list). Shelved subtitles are
++         *  skipped by the automatic cache cleanup. */
++        public final boolean pinned;
+ 
+         @SuppressWarnings("checkstyle:ParameterNumber")
+         CachedSubtitle(@NonNull final File file, @Nullable final String title,
+@@ -649,6 +656,16 @@ public final class BisubManager {
+                        @Nullable final String targetLanguage, @Nullable final String model,
+                        @Nullable final String provider,
+                        final int cueCount, final long timestamp) {
++            this(file, title, videoId, sourceLanguage, targetLanguage, model,
++                    provider, cueCount, timestamp, false);
++        }
++
++        @SuppressWarnings("checkstyle:ParameterNumber")
++        CachedSubtitle(@NonNull final File file, @Nullable final String title,
++                       @Nullable final String videoId, @Nullable final String sourceLanguage,
++                       @Nullable final String targetLanguage, @Nullable final String model,
++                       @Nullable final String provider,
++                       final int cueCount, final long timestamp, final boolean pinned) {
+             this.file = file;
+             this.title = title;
+             this.videoId = videoId;
+@@ -658,6 +675,7 @@ public final class BisubManager {
+             this.provider = provider;
+             this.cueCount = cueCount;
+             this.timestamp = timestamp;
++            this.pinned = pinned;
+         }
+     }
+ 
+@@ -676,9 +694,19 @@ public final class BisubManager {
+         if (files == null) {
+             return entries;
+         }
++        final List<String> shelf = ReaderShelf.list(appContext);
+         for (final File file : files) {
+             if (file.getName().endsWith(".vtt") && sibling(file, ".done").exists()) {
+-                entries.add(describeCachedSubtitle(file));
++                final CachedSubtitle described = describeCachedSubtitle(file);
++                final boolean pinned = shelf.contains(
++                        ReaderShelf.idOf(file.getName()));
++                entries.add(pinned
++                        ? new CachedSubtitle(described.file, described.title,
++                                described.videoId, described.sourceLanguage,
++                                described.targetLanguage, described.model,
++                                described.provider, described.cueCount,
++                                described.timestamp, true)
++                        : described);
+             }
+         }
+         Collections.sort(entries, (final CachedSubtitle a, final CachedSubtitle b) ->
+@@ -686,6 +714,49 @@ public final class BisubManager {
+         return entries;
+     }
+ 
++    /**
++     * Deletes the oldest unpinned cache entries until at most
++     * {@code threshold} entries remain, honoring the automatic cleanup
++     * setting. Subtitles on the reader shelf are never deleted, so the
++     * count can stay above the threshold when everything is shelved.
++     * Only touches disk; call from a background thread.
++     *
++     * @return how many entries were deleted
++     */
++    public int pruneCachedSubtitles() {
++        final SharedPreferences prefs =
++                PreferenceManager.getDefaultSharedPreferences(appContext);
++        if (!prefs.getBoolean(appContext.getString(
++                R.string.bisub_cache_auto_clean_key), true)) {
++            return 0;
++        }
++        final int threshold;
++        final String value = prefs.getString(appContext.getString(
++                R.string.bisub_cache_auto_clean_threshold_key), "100");
++        try {
++            threshold = Math.max(1, Integer.parseInt(value));
++        } catch (final NumberFormatException e) {
++            return 0;
++        }
++        final List<CachedSubtitle> entries = listCachedSubtitles();
++        // entries is newest-first; the deletable tail is the oldest
++        // unpinned run at the end.
++        int deleted = 0;
++        for (int i = entries.size() - 1; i >= threshold && !entries.get(i).pinned; i--) {
++            if (deleteCachedSubtitle(entries.get(i))) {
++                deleted++;
++            } else {
++                break;
++            }
++        }
++        if (deleted > 0) {
++            Log.i(TAG, "Automatic cache cleanup removed " + deleted
++                    + " entr" + (deleted == 1 ? "y" : "ies")
++                    + " (threshold " + threshold + ")");
++        }
++        return deleted;
++    }
++
+     /**
+      * Reads the full text of a cached bilingual subtitle file. Only reads
+      * disk; call from a background thread.
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/ReaderShelf.java b/app/src/main/java/org/schabi/newpipe/bisub/ReaderShelf.java
+new file mode 100644
+index 000000000..79c5aaa96
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/ReaderShelf.java
+@@ -0,0 +1,129 @@
++package org.schabi.newpipe.bisub;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import androidx.annotation.NonNull;
++
++import androidx.preference.PreferenceManager;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * The reader shelf: the bilingual subtitles the learner moved out of
++ * the plain subtitle cache into the learning center's reading list.
++ * A shelved subtitle is never touched by the automatic cache cleanup,
++ * so it stays readable - and keeps riding along in every backup -
++ * until the learner removes it.
++ *
++ * <p>Entries are the cache file base names (like
++ * {@code v7-2fa46a1e579d6e48}), stored as a JSON array in the default
++ * shared preferences, so the shelf rides along in every data export
++ * and cloud backup automatically.</p>
++ */
++public final class ReaderShelf {
++
++    private static final String KEY = "bisub_reader_shelf";
++
++    private ReaderShelf() {
++    }
++
++    /**
++     * @param fileBaseName the cache file name without extensions, used
++     *                     as the shelf entry id
++     * @return the normalized shelf id
++     */
++    @NonNull
++    public static String idOf(@NonNull final String fileBaseName) {
++        return fileBaseName.replaceAll("\\.(vtt|done|meta)$", "");
++    }
++
++    /**
++     * Puts a cached subtitle onto the shelf.
++     *
++     * @param context any context
++     * @param id      the shelf id of the subtitle
++     */
++    public static void add(@NonNull final Context context, @NonNull final String id) {
++        final List<String> ids = list(context);
++        if (!ids.contains(id)) {
++            ids.add(0, id);
++            save(context, ids);
++        }
++    }
++
++    /**
++     * Takes a subtitle off the shelf.
++     *
++     * @param context any context
++     * @param id      the shelf id of the subtitle
++     */
++    public static void remove(@NonNull final Context context, @NonNull final String id) {
++        final List<String> ids = list(context);
++        if (ids.remove(id)) {
++            save(context, ids);
++        }
++    }
++
++    /**
++     * @param context any context
++     * @param id      the shelf id of the subtitle
++     * @return whether the subtitle is on the shelf
++     */
++    public static boolean contains(@NonNull final Context context,
++                                   @NonNull final String id) {
++        return list(context).contains(id);
++    }
++
++    /**
++     * @param context any context
++     * @return the shelved ids, most recently shelved first
++     */
++    @NonNull
++    public static List<String> list(@NonNull final Context context) {
++        final List<String> ids = new ArrayList<>();
++        final String json = PreferenceManager
++                .getDefaultSharedPreferences(context.getApplicationContext())
++                .getString(KEY, null);
++        if (json == null) {
++            return ids;
++        }
++        try {
++            final JSONArray array = new JSONArray(json);
++            for (int i = 0; i < array.length(); i++) {
++                final JSONObject item = array.optJSONObject(i);
++                final String id = item == null ? null : item.optString("id", "");
++                if (!id.isEmpty()) {
++                    ids.add(id);
++                }
++            }
++        } catch (final JSONException e) {
++            // A corrupted shelf is replaced by the next save; reading an
++            // empty shelf is better than crashing the cache list.
++        }
++        return ids;
++    }
++
++    private static void save(@NonNull final Context context,
++                             @NonNull final List<String> ids) {
++        final JSONArray array = new JSONArray();
++        for (final String id : ids) {
++            final JSONObject item = new JSONObject();
++            try {
++                item.put("id", id);
++                item.put("time", System.currentTimeMillis());
++                array.put(item);
++            } catch (final JSONException e) {
++                // JSONObject.put with a non-null value never throws
++            }
++        }
++        PreferenceManager
++                .getDefaultSharedPreferences(context.getApplicationContext())
++                .edit().putString(KEY, array.toString()).apply();
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+index 3f0bbcfa4..cb436ccb6 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+@@ -4,6 +4,7 @@ import android.content.Context;
+ import android.content.SharedPreferences;
+ 
+ import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import androidx.preference.PreferenceManager;
+ 
+@@ -15,10 +16,16 @@ import java.util.ArrayList;
+ import java.util.List;
+ 
+ /**
+- * The local word book: every word the learner saved from the reader's
+- * word popup. Stored as a JSON array in the default shared preferences,
+- * so it rides along in every data export and cloud backup (and will be
+- * ready for an export to a spaced-repetition app later).
++ * The local word book: every word the learner saved from a word popup.
++ * Stored as a JSON array in the default shared preferences, so it rides
++ * along in every data export and cloud backup (and will be ready for an
++ * export to a spaced-repetition app later).
++ *
++ * <p>Each item also carries the dictionary entry captured at save time,
++ * when one was already available: browsing the book then reads purely
++ * from storage - no request, no rate limit, no network dependency -
++ * and only words saved before this cache existed (or saved while a
++ * lookup was still running) are fetched on demand and backfilled.</p>
+  */
+ public final class WordBook {
+ 
+@@ -33,17 +40,51 @@ public final class WordBook {
+     }
+ 
+     /**
+-     * Saves a word (most recent first). Saving an existing word moves
+-     * it to the front without duplicating it.
++     * Saves a word (most recent first) together with its definition
++     * when one is at hand. Saving an existing word moves it to the
++     * front without duplicating it and updates the stored definition.
+      *
+      * @param context any context
+      * @param word    the word to save
++     * @param entry   the looked-up definition, or {@code null} when the
++     *                lookup has not finished (filled in later)
+      */
+-    public static void add(@NonNull final Context context, @NonNull final String word) {
+-        final List<String> words = list(context);
+-        words.remove(word);
+-        words.add(0, word);
+-        save(context, words);
++    public static void add(@NonNull final Context context, @NonNull final String word,
++                           @Nullable final WordEntry entry) {
++        final List<Item> items = readItems(context);
++        // Keep the other items' timestamps: only the saved word becomes
++        // "most recent". (Iterating instead of removeIf: the project
++        // targets API 23, below java.util.function.)
++        for (int i = items.size() - 1; i >= 0; i--) {
++            if (items.get(i).word.equals(word)) {
++                items.remove(i);
++            }
++        }
++        items.add(0, new Item(word, System.currentTimeMillis(),
++                entry == null ? null : entry.toJson()));
++        writeItems(context, items);
++    }
++
++    /**
++     * Backfills the stored definition of a word that was saved before
++     * its lookup finished. Words not in the book are ignored (a
++     * dismissed popup's late result must not save the word).
++     *
++     * @param context any context
++     * @param word    the word whose definition to store
++     * @param entry   the finished lookup result
++     */
++    public static void updateEntry(@NonNull final Context context,
++                                   @NonNull final String word,
++                                   @Nullable final WordEntry entry) {
++        final List<Item> items = readItems(context);
++        for (final Item item : items) {
++            if (item.word.equals(word)) {
++                item.entry = entry == null ? null : entry.toJson();
++                writeItems(context, items);
++                return;
++            }
++        }
+     }
+ 
+     /**
+@@ -53,9 +94,16 @@ public final class WordBook {
+      * @param word    the word to remove
+      */
+     public static void remove(@NonNull final Context context, @NonNull final String word) {
+-        final List<String> words = list(context);
+-        if (words.remove(word)) {
+-            save(context, words);
++        final List<Item> items = readItems(context);
++        boolean removed = false;
++        for (int i = items.size() - 1; i >= 0; i--) {
++            if (items.get(i).word.equals(word)) {
++                items.remove(i);
++                removed = true;
++            }
++        }
++        if (removed) {
++            writeItems(context, items);
+         }
+     }
+ 
+@@ -66,7 +114,29 @@ public final class WordBook {
+      */
+     public static boolean contains(@NonNull final Context context,
+                                    @NonNull final String word) {
+-        return list(context).contains(word);
++        for (final Item item : readItems(context)) {
++            if (item.word.equals(word)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * @param context any context
++     * @param word    the word to look up
++     * @return the locally stored definition, or {@code null} when the
++     *         word is not in the book or was saved without one
++     */
++    @Nullable
++    public static WordEntry getEntry(@NonNull final Context context,
++                                      @NonNull final String word) {
++        for (final Item item : readItems(context)) {
++            if (item.word.equals(word)) {
++                return item.entry == null ? null : parseEntry(item.entry);
++            }
++        }
++        return null;
+     }
+ 
+     /**
+@@ -76,35 +146,76 @@ public final class WordBook {
+     @NonNull
+     public static List<String> list(@NonNull final Context context) {
+         final List<String> words = new ArrayList<>();
++        for (final Item item : readItems(context)) {
++            words.add(item.word);
++        }
++        return words;
++    }
++
++    /**
++     * @param context any context
++     * @param word    the word to look up
++     * @return when the word was saved, in epoch milliseconds, or 0
++     */
++    public static long timeOf(@NonNull final Context context,
++                              @NonNull final String word) {
++        for (final Item item : readItems(context)) {
++            if (item.word.equals(word)) {
++                return item.time;
++            }
++        }
++        return 0L;
++    }
++
++    @Nullable
++    private static WordEntry parseEntry(@NonNull final JSONObject json) {
++        try {
++            return WordEntry.fromJson(json);
++        } catch (final Exception e) {
++            // A malformed entry is treated as "not cached": the word is
++            // fetched on demand again.
++            return null;
++        }
++    }
++
++    @NonNull
++    private static List<Item> readItems(@NonNull final Context context) {
++        final List<Item> items = new ArrayList<>();
+         final String json = prefs(context).getString(KEY, null);
+         if (json == null) {
+-            return words;
++            return items;
+         }
+         try {
+             final JSONArray array = new JSONArray(json);
+             for (int i = 0; i < array.length(); i++) {
+                 final JSONObject item = array.optJSONObject(i);
+                 final String word = item == null ? null : item.optString("word", "");
+-                if (!word.isEmpty()) {
+-                    words.add(word);
++                if (word == null || word.isEmpty()) {
++                    continue;
+                 }
++                final long time = item.optLong("time", 0L);
++                final JSONObject entry = item.optJSONObject("entry");
++                items.add(new Item(word, time, entry));
+             }
+         } catch (final JSONException e) {
+             // A corrupted list is replaced by the next save; reading an
+             // empty book is better than crashing the reader.
+         }
+-        return words;
++        return items;
+     }
+ 
+-    private static void save(@NonNull final Context context,
+-                             @NonNull final List<String> words) {
++    private static void writeItems(@NonNull final Context context,
++                                   @NonNull final List<Item> items) {
+         final JSONArray array = new JSONArray();
+-        for (final String word : words) {
+-            final JSONObject item = new JSONObject();
++        for (final Item item : items) {
++            final JSONObject json = new JSONObject();
+             try {
+-                item.put("word", word);
+-                item.put("time", System.currentTimeMillis());
+-                array.put(item);
++                json.put("word", item.word);
++                json.put("time", item.time);
++                if (item.entry != null) {
++                    json.put("entry", item.entry);
++                }
++                array.put(json);
+             } catch (final JSONException e) {
+                 // JSONObject.put with a non-null value never throws
+             }
+@@ -112,4 +223,16 @@ public final class WordBook {
+         prefs(context).edit().putString(KEY, array.toString()).apply();
+     }
+ 
++    private static final class Item {
++        final String word;
++        final long time;
++        @Nullable JSONObject entry;
++
++        Item(@NonNull final String word, final long time,
++             @Nullable final JSONObject entry) {
++            this.word = word;
++            this.time = time;
++            this.entry = entry;
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+index b3cbe03a7..f82ec84d0 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+@@ -139,6 +139,12 @@ public final class WordDialogHelper {
+             }
+         });
+ 
++        // The entry of the running lookup, so the word-book button can
++        // save the definition together with the word, and so a finished
++        // lookup can backfill the stored definition of a word that was
++        // saved while the lookup was still running.
++        final WordEntry[] currentEntry = new WordEntry[1];
++
+         refreshBookButton(bookButton, word);
+         bookButton.setOnClickListener(v -> {
+             final Context buttonContext = v.getContext();
+@@ -147,7 +153,7 @@ public final class WordDialogHelper {
+                 Toast.makeText(buttonContext, R.string.bisub_word_book_removed,
+                         Toast.LENGTH_SHORT).show();
+             } else {
+-                WordBook.add(buttonContext, word);
++                WordBook.add(buttonContext, word, currentEntry[0]);
+                 Toast.makeText(buttonContext, R.string.bisub_word_book_added,
+                         Toast.LENGTH_SHORT).show();
+             }
+@@ -156,14 +162,33 @@ public final class WordDialogHelper {
+ 
+         final Handler mainHandler = new Handler(Looper.getMainLooper());
+         new Thread(() -> {
++            // A word already in the book reads from its stored
++            // definition: no request, no rate limit, works offline.
++            // (Words saved by older versions have no entry stored - they
++            // fall back to a live lookup below, which backfills it.)
+             WordEntry entry = null;
+-            try {
+-                entry = WordLookupService.lookup(context, word);
+-            } catch (final IOException e) {
+-                BisubLog.e("word popup '" + word + "': lookup failed: "
+-                        + e.getMessage());
++            if (WordBook.contains(context, word)) {
++                entry = WordBook.getEntry(context, word);
++                if (entry != null) {
++                    BisubLog.i("word popup '" + word + "': local definition hit");
++                }
++            }
++            if (entry == null) {
++                try {
++                    entry = WordLookupService.lookup(context, word);
++                } catch (final IOException e) {
++                    BisubLog.e("word popup '" + word + "': lookup failed: "
++                            + e.getMessage());
++                }
+             }
+             final WordEntry result = entry;
++            currentEntry[0] = result;
++            // A finished lookup backfills the stored definition of a word
++            // that was saved while the lookup was still running, so the
++            // book becomes self-contained even for that early save.
++            if (result != null && WordBook.contains(context, word)) {
++                WordBook.updateEntry(context, word, result);
++            }
+             BisubLog.i("word popup '" + word + "': lookup finished, entry="
+                     + (result == null ? "null" : result.translations.size()
+                     + " senses, " + result.webTranslations.size() + " web")
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
+index fc3deae75..79f8df5aa 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordEntry.java
+@@ -3,6 +3,10 @@ package org.schabi.newpipe.bisub.wordlookup;
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ 
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -49,4 +53,99 @@ public final class WordEntry {
+     public boolean isEmpty() {
+         return translations.isEmpty() && webTranslations.isEmpty() && forms.isEmpty();
+     }
++
++    /**
++     * Serializes the entry for the word book's local definition cache.
++     *
++     * @return the entry as JSON, or {@code null} when it carries nothing
++     */
++    @Nullable
++    public JSONObject toJson() {
++        if (isEmpty() && phonetic == null && speechUrl == null && !isWord) {
++            return null;
++        }
++        final JSONObject json = new JSONObject();
++        try {
++            json.put("word", word);
++            if (phonetic != null) {
++                json.put("phonetic", phonetic);
++            }
++            if (speechUrl != null) {
++                json.put("speechUrl", speechUrl);
++            }
++            json.put("isWord", isWord);
++            json.put("translations", new JSONArray(translations));
++            json.put("examTypes", new JSONArray(examTypes));
++            final JSONArray formsJson = new JSONArray();
++            for (final String[] form : forms) {
++                formsJson.put(new JSONArray().put(form[0]).put(form[1]));
++            }
++            json.put("forms", formsJson);
++            final JSONArray webJson = new JSONArray();
++            for (final String[] web : webTranslations) {
++                webJson.put(new JSONArray().put(web[0]).put(web[1]));
++            }
++            json.put("webTranslations", webJson);
++        } catch (final JSONException e) {
++            // put with non-null values never throws
++            return null;
++        }
++        return json;
++    }
++
++    /**
++     * Deserializes an entry written by {@link #toJson()}.
++     *
++     * @param json the stored entry
++     * @return the entry, or {@code null} when the JSON is malformed
++     */
++    @Nullable
++    public static WordEntry fromJson(@Nullable final JSONObject json) {
++        if (json == null) {
++            return null;
++        }
++        final String word = json.optString("word", "");
++        if (word.isEmpty()) {
++            return null;
++        }
++        final WordEntry entry = new WordEntry(word,
++                json.isNull("phonetic") ? null : json.optString("phonetic", null),
++                json.isNull("speechUrl") ? null : json.optString("speechUrl", null),
++                json.optBoolean("isWord", false));
++        fillStrings(json, "translations", entry.translations);
++        fillStrings(json, "examTypes", entry.examTypes);
++        fillPairs(json, "forms", entry.forms);
++        fillPairs(json, "webTranslations", entry.webTranslations);
++        return entry;
++    }
++
++    private static void fillStrings(@NonNull final JSONObject json,
++                                    @NonNull final String key,
++                                    @NonNull final List<String> target) {
++        final JSONArray array = json.optJSONArray(key);
++        if (array == null) {
++            return;
++        }
++        for (int i = 0; i < array.length(); i++) {
++            final String value = array.optString(i, "");
++            if (!value.isEmpty()) {
++                target.add(value);
++            }
++        }
++    }
++
++    private static void fillPairs(@NonNull final JSONObject json,
++                                  @NonNull final String key,
++                                  @NonNull final List<String[]> target) {
++        final JSONArray array = json.optJSONArray(key);
++        if (array == null) {
++            return;
++        }
++        for (int i = 0; i < array.length(); i++) {
++            final JSONArray pair = array.optJSONArray(i);
++            if (pair != null && pair.length() == 2) {
++                target.add(new String[]{pair.optString(0), pair.optString(1)});
++            }
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
+index d1a4e8bfa..3c261c60b 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubCacheFragment.java
+@@ -30,6 +30,7 @@ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.BisubManager;
++import org.schabi.newpipe.bisub.ReaderShelf;
+ import org.schabi.newpipe.util.PicassoHelper;
+ import org.schabi.newpipe.util.ThemeHelper;
+ 
+@@ -99,6 +100,10 @@ public final class BisubCacheFragment extends Fragment {
+             return;
+         }
+         new Thread(() -> {
++            // Honoring the automatic cleanup here keeps the cache bounded
++            // without a background job: the list opens on the same screen
++            // where the threshold is configured.
++            BisubManager.getInstance(context).pruneCachedSubtitles();
+             final List<BisubManager.CachedSubtitle> entries =
+                     BisubManager.getInstance(context).listCachedSubtitles();
+             if (getActivity() == null) {
+@@ -430,12 +435,15 @@ public final class BisubCacheFragment extends Fragment {
+             details.add(getString(R.string.bisub_cached_lines_count, entry.cueCount));
+             details.add(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                     .format(new Date(entry.timestamp)));
++            if (entry.pinned) {
++                details.add(getString(R.string.bisub_shelf_badge));
++            }
+             detailsView.setText(TextUtils.join(" · ", details));
+             loadThumbnail(entry.videoId);
+             itemView.setOnClickListener(view ->
+-                    openCachedSubtitle(view.getContext(), entry));
+-            // Deleting moved here (long press) because the viewer dialog
+-            // now leads with the bilingual reader action.
++                    showEntryActions(view.getContext(), entry));
++            // Deleting moved here (long press) as a shortcut; the action
++            // menu carries it too.
+             itemView.setOnLongClickListener(view -> {
+                 confirmDeleteCached(view.getContext(), entry);
+                 return true;
+@@ -461,4 +469,64 @@ public final class BisubCacheFragment extends Fragment {
+             }
+         }
+     }
++
++    /**
++     * Shows the action menu for one cache entry: viewing the full text,
++     * reading it bilingually, moving it to (or off) the learning
++     * center's reading shelf, exporting it, or deleting it.
++     *
++     * @param context a context to build the dialog with
++     * @param entry   the cache entry to act on
++     */
++    private void showEntryActions(@NonNull final Context context,
++                                  @NonNull final BisubManager.CachedSubtitle entry) {
++        final String shelfAction = entry.pinned
++                ? getString(R.string.bisub_shelf_remove)
++                : getString(R.string.bisub_shelf_add);
++        final CharSequence[] actions = {
++                getString(R.string.bisub_cached_view),
++                getString(R.string.bisub_reader_open),
++                shelfAction,
++                getString(R.string.bisub_cached_download),
++                getString(R.string.bisub_cached_delete_title)};
++        new AlertDialog.Builder(context)
++                .setTitle(entry.title == null
++                        ? getString(R.string.bisub_cached_list_title) : entry.title)
++                .setItems(actions, (final DialogInterface dialog, final int which) -> {
++                    if (which == 0) {
++                        openCachedSubtitle(context, entry);
++                    } else if (which == 1) {
++                        openReader(entry);
++                    } else if (which == 2) {
++                        toggleShelf(context, entry);
++                    } else if (which == 3) {
++                        exportCachedSubtitle(entry);
++                    } else if (which == 4) {
++                        confirmDeleteCached(context, entry);
++                    }
++                })
++                .show();
++    }
++
++    /**
++     * Moves a cache entry onto the learning center's reading shelf (or
++     * off it), then reloads the list so the shelf badge follows.
++     *
++     * @param context a context for the shelf store and the toast
++     * @param entry   the cache entry to move
++     */
++    private void toggleShelf(@NonNull final Context context,
++                             @NonNull final BisubManager.CachedSubtitle entry) {
++        final String id = ReaderShelf.idOf(entry.file.getName());
++        if (ReaderShelf.contains(context, id)) {
++            ReaderShelf.remove(context, id);
++            Toast.makeText(context, R.string.bisub_shelf_removed,
++                    Toast.LENGTH_SHORT).show();
++        } else {
++            ReaderShelf.add(context, id);
++            Toast.makeText(context, R.string.bisub_shelf_added,
++                    Toast.LENGTH_SHORT).show();
++        }
++        reload();
++    }
+ }
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java b/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
+new file mode 100644
+index 000000000..3cfb02632
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/LearningCenterFragment.java
+@@ -0,0 +1,39 @@
++package org.schabi.newpipe.settings;
++
++import android.os.Bundle;
++
++import androidx.annotation.Nullable;
++import androidx.preference.Preference;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.wordlookup.WordBook;
++
++/**
++ * First-level settings page of the learning center: the bilingual
++ * reading list and the word book, the two resources that turn watched
++ * videos into learning material. The word-book summary shows how many
++ * words it holds.
++ */
++public final class LearningCenterFragment extends BasePreferenceFragment {
++
++    @Override
++    public void onCreatePreferences(@Nullable final Bundle savedInstanceState,
++                                    @Nullable final String rootKey) {
++        addPreferencesFromResourceRegistry();
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        final Preference wordBook = findPreference(
++                getString(R.string.bisub_word_book_key));
++        if (wordBook != null) {
++            final int count = WordBook.list(requireContext()).size();
++            wordBook.setSummary(count == 0
++                    ? getString(R.string.bisub_word_book_summary)
++                    : getResources()
++                            .getQuantityString(R.plurals.bisub_word_book_count,
++                                    count, count));
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/ReaderListFragment.java b/app/src/main/java/org/schabi/newpipe/settings/ReaderListFragment.java
+new file mode 100644
+index 000000000..edc26c5d4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/ReaderListFragment.java
+@@ -0,0 +1,221 @@
++package org.schabi.newpipe.settings;
++
++import android.content.Context;
++import android.content.DialogInterface;
++import android.os.Bundle;
++import android.text.TextUtils;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.ImageView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AlertDialog;
++import androidx.fragment.app.Fragment;
++import androidx.recyclerview.widget.LinearLayoutManager;
++import androidx.recyclerview.widget.RecyclerView;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubManager;
++import org.schabi.newpipe.bisub.ReaderShelf;
++import org.schabi.newpipe.util.PicassoHelper;
++import org.schabi.newpipe.util.ThemeHelper;
++
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * The reading list of the learning center: the bilingual subtitles the
++ * learner moved onto the reader shelf from the subtitle cache. Tapping
++ * one opens the bilingual reader; a long press takes it off the shelf
++ * (the cache entry itself stays until the cache cleanup catches it).
++ */
++public final class ReaderListFragment extends Fragment {
++
++    private RecyclerView recyclerView;
++    private TextView emptyView;
++    private final ReaderListAdapter adapter = new ReaderListAdapter();
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull final LayoutInflater inflater,
++                             @Nullable final ViewGroup container,
++                             @Nullable final Bundle savedInstanceState) {
++        final View root =
++                inflater.inflate(R.layout.fragment_bisub_cache, container, false);
++        recyclerView = root.findViewById(R.id.bisub_cache_list);
++        emptyView = root.findViewById(R.id.bisub_cache_empty);
++        emptyView.setText(R.string.bisub_reader_shelf_empty);
++        recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
++        recyclerView.setAdapter(adapter);
++        return root;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        ThemeHelper.setTitleToAppCompatActivity(getActivity(),
++                getString(R.string.bisub_reader_shelf_title));
++        reload();
++    }
++
++    /**
++     * Lists the shelved subtitles on a background thread and swaps them
++     * into the list on the UI thread.
++     */
++    private void reload() {
++        final Context context = getContext();
++        if (context == null) {
++            return;
++        }
++        new Thread(() -> {
++            final List<BisubManager.CachedSubtitle> shelved = new ArrayList<>();
++            for (final BisubManager.CachedSubtitle entry
++                    : BisubManager.getInstance(context).listCachedSubtitles()) {
++                if (entry.pinned) {
++                    shelved.add(entry);
++                }
++            }
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                adapter.setEntries(shelved);
++                final boolean empty = shelved.isEmpty();
++                emptyView.setVisibility(empty ? View.VISIBLE : View.GONE);
++                recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
++            });
++        }).start();
++    }
++
++    /**
++     * Opens the bilingual reader page for a shelved subtitle, pushed on
++     * top of the shelf list in the settings fragment holder.
++     *
++     * @param entry the subtitle to read
++     */
++    private void openReader(@NonNull final BisubManager.CachedSubtitle entry) {
++        final BisubSubtitleReaderFragment reader = new BisubSubtitleReaderFragment();
++        reader.setArguments(BisubSubtitleReaderFragment.buildArguments(
++                entry.file.getAbsolutePath(), entry.title));
++        if (getActivity() == null) {
++            return;
++        }
++        getActivity().getSupportFragmentManager()
++                .beginTransaction()
++                .setCustomAnimations(R.animator.custom_fade_in,
++                        R.animator.custom_fade_out,
++                        R.animator.custom_fade_in, R.animator.custom_fade_out)
++                .replace(R.id.settings_fragment_holder, reader)
++                .addToBackStack(null)
++                .commit();
++    }
++
++    /**
++     * Asks for confirmation before a subtitle is taken off the shelf.
++     *
++     * @param context a context to build the dialog with
++     * @param entry   the subtitle to unshelve
++     */
++    private void confirmUnshelve(@NonNull final Context context,
++                                 @NonNull final BisubManager.CachedSubtitle entry) {
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_shelf_remove_title)
++                .setMessage(R.string.bisub_shelf_remove_message)
++                .setPositiveButton(R.string.bisub_shelf_remove,
++                        (final DialogInterface dialog, final int which) -> {
++                            ReaderShelf.remove(context,
++                                    ReaderShelf.idOf(entry.file.getName()));
++                            Toast.makeText(context, R.string.bisub_shelf_removed,
++                                    Toast.LENGTH_SHORT).show();
++                            reload();
++                        })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private final class ReaderListAdapter
++            extends RecyclerView.Adapter<ReaderListHolder> {
++        private final List<BisubManager.CachedSubtitle> entries = new ArrayList<>();
++
++        void setEntries(@NonNull final List<BisubManager.CachedSubtitle> newEntries) {
++            entries.clear();
++            entries.addAll(newEntries);
++            notifyDataSetChanged();
++        }
++
++        @NonNull
++        @Override
++        public ReaderListHolder onCreateViewHolder(@NonNull final ViewGroup parent,
++                                                   final int viewType) {
++            return new ReaderListHolder(LayoutInflater.from(parent.getContext())
++                    .inflate(R.layout.item_bisub_cache, parent, false));
++        }
++
++        @Override
++        public void onBindViewHolder(@NonNull final ReaderListHolder holder,
++                                     final int position) {
++            holder.bind(entries.get(position));
++        }
++
++        @Override
++        public int getItemCount() {
++            return entries.size();
++        }
++    }
++
++    private final class ReaderListHolder extends RecyclerView.ViewHolder {
++        private final ImageView thumbnailView;
++        private final TextView titleView;
++        private final TextView detailsView;
++
++        ReaderListHolder(@NonNull final View itemView) {
++            super(itemView);
++            thumbnailView = itemView.findViewById(R.id.bisub_cache_thumbnail);
++            titleView = itemView.findViewById(R.id.bisub_cache_title);
++            detailsView = itemView.findViewById(R.id.bisub_cache_details);
++        }
++
++        /**
++         * Fills one row: thumbnail, video title and the detail line with
++         * the target language and the shelving date.
++         *
++         * @param entry the subtitle to show
++         */
++        void bind(@NonNull final BisubManager.CachedSubtitle entry) {
++            titleView.setText(entry.title == null
++                    ? entry.file.getName() : entry.title);
++            final List<String> details = new ArrayList<>();
++            if (entry.targetLanguage != null && !entry.targetLanguage.isEmpty()) {
++                details.add(entry.targetLanguage);
++            }
++            details.add(getString(R.string.bisub_cached_lines_count, entry.cueCount));
++            details.add(new SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
++                    .format(new Date(entry.timestamp)));
++            detailsView.setText(TextUtils.join(" · ", details));
++            if (entry.videoId != null && entry.videoId.matches("[A-Za-z0-9_-]{11}")) {
++                PicassoHelper.loadThumbnail(
++                        "https://i.ytimg.com/vi/" + entry.videoId + "/mqdefault.jpg")
++                        .resize(192, 108)
++                        .centerCrop()
++                        .into(thumbnailView);
++            } else {
++                thumbnailView.setImageResource(R.drawable.dummy_thumbnail);
++            }
++            itemView.setOnClickListener(view -> openReader(entry));
++            itemView.setOnLongClickListener(view -> {
++                confirmUnshelve(view.getContext(), entry);
++                return true;
++            });
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+index 924febb68..da81a9fad 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/SettingsResourceRegistry.java
+@@ -41,6 +41,9 @@ public final class SettingsResourceRegistry {
+ 
+         add(VideoAudioSettingsFragment.class, R.xml.video_audio_settings);
+         add(BisubSettingsFragment.class, R.xml.bisub_settings);
++        add(LearningCenterFragment.class, R.xml.learning_center_settings);
++        add(ReaderListFragment.class, R.xml.learning_center_settings);
++        add(WordBookFragment.class, R.xml.learning_center_settings);
+         add(GestureSettingsFragment.class, R.xml.gesture_settings);
+         add(AdvancedSettingsFragment.class, R.xml.advanced_settings);
+         add(BackupSettingsFragment.class, R.xml.backup_settings);
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+new file mode 100644
+index 000000000..a85b521f4
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/settings/WordBookFragment.java
+@@ -0,0 +1,210 @@
++package org.schabi.newpipe.settings;
++
++import android.content.Context;
++import android.content.DialogInterface;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AlertDialog;
++import androidx.fragment.app.Fragment;
++import androidx.recyclerview.widget.LinearLayoutManager;
++import androidx.recyclerview.widget.RecyclerView;
++
++import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.wordlookup.WordBook;
++import org.schabi.newpipe.bisub.wordlookup.WordDialogHelper;
++import org.schabi.newpipe.bisub.wordlookup.WordEntry;
++import org.schabi.newpipe.util.ThemeHelper;
++
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * The word book page of the learning center: every word the learner
++ * saved, as a compact card showing the word, its phonetic transcription
++ * and a preview of the locally cached definition. Tapping a card opens
++ * the shared dictionary popup, which reads the stored definition - no
++ * request, no rate limit, works offline; words saved before their
++ * definition was cached are fetched on demand and backfilled. A long
++ * press removes a word.
++ */
++public final class WordBookFragment extends Fragment {
++
++    private RecyclerView recyclerView;
++    private TextView emptyView;
++    private final WordBookAdapter adapter = new WordBookAdapter();
++
++    @Nullable
++    @Override
++    public View onCreateView(@NonNull final LayoutInflater inflater,
++                             @Nullable final ViewGroup container,
++                             @Nullable final Bundle savedInstanceState) {
++        final View root =
++                inflater.inflate(R.layout.fragment_word_book, container, false);
++        recyclerView = root.findViewById(R.id.word_book_list);
++        emptyView = root.findViewById(R.id.word_book_empty);
++        recyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
++        recyclerView.setAdapter(adapter);
++        return root;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        ThemeHelper.setTitleToAppCompatActivity(getActivity(),
++                getString(R.string.bisub_word_book_title));
++        reload();
++    }
++
++    /**
++     * Reads the saved words with their cached definitions on a background
++     * thread and swaps them into the list on the UI thread.
++     */
++    private void reload() {
++        final Context context = getContext();
++        if (context == null) {
++            return;
++        }
++        new Thread(() -> {
++            final List<WordCard> cards = new ArrayList<>();
++            for (final String word : WordBook.list(context)) {
++                cards.add(new WordCard(word, WordBook.getEntry(context, word),
++                        WordBook.timeOf(context, word)));
++            }
++            if (getActivity() == null) {
++                return;
++            }
++            getActivity().runOnUiThread(() -> {
++                if (getActivity() == null) {
++                    return;
++                }
++                adapter.setCards(cards);
++                final boolean empty = cards.isEmpty();
++                emptyView.setVisibility(empty ? View.VISIBLE : View.GONE);
++                recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
++            });
++        }).start();
++    }
++
++    /**
++     * One card of the list.
++     */
++    private static final class WordCard {
++        final String word;
++        @Nullable final WordEntry entry;
++        final long time;
++
++        WordCard(@NonNull final String word, @Nullable final WordEntry entry,
++                 final long time) {
++            this.word = word;
++            this.entry = entry;
++            this.time = time;
++        }
++    }
++
++    private final class WordBookAdapter
++            extends RecyclerView.Adapter<WordBookHolder> {
++        private final List<WordCard> cards = new ArrayList<>();
++
++        void setCards(@NonNull final List<WordCard> newCards) {
++            cards.clear();
++            cards.addAll(newCards);
++            notifyDataSetChanged();
++        }
++
++        @NonNull
++        @Override
++        public WordBookHolder onCreateViewHolder(@NonNull final ViewGroup parent,
++                                                 final int viewType) {
++            return new WordBookHolder(LayoutInflater.from(parent.getContext())
++                    .inflate(R.layout.item_word_book, parent, false));
++        }
++
++        @Override
++        public void onBindViewHolder(@NonNull final WordBookHolder holder,
++                                     final int position) {
++            holder.bind(cards.get(position));
++        }
++
++        @Override
++        public int getItemCount() {
++            return cards.size();
++        }
++    }
++
++    private final class WordBookHolder extends RecyclerView.ViewHolder {
++        private final TextView wordView;
++        private final TextView phoneticView;
++        private final TextView definitionView;
++        private final TextView timeView;
++
++        WordBookHolder(@NonNull final View itemView) {
++            super(itemView);
++            wordView = itemView.findViewById(R.id.word_book_word);
++            phoneticView = itemView.findViewById(R.id.word_book_phonetic);
++            definitionView = itemView.findViewById(R.id.word_book_definition);
++            timeView = itemView.findViewById(R.id.word_book_time);
++        }
++
++        /**
++         * Fills one card: the word, the phonetic transcription, a preview
++         * of the cached definition (or a hint that it will be fetched on
++         * demand) and the save date.
++         *
++         * @param card the card to show
++         */
++        void bind(@NonNull final WordCard card) {
++            wordView.setText(card.word);
++            phoneticView.setText(card.entry != null && card.entry.phonetic != null
++                    ? "/" + card.entry.phonetic + "/" : "");
++            definitionView.setText(card.entry != null
++                    && !card.entry.translations.isEmpty()
++                    ? firstLine(card.entry.translations.get(0))
++                    : getString(R.string.bisub_word_book_uncached));
++            timeView.setText(new SimpleDateFormat("MM-dd", Locale.getDefault())
++                    .format(new Date(card.time)));
++            itemView.setOnClickListener(view ->
++                    WordDialogHelper.show(view.getContext(), card.word));
++            itemView.setOnLongClickListener(view -> {
++                confirmRemove(view.getContext(), card.word);
++                return true;
++            });
++        }
++
++        private String firstLine(@NonNull final String translation) {
++            final int newline = translation.indexOf('\n');
++            return newline > 0 ? translation.substring(0, newline) : translation;
++        }
++    }
++
++    /**
++     * Asks for confirmation before a word is removed from the book.
++     *
++     * @param context a context to build the dialog with
++     * @param word    the word to remove
++     */
++    private void confirmRemove(@NonNull final Context context,
++                               @NonNull final String word) {
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_word_book_remove_title)
++                .setMessage(getString(R.string.bisub_word_book_remove_message, word))
++                .setPositiveButton(R.string.delete,
++                        (final DialogInterface dialog, final int which) -> {
++                            WordBook.remove(context, word);
++                            Toast.makeText(context, R.string.bisub_word_book_removed,
++                                    Toast.LENGTH_SHORT).show();
++                            reload();
++                        })
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/fragment_word_book.xml b/app/src/main/res/layout/fragment_word_book.xml
+new file mode 100644
+index 000000000..fb273919a
+--- /dev/null
++++ b/app/src/main/res/layout/fragment_word_book.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent">
++
++    <androidx.recyclerview.widget.RecyclerView
++        android:id="@+id/word_book_list"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent" />
++
++    <org.schabi.newpipe.views.NewPipeTextView
++        android:id="@+id/word_book_empty"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:gravity="center"
++        android:padding="32dp"
++        android:text="@string/bisub_word_book_empty" />
++</FrameLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/item_word_book.xml b/app/src/main/res/layout/item_word_book.xml
+new file mode 100644
+index 000000000..f2017fc77
+--- /dev/null
++++ b/app/src/main/res/layout/item_word_book.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:background="?android:attr/selectableItemBackground"
++    android:gravity="center_vertical"
++    android:orientation="horizontal"
++    android:paddingHorizontal="16dp"
++    android:paddingVertical="14dp">
++
++    <!-- One word card of the book: the word itself as the headline, the
++         phonetic transcription next to it, and a preview line of the
++         locally cached definition below. Tapping opens the full popup. -->
++    <LinearLayout
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_weight="1"
++        android:orientation="vertical">
++
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:gravity="center_vertical"
++            android:orientation="horizontal">
++
++            <org.schabi.newpipe.views.NewPipeTextView
++                android:id="@+id/word_book_word"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:textColor="?android:attr/textColorPrimary"
++                android:textSize="18sp"
++                android:textStyle="bold" />
++
++            <org.schabi.newpipe.views.NewPipeTextView
++                android:id="@+id/word_book_phonetic"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="10dp"
++                android:ellipsize="end"
++                android:maxLines="1"
++                android:textColor="?android:attr/textColorSecondary"
++                android:textSize="13sp"
++                android:textStyle="italic" />
++        </LinearLayout>
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:id="@+id/word_book_definition"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="3dp"
++            android:ellipsize="end"
++            android:maxLines="2"
++            android:textColor="?android:attr/textColorSecondary"
++            android:textSize="14sp" />
++    </LinearLayout>
++
++    <org.schabi.newpipe.views.NewPipeTextView
++        android:id="@+id/word_book_time"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginStart="12dp"
++        android:textColor="?android:attr/textColorTertiary"
++        android:textSize="11sp" />
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 2cc665aa5..73273f600 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1318,6 +1318,38 @@
+     <string name="bisub_dictionary_provider_microsoft">微软翻译（纯翻译释义）</string>
+     <string name="bisub_word_pause_video_title">查词时暂停播放</string>
+     <string name="bisub_word_pause_video_summary">词典弹窗打开期间暂停播放</string>
++    <string name="bisub_learning_center_title">学习中心</string>
++    <string name="bisub_reader_shelf_title">双语阅读</string>
++    <string name="bisub_reader_shelf_summary">从字幕缓存移入的字幕，长期保留供阅读</string>
++    <string name="bisub_reader_shelf_empty">阅读列表还是空的。\n在“双语字幕 → 已缓存字幕”里把字幕移到这里</string>
++    <string name="bisub_shelf_add">移到双语阅读</string>
++    <string name="bisub_shelf_remove">移出双语阅读</string>
++    <string name="bisub_shelf_added">已移到双语阅读</string>
++    <string name="bisub_shelf_removed">已移出双语阅读</string>
++    <string name="bisub_shelf_remove_title">移出阅读列表</string>
++    <string name="bisub_shelf_remove_message">字幕仍留在缓存中，只是不再作为阅读材料保留。</string>
++    <string name="bisub_shelf_badge">阅读列表</string>
++    <string name="bisub_cached_view">查看全文</string>
++    <string name="bisub_word_book_summary">阅读时收藏的单词</string>
++    <string name="bisub_word_book_title">生词本</string>
++    <string name="bisub_word_book_empty">生词本还是空的。\n点字幕上或阅读页里的单词，查释义后加入生词本</string>
++    <string name="bisub_word_book_uncached">首次打开时加载释义</string>
++    <string name="bisub_word_book_remove_title">移除单词</string>
++    <string name="bisub_word_book_remove_message">将 “%s” 从生词本移除？</string>
++    <string name="bisub_cache_cleanup_category_title">缓存清理</string>
++    <string name="bisub_cache_auto_clean_title">自动清理缓存</string>
++    <string name="bisub_cache_auto_clean_summary">打开缓存列表时删除超出上限的最旧字幕；阅读列表中的字幕永不删除</string>
++    <string name="bisub_cache_auto_clean_threshold_title">最多保留</string>
++    <string name="bisub_cache_threshold_10">10 条字幕</string>
++    <string name="bisub_cache_threshold_50">50 条字幕</string>
++    <string name="bisub_cache_threshold_100">100 条字幕</string>
++    <string name="bisub_cache_threshold_500">500 条字幕</string>
++    <string name="bisub_cache_threshold_1000">1000 条字幕</string>
++
++    <plurals name="bisub_word_book_count">
++        <item quantity="other">已收藏 %d 个单词</item>
++    </plurals>
++
+     <string name="bisub_reader_open">双语阅读</string>
+     <string name="bisub_reader_empty">该文件没有可读的字幕内容</string>
+     <string name="bisub_reader_mode_bilingual">双语</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index b9c89c621..2f6539463 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1223,4 +1223,36 @@
+     <string name="bisub_dictionary_provider_microsoft">微軟翻譯（純翻譯釋義）</string>
+     <string name="bisub_word_pause_video_title">查詞時暫停播放</string>
+     <string name="bisub_word_pause_video_summary">詞典彈窗開啟期間暫停播放</string>
++    <string name="bisub_learning_center_title">學習中心</string>
++    <string name="bisub_reader_shelf_title">雙語閱讀</string>
++    <string name="bisub_reader_shelf_summary">從字幕快取移入的字幕，長期保留供閱讀</string>
++    <string name="bisub_reader_shelf_empty">閱讀列表還是空的。\n在「雙語字幕 → 已快取字幕」裡把字幕移到這裡</string>
++    <string name="bisub_shelf_add">移到雙語閱讀</string>
++    <string name="bisub_shelf_remove">移出雙語閱讀</string>
++    <string name="bisub_shelf_added">已移到雙語閱讀</string>
++    <string name="bisub_shelf_removed">已移出雙語閱讀</string>
++    <string name="bisub_shelf_remove_title">移出閱讀列表</string>
++    <string name="bisub_shelf_remove_message">字幕仍留在快取中，只是不再作為閱讀材料保留。</string>
++    <string name="bisub_shelf_badge">閱讀列表</string>
++    <string name="bisub_cached_view">查看全文</string>
++    <string name="bisub_word_book_summary">閱讀時收藏的單字</string>
++    <string name="bisub_word_book_title">生詞本</string>
++    <string name="bisub_reader_open">雙語閱讀</string>
++    <string name="bisub_word_book_empty">生詞本還是空的。\n點字幕上或閱讀頁裡的單字，查釋義後加入生詞本</string>
++    <string name="bisub_word_book_uncached">首次開啟時載入釋義</string>
++    <string name="bisub_word_book_remove_title">移除單字</string>
++    <string name="bisub_word_book_remove_message">將 「%s」 從生詞本移除？</string>
++    <string name="bisub_cache_cleanup_category_title">快取清理</string>
++    <string name="bisub_cache_auto_clean_title">自動清理快取</string>
++    <string name="bisub_cache_auto_clean_summary">開啟快取列表時刪除超出上限的最舊字幕；閱讀列表中的字幕永不刪除</string>
++    <string name="bisub_cache_auto_clean_threshold_title">最多保留</string>
++    <string name="bisub_cache_threshold_10">10 條字幕</string>
++    <string name="bisub_cache_threshold_50">50 條字幕</string>
++    <string name="bisub_cache_threshold_100">100 條字幕</string>
++    <string name="bisub_cache_threshold_500">500 條字幕</string>
++    <string name="bisub_cache_threshold_1000">1000 條字幕</string>
++
++    <plurals name="bisub_word_book_count">
++        <item quantity="other">已收藏 %d 個單字</item>
++    </plurals>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index 23c262f44..e292c5841 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1924,6 +1924,26 @@
+     <string name="bisub_cloud_backup_last_run_key">bisub_cloud_backup_last_run</string>
+     <string name="bisub_dictionary_provider_key">bisub_dictionary_provider</string>
+     <string name="bisub_word_pause_video_key">bisub_word_pause_video</string>
++    <string name="bisub_cache_auto_clean_key">bisub_cache_auto_clean</string>
++    <string name="bisub_cache_auto_clean_threshold_key">bisub_cache_auto_clean_threshold</string>
++    <string name="bisub_reader_shelf_key">bisub_reader_shelf_entry</string>
++    <string name="bisub_word_book_key">bisub_word_book_entry</string>
++
++    <string-array name="bisub_cache_threshold_entries">
++        <item>@string/bisub_cache_threshold_10</item>
++        <item>@string/bisub_cache_threshold_50</item>
++        <item>@string/bisub_cache_threshold_100</item>
++        <item>@string/bisub_cache_threshold_500</item>
++        <item>@string/bisub_cache_threshold_1000</item>
++    </string-array>
++    <string-array name="bisub_cache_threshold_values">
++        <item>10</item>
++        <item>50</item>
++        <item>100</item>
++        <item>500</item>
++        <item>1000</item>
++    </string-array>
++
+ 
+     <string-array name="bisub_dictionary_providers">
+         <item>@string/bisub_dictionary_provider_youdao</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index b7ea9c00e..2cf895ca9 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1322,7 +1322,39 @@
+     <string name="bisub_dictionary_provider_microsoft">Microsoft translate (plain translation)</string>
+     <string name="bisub_word_pause_video_title">Pause on word lookup</string>
+     <string name="bisub_word_pause_video_summary">Pause playback while the dictionary popup is open</string>
++    <string name="bisub_learning_center_title">Learning center</string>
++    <string name="bisub_reader_shelf_title">Bilingual reading</string>
++    <string name="bisub_reader_shelf_summary">Subtitles moved here from the cache, kept for reading</string>
++    <string name="bisub_reader_shelf_empty">Nothing on the reading list yet.\nMove a subtitle here from the cached subtitles (bilingual subtitles → cached subtitles)</string>
++    <string name="bisub_shelf_add">Move to bilingual reading</string>
++    <string name="bisub_shelf_remove">Move off bilingual reading</string>
++    <string name="bisub_shelf_added">Moved to bilingual reading</string>
++    <string name="bisub_shelf_removed">Moved off bilingual reading</string>
++    <string name="bisub_shelf_remove_title">Move off the reading list</string>
++    <string name="bisub_shelf_remove_message">The subtitle stays in the cache; it just no longer counts as reading material.</string>
++    <string name="bisub_shelf_badge">On reading list</string>
++    <string name="bisub_cached_view">View full text</string>
++    <string name="bisub_word_book_summary">The words you saved while reading</string>
++    <string name="bisub_word_book_title">Word book</string>
+     <string name="bisub_reader_open">Read bilingually</string>
++    <string name="bisub_word_book_empty">The word book is empty.\nTap a word on a subtitle or in the reader to look it up and save it</string>
++    <string name="bisub_word_book_uncached">Definition loads on first open</string>
++    <string name="bisub_word_book_remove_title">Remove word</string>
++    <string name="bisub_word_book_remove_message">Remove \'%s\' from the word book?</string>
++    <string name="bisub_cache_cleanup_category_title">Cache cleanup</string>
++    <string name="bisub_cache_auto_clean_title">Automatic cache cleanup</string>
++    <string name="bisub_cache_auto_clean_summary">Delete the oldest cached subtitles beyond the limit when the cache list opens; subtitles on the reading list are never deleted</string>
++    <string name="bisub_cache_auto_clean_threshold_title">Keep at most</string>
++    <string name="bisub_cache_threshold_10">10 subtitles</string>
++    <string name="bisub_cache_threshold_50">50 subtitles</string>
++    <string name="bisub_cache_threshold_100">100 subtitles</string>
++    <string name="bisub_cache_threshold_500">500 subtitles</string>
++    <string name="bisub_cache_threshold_1000">1000 subtitles</string>
++
++    <plurals name="bisub_word_book_count">
++        <item quantity="one">%d word saved</item>
++        <item quantity="other">%d words saved</item>
++    </plurals>
+     <string name="bisub_reader_empty">No readable cues in this file</string>
+     <string name="bisub_reader_mode_bilingual">Bilingual</string>
+     <string name="bisub_reader_mode_original">Original</string>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index d9e3474b8..b70e899cf 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -112,6 +112,30 @@
+         app:iconSpaceReserved="false"
+         app:singleLineTitle="false" />
+ 
++    <PreferenceCategory
++        android:title="@string/bisub_cache_cleanup_category_title"
++        app:iconSpaceReserved="false">
++
++        <SwitchPreferenceCompat
++            android:key="@string/bisub_cache_auto_clean_key"
++            android:defaultValue="true"
++            android:title="@string/bisub_cache_auto_clean_title"
++            android:summary="@string/bisub_cache_auto_clean_summary"
++            app:iconSpaceReserved="false"
++            app:singleLineTitle="false" />
++
++        <ListPreference
++            android:key="@string/bisub_cache_auto_clean_threshold_key"
++            android:defaultValue="100"
++            android:entries="@array/bisub_cache_threshold_entries"
++            android:entryValues="@array/bisub_cache_threshold_values"
++            android:title="@string/bisub_cache_auto_clean_threshold_title"
++            android:summary="%s"
++            android:dependency="@string/bisub_cache_auto_clean_key"
++            app:iconSpaceReserved="false"
++            app:singleLineTitle="false" />
++    </PreferenceCategory>
++
+     <PreferenceCategory
+         android:title="@string/bisub_dictionary_category_title"
+         app:iconSpaceReserved="false">
+diff --git a/app/src/main/res/xml/learning_center_settings.xml b/app/src/main/res/xml/learning_center_settings.xml
+new file mode 100644
+index 000000000..0d84a69d6
+--- /dev/null
++++ b/app/src/main/res/xml/learning_center_settings.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:title="@string/bisub_learning_center_title">
++
++    <Preference
++        android:key="@string/bisub_reader_shelf_key"
++        android:fragment="org.schabi.newpipe.settings.ReaderListFragment"
++        android:summary="@string/bisub_reader_shelf_summary"
++        android:title="@string/bisub_reader_shelf_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++
++    <Preference
++        android:key="@string/bisub_word_book_key"
++        android:fragment="org.schabi.newpipe.settings.WordBookFragment"
++        android:summary="@string/bisub_word_book_summary"
++        android:title="@string/bisub_word_book_title"
++        app:iconSpaceReserved="false"
++        app:singleLineTitle="false" />
++</PreferenceScreen>
+\ No newline at end of file
+diff --git a/app/src/main/res/xml/main_settings.xml b/app/src/main/res/xml/main_settings.xml
+index 535de4d29..e0ae770cc 100644
+--- a/app/src/main/res/xml/main_settings.xml
++++ b/app/src/main/res/xml/main_settings.xml
+@@ -16,6 +16,12 @@
+         android:title="@string/bisub_settings_title"
+         app:iconSpaceReserved="false" />
+ 
++    <PreferenceScreen
++        android:fragment="org.schabi.newpipe.settings.LearningCenterFragment"
++        android:icon="@drawable/ic_school"
++        android:title="@string/bisub_learning_center_title"
++        app:iconSpaceReserved="false" />
++
+     <PreferenceScreen
+         android:fragment="org.schabi.newpipe.settings.GestureSettingsFragment"
+         android:icon="@drawable/ic_button_pointer"
+-- 
+2.54.0.windows.1
+

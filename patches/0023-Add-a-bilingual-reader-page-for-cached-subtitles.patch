@@ -1,7 +1,7 @@
-From cf724ea5e6ab9b50d102049368696def1d7df84c Mon Sep 17 00:00:00 2001
+From abc4c8c5648a39d2773b5604383b6625671e6faa Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 21:55:34 +0800
-Subject: [PATCH 3/4] Add a bilingual reader page for cached subtitles
+Subject: [PATCH 23/51] Add a bilingual reader page for cached subtitles
 
 The cached subtitles were only viewable as raw VTT text in a dialog.
 They are a valuable learning resource, so tapping an entry keeps the
@@ -418,7 +418,7 @@ index 000000000..6b305584d
 +</LinearLayout>
 \ No newline at end of file
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 78f3f2319..b9dddb61a 100644
+index 8029111a2..76761ac5d 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1295,6 +1295,12 @@
@@ -435,10 +435,10 @@ index 78f3f2319..b9dddb61a 100644
      <string name="bisub_cached_list_summary">查看已翻译视频的缩略图与详情，支持导出和删除字幕文件</string>
      <string name="bisub_cached_list_empty">还没有已翻译的双语字幕。打开视频页并点击“双语”按钮即可生成。</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index f47b97baf..37f169e6c 100644
+index 579eb5f62..a411dc0bf 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1298,6 +1298,12 @@
+@@ -1299,6 +1299,12 @@
      <string name="bisub_button_failed">Retry</string>
      <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
      <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>

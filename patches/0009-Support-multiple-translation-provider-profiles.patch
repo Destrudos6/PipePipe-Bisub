@@ -1,7 +1,7 @@
-From 31f59db866fb42630a5c950008fd46bb77ae179d Mon Sep 17 00:00:00 2001
+From fbe6e39a45bbd18cb62386968391d23a4eac118b Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 13:54:18 +0800
-Subject: [PATCH 09/12] Support multiple translation provider profiles
+Subject: [PATCH 09/51] Support multiple translation provider profiles
 
 The single provider/model configuration becomes a list of named
 profiles (provider preset, base URL, API key, model, parallel
@@ -779,7 +779,7 @@ index e49f337ad..2f86d9966 100644
          }
          if (isBlank(prefs.getString(getString(R.string.bisub_target_lang_key), null))) {
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 518c11031..1aab0e4b3 100644
+index 6a12cc7cf..1d8251e50 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1204,6 +1204,18 @@
@@ -802,10 +802,10 @@ index 518c11031..1aab0e4b3 100644
      <string name="bisub_enable_summary">在视频页显示“双语字幕”按钮，按需生成并缓存翻译字幕</string>
      <string name="bisub_provider_title">提供商</string>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index a249b514d..15abee983 100644
+index d40f056c7..3af6ed8ba 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1885,6 +1885,9 @@
+@@ -1887,6 +1887,9 @@
      <string name="lock_screen_button_key" translatable="false">lock_screen_button</string>
      <!-- Bilingual subtitles (bisub) -->
      <string name="bisub_enable_key">bisub_enable</string>
@@ -816,10 +816,10 @@ index a249b514d..15abee983 100644
      <string name="bisub_base_url_key">bisub_base_url</string>
      <string name="bisub_api_key_key">bisub_api_key</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 298fb0643..eb4d1c617 100644
+index e51a634f0..c677c7c29 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1210,6 +1210,17 @@
+@@ -1211,6 +1211,17 @@
      <string name="bisub_settings_title">Bilingual subtitles</string>
      <string name="bisub_enable_title">Enable bilingual subtitles</string>
      <string name="bisub_enable_summary">Show a Bilingual button on video pages that generates translated subtitles on demand</string>

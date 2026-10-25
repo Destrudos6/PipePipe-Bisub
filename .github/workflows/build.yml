@@ -11,11 +11,11 @@ on:
       client_ref:
         description: 'PipePipeClient branch/tag/commit to build from'
         required: false
-        default: "b7cd5a34cfa5cbf52474dd075fe82e414d162fae"
+        default: "b91f008fb4d25b470c4383dcf42e31ee7696d272"
       extractor_ref:
         description: 'PipePipeExtractor branch/tag/commit (must be compatible with the client ref)'
         required: false
-        default: '73442076c671ae09bd5c0f9635932a5a67bdd609'
+        default: 'ce289b45503e06ae5e578ea70c92bc87d21b3a73'
 
 jobs:
   # Lightweight probe: resolves the upstream dev/main heads and compares

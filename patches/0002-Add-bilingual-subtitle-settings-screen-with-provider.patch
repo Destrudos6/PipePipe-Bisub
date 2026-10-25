@@ -1,7 +1,7 @@
-From c80f1d2515501c8bc08a2f4e3bb5d8073c5cfa1d Mon Sep 17 00:00:00 2001
+From a12712da1b6b84165ec99fff9f16b44bce04b43f Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Tue, 20 Oct 2026 09:37:41 +0800
-Subject: [PATCH 02/12] Add bilingual subtitle settings screen with provider
+Subject: [PATCH 02/51] Add bilingual subtitle settings screen with provider
  config and style editor
 
 - New BisubSettingsFragment registered in SettingsResourceRegistry and
@@ -20,10 +20,10 @@ Subject: [PATCH 02/12] Add bilingual subtitle settings screen with provider
  .../main/res/layout/dialog_bisub_style.xml    | 156 +++++++
  app/src/main/res/values-zh-rCN/strings.xml    |  60 ++-
  app/src/main/res/values/settings_keys.xml     |  34 ++
- app/src/main/res/values/strings.xml           |  58 +++
+ app/src/main/res/values/strings.xml           |  62 ++-
  app/src/main/res/xml/bisub_settings.xml       |  75 +++
  app/src/main/res/xml/main_settings.xml        |   6 +
- 9 files changed, 836 insertions(+), 2 deletions(-)
+ 9 files changed, 839 insertions(+), 3 deletions(-)
  create mode 100644 app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
  create mode 100644 app/src/main/res/drawable/bisub_preview_background.xml
  create mode 100644 app/src/main/res/layout/dialog_bisub_style.xml
@@ -665,7 +665,7 @@ index 000000000..a256c9ac3
 +</ScrollView>
 \ No newline at end of file
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
-index 78e07cb29..4fa7be84e 100644
+index 48559beec..e346e3e18 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml
 +++ b/app/src/main/res/values-zh-rCN/strings.xml
 @@ -1202,5 +1202,61 @@
@@ -734,10 +734,10 @@ index 78e07cb29..4fa7be84e 100644
 +    <string name="bisub_toast_failed">字幕翻译失败，请检查网络后重试</string>
 +</resources>
 diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
-index 53078609f..2658ed8fb 100644
+index 163e70263..fbd27022e 100644
 --- a/app/src/main/res/values/settings_keys.xml
 +++ b/app/src/main/res/values/settings_keys.xml
-@@ -1883,4 +1883,38 @@
+@@ -1885,4 +1885,38 @@
          <item>@string/audio_quality_low</item>
      </string-array>
      <string name="lock_screen_button_key" translatable="false">lock_screen_button</string>
@@ -777,13 +777,16 @@ index 53078609f..2658ed8fb 100644
 +    </string-array>
  </resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index f30139d5d..cfe0c7ee3 100644
+index 31ea3e516..6abea7b27 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1206,4 +1206,62 @@
+@@ -1206,4 +1206,64 @@
  <string name="audio_quality_low">Low (lowest bitrate, saves data)</string>
  <string name="lock_screen_button_title">Lock screen button</string>
  <string name="lock_screen_button_summary">Show a button in the fullscreen player to lock touch controls</string>
+-</resources>
+\ No newline at end of file
++
 +    <!-- Bilingual subtitles (bisub) -->
 +    <string name="bisub_settings_title">Bilingual subtitles</string>
 +    <string name="bisub_enable_title">Enable bilingual subtitles</string>
@@ -842,7 +845,8 @@ index f30139d5d..cfe0c7ee3 100644
 +    <string name="bisub_button_failed">Retry</string>
 +    <string name="bisub_button_desc">Generate bilingual subtitles with a translation model</string>
 +    <string name="bisub_toast_failed">Subtitle translation failed. Check your connection and try again.</string>
- </resources>
++</resources>
++
 diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
 new file mode 100644
 index 000000000..305682886
