@@ -1,0 +1,129 @@
+From 4cd6ff0e19d5ae13f5191b73c0128aed286d9c51 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Sun, 25 Oct 2026 13:00:54 +0800
+Subject: [PATCH] Cap the word popup scroll area so the button stays visible
+
+A word with many long senses (e.g. "down") stretched the dictionary popup taller than the screen, pushing the word-book button out of reach. The senses and secondary TextViews now sit inside a ScrollView whose height is capped at 240dp after the content is filled: short lookups stay unchanged, long ones scroll in place, and the button is always visible at the bottom.
+---
+ .../bisub/wordlookup/WordDialogHelper.java    | 35 ++++++++++++++
+ app/src/main/res/layout/dialog_bisub_word.xml | 46 ++++++++++++-------
+ 2 files changed, 65 insertions(+), 16 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+index d6722c7d1..1f6a7ce46 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordDialogHelper.java
+@@ -12,9 +12,11 @@ import android.text.TextUtils;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.view.ViewTreeObserver;
+ import android.view.Window;
+ import android.view.WindowManager;
+ import android.widget.Button;
++import android.widget.ScrollView;
+ import android.widget.TextView;
+ import android.widget.Toast;
+ 
+@@ -366,6 +368,39 @@ public final class WordDialogHelper {
+         // a zero in the debug log instead of a mystery.
+         sensesView.post(() -> BisubLog.i("word popup '" + word + "': senses view "
+                 + "measured " + sensesView.getWidth() + "x" + sensesView.getHeight()));
++        capScrollHeight(view);
++    }
++
++    /**
++     * Caps the scroll area of the senses/secondary block so a word with
++     * many long senses (e.g. "down") cannot stretch the popup taller
++     * than the screen and push the word-book button out of reach. The
++     * cap is applied after the content is filled, once the scroll view
++     * has been laid out with its real height.
++     *
++     * @param view the popup's root view
++     */
++    private static void capScrollHeight(@NonNull final View view) {
++        final ScrollView scroll = view.findViewById(R.id.bisub_word_scroll);
++        if (scroll == null) {
++            return;
++        }
++        final float density = scroll.getResources().getDisplayMetrics().density;
++        final int maxPx = (int) (240 * density);
++        scroll.getViewTreeObserver().addOnGlobalLayoutListener(
++                new ViewTreeObserver.OnGlobalLayoutListener() {
++            @Override
++            public void onGlobalLayout() {
++                scroll.getViewTreeObserver().removeOnGlobalLayoutListener(this);
++                if (scroll.getHeight() > maxPx) {
++                    final ViewGroup.LayoutParams lp = scroll.getLayoutParams();
++                    lp.height = maxPx;
++                    scroll.setLayoutParams(lp);
++                    BisubLog.i("word popup: scroll capped to " + maxPx
++                            + "px (was " + scroll.getHeight() + "px)");
++                }
++            }
++        });
+     }
+ 
+     /**
+diff --git a/app/src/main/res/layout/dialog_bisub_word.xml b/app/src/main/res/layout/dialog_bisub_word.xml
+index 6765e711d..6ef863e91 100644
+--- a/app/src/main/res/layout/dialog_bisub_word.xml
++++ b/app/src/main/res/layout/dialog_bisub_word.xml
+@@ -58,24 +58,38 @@
+         android:alpha="0.15"
+         android:background="?android:attr/textColorPrimary" />
+ 
+-    <TextView
+-        android:id="@+id/bisub_word_senses"
+-        android:layout_width="wrap_content"
++    <ScrollView
++        android:id="@+id/bisub_word_scroll"
++        android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+-        android:paddingTop="2dp"
+-        android:paddingBottom="2dp"
+-        android:textColor="?android:attr/textColorPrimary"
+-        android:textSize="14sp" />
++        android:layout_marginTop="2dp"
++        android:fillViewport="true">
+ 
+-    <TextView
+-        android:id="@+id/bisub_word_secondary"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:paddingTop="2dp"
+-        android:paddingBottom="4dp"
+-        android:textColor="?android:attr/textColorTertiary"
+-        android:textSize="12sp"
+-        android:visibility="gone" />
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="vertical">
++
++            <TextView
++                android:id="@+id/bisub_word_senses"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:paddingTop="2dp"
++                android:paddingBottom="2dp"
++                android:textColor="?android:attr/textColorPrimary"
++                android:textSize="14sp" />
++
++            <TextView
++                android:id="@+id/bisub_word_secondary"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:paddingTop="2dp"
++                android:paddingBottom="4dp"
++                android:textColor="?android:attr/textColorTertiary"
++                android:textSize="12sp"
++                android:visibility="gone" />
++        </LinearLayout>
++    </ScrollView>
+ 
+     <Button
+         android:id="@+id/bisub_word_book_button"
+-- 
+2.54.0.windows.1
+
