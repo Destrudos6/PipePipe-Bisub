@@ -1,4 +1,4 @@
-From 3aff784811678c6848816787dc10920400beb376 Mon Sep 17 00:00:00 2001
+From 43db7a7023ec22bd426f68fa7d5a16c40545d769 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Thu, 22 Oct 2026 12:57:51 +0800
 Subject: [PATCH 2/4] Remove the leftover SoundCloudGoPlusContentException

@@ -15,7 +15,7 @@ on:
       extractor_ref:
         description: 'PipePipeExtractor branch/tag/commit (must be compatible with the client ref)'
         required: false
-        default: 'ce289b45503e06ae5e578ea70c92bc87d21b3a73'
+        default: '1a09d20e68dbd0892995bc58ffa539049a656690'
 
 jobs:
   # Lightweight probe: resolves the upstream dev/main heads and compares
