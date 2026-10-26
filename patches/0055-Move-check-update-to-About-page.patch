@@ -1,0 +1,131 @@
+From 08a06a994c5af389a96ed291d2201e5a8556b242 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Mon, 26 Oct 2026 12:30:45 +0800
+Subject: [PATCH] 0055: Move check-update button from bisub settings to About
+ page
+
+The update checker is a maintenance action, not a subtitle setting,
+so it belongs in the About page alongside the app version and project
+links. Remove the update PreferenceCategory from bisub_settings.xml
+and the setupCheckUpdateButton method from BisubSettingsFragment, and
+add a Check for updates button to the About fragment instead.
+---
+ .../org/schabi/newpipe/about/AboutActivity.kt    |  4 ++++
+ .../newpipe/settings/BisubSettingsFragment.java  | 16 ++--------------
+ app/src/main/res/layout/fragment_about.xml       | 15 +++++++++++++++
+ app/src/main/res/xml/bisub_settings.xml          | 11 -----------
+ 4 files changed, 21 insertions(+), 25 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/about/AboutActivity.kt b/app/src/main/java/org/schabi/newpipe/about/AboutActivity.kt
+index 36da22fbd..76df6c5f0 100644
+--- a/app/src/main/java/org/schabi/newpipe/about/AboutActivity.kt
++++ b/app/src/main/java/org/schabi/newpipe/about/AboutActivity.kt
+@@ -13,6 +13,7 @@ import androidx.viewpager2.adapter.FragmentStateAdapter
+ import com.google.android.material.tabs.TabLayoutMediator
+ import org.schabi.newpipe.BuildConfig
+ import org.schabi.newpipe.R
++import org.schabi.newpipe.bisub.BisubUpdateChecker
+ import org.schabi.newpipe.databinding.ActivityAboutBinding
+ import org.schabi.newpipe.databinding.FragmentAboutBinding
+ import org.schabi.newpipe.util.Localization
+@@ -78,6 +79,9 @@ class AboutActivity : AppCompatActivity() {
+                 aboutGithubLink.openLink(R.string.github_url)
+                 aboutPipepipeLink.openLink(R.string.pipepipe_project_url)
+                 aboutNewpipeLink.openLink(R.string.newpipe_project_url)
++                aboutCheckUpdateButton.setOnClickListener {
++                    BisubUpdateChecker.checkForUpdates(requireContext())
++                }
+                 return root
+             }
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 5f6356f37..1ca4afdd3 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -31,7 +31,7 @@ import com.google.android.material.tabs.TabLayout;
+ 
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.BisubLog;
+-import org.schabi.newpipe.bisub.BisubUpdateChecker;
++
+ 
+ import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.bisub.BisubStyle;
+@@ -118,7 +118,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         // The cached subtitles list is a second-level page
+         // (BisubCacheFragment) opened through android:fragment.
+         setupDebugLogButton();
+-        setupCheckUpdateButton();
++
+         refreshProfileBindings();
+         prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
+     }
+@@ -665,19 +665,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+     }
+ 
+     /**
+-     * Checks GitHub for a newer bisub release and, if one exists,
+-     * shows a dialog with the release notes and a download button.
+-     */
+-    private void setupCheckUpdateButton() {
+-        final Preference updatePref =
+-                requirePreference(R.string.bisub_check_update_key);
+-        updatePref.setOnPreferenceClickListener((final Preference p) -> {
+-            BisubUpdateChecker.checkForUpdates(requireContext());
+-            return true;
+-        });
+-    }
+ 
+-    /**
+      * Shows the debug log entries, newest at the bottom, and offers copy,
+      * clear and dismiss actions.
+      */
+diff --git a/app/src/main/res/layout/fragment_about.xml b/app/src/main/res/layout/fragment_about.xml
+index 32e9da7a0..94a31ff43 100644
+--- a/app/src/main/res/layout/fragment_about.xml
++++ b/app/src/main/res/layout/fragment_about.xml
+@@ -96,5 +96,20 @@
+                 android:layout_height="wrap_content"
+                 android:text="@string/view_newpipe_on_github" />
+         </LinearLayout>
++
++        <org.schabi.newpipe.views.NewPipeTextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:paddingTop="10dp"
++            android:text="@string/bisub_update_category_title"
++            android:textAppearance="@android:style/TextAppearance.Medium" />
++
++        <Button
++            android:id="@+id/about_check_update_button"
++            style="@style/Base.Widget.AppCompat.Button.Borderless"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_gravity="end"
++            android:text="@string/bisub_check_update_title" />
+     </LinearLayout>
+ </androidx.core.widget.NestedScrollView>
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index bea3a08f0..95ccfeb3d 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -171,15 +171,4 @@
+             app:singleLineTitle="false" />
+     </PreferenceCategory>
+ 
+-    <PreferenceCategory
+-        android:title="@string/bisub_update_category_title"
+-        app:iconSpaceReserved="false">
+-
+-        <Preference
+-            android:key="@string/bisub_check_update_key"
+-            android:summary="@string/bisub_check_update_summary"
+-            android:title="@string/bisub_check_update_title"
+-            app:iconSpaceReserved="false"
+-            app:singleLineTitle="false" />
+-    </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+
