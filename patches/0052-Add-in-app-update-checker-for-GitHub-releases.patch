@@ -1,7 +1,7 @@
-From 73be63f80980ef242d9461b16467a392970ea804 Mon Sep 17 00:00:00 2001
+From 93a03010358d0f6ef4c7ea0aa63eff28111559cb Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Mon, 26 Oct 2026 11:32:43 +0800
-Subject: [PATCH] 0052: Add in-app update checker for GitHub releases
+Subject: [PATCH 1/2] 0052: Add in-app update checker for GitHub releases
 
 Check the PipePipe-Bisub GitHub releases API from a new "Check for
 updates" preference in the bisub settings page. Compare the bisub
@@ -14,12 +14,12 @@ the cache dir.
 ---
  app/src/main/AndroidManifest.xml              |  10 +
  .../newpipe/bisub/BisubUpdateChecker.java     | 261 ++++++++++++++++++
- .../settings/BisubSettingsFragment.java       |  14 +
+ .../settings/BisubSettingsFragment.java       |  15 +
  app/src/main/res/values-zh-rCN/strings.xml    |  14 +
  app/src/main/res/values/strings.xml           |  14 +
  app/src/main/res/xml/bisub_file_paths.xml     |   6 +
  app/src/main/res/xml/bisub_settings.xml       |  12 +
- 7 files changed, 331 insertions(+)
+ 7 files changed, 332 insertions(+)
  create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
  create mode 100644 app/src/main/res/xml/bisub_file_paths.xml
 
@@ -320,10 +320,18 @@ index 000000000..590cfde67
 +}
 \ No newline at end of file
 diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
-index 60be13be6..e2d93f5d2 100644
+index 60be13be6..5f6356f37 100644
 --- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
 +++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
-@@ -117,6 +117,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+@@ -31,6 +31,7 @@ import com.google.android.material.tabs.TabLayout;
+ 
+ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.BisubLog;
++import org.schabi.newpipe.bisub.BisubUpdateChecker;
+ 
+ import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.bisub.BisubStyle;
+@@ -117,6 +118,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
          // The cached subtitles list is a second-level page
          // (BisubCacheFragment) opened through android:fragment.
          setupDebugLogButton();
@@ -331,7 +339,7 @@ index 60be13be6..e2d93f5d2 100644
          refreshProfileBindings();
          prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
      }
-@@ -662,6 +663,19 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+@@ -662,6 +664,19 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
          });
      }
  

@@ -1,7 +1,7 @@
-From b8afa17119def3749817e1dd5f01631876cafe8e Mon Sep 17 00:00:00 2001
+From c85a1958b2aff08c5f332c219f5aaa3b25b857c7 Mon Sep 17 00:00:00 2001
 From: Destrudos6 <3411622425@qq.com>
 Date: Mon, 26 Oct 2026 11:40:08 +0800
-Subject: [PATCH] 0053: Pre-fill jianguoyun WebDAV URL in cloud backup
+Subject: [PATCH 2/2] 0053: Pre-fill jianguoyun WebDAV URL in cloud backup
 
 Add a "Preset service" ListPreference to the cloud backup settings
 that, when set to jianguoyun, automatically fills the WebDAV URL
