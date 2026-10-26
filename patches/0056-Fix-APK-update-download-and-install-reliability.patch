@@ -1,0 +1,261 @@
+From 0df0252782816e401193596615e0e4fbe6952793 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Mon, 26 Oct 2026 12:49:27 +0800
+Subject: [PATCH] 0056: Fix APK update download and install reliability
+
+- Switch APK storage from cacheDir to externalFilesDir (more persistent,
+  not cleared by OS, more reliable with FileProvider)
+- Use version-specific filename (bisub-update-NN.apk) so repeated
+  check-update reuses already downloaded APK instead of re-downloading
+- Add download progress dialog with percentage indicator
+- Verify Content-Length after download to prevent installing truncated APK
+- Clean up old version APK files before downloading new one
+- Add external-files-path to FileProvider XML (with cache-path fallback)
+- Add bisub_update_installing string resource (en + zh-CN)
+---
+ .../newpipe/bisub/BisubUpdateChecker.java     | 128 +++++++++++++++---
+ app/src/main/res/values-zh-rCN/strings.xml    |   1 +
+ app/src/main/res/values/strings.xml           |   1 +
+ app/src/main/res/xml/bisub_file_paths.xml     |   3 +
+ 4 files changed, 117 insertions(+), 16 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+index 590cfde67..ea721add6 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+@@ -1,6 +1,7 @@
+ package org.schabi.newpipe.bisub;
+ 
+ import android.app.AlertDialog;
++import android.app.ProgressDialog;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.net.Uri;
+@@ -31,11 +32,17 @@ import okhttp3.Response;
+  * newer bisub build, compares the bisub run-number embedded in the release
+  * tag ({@code bisub-NN}) with the one baked into {@link BuildConfig#VERSION_NAME},
+  * and if a newer release exists, shows a dialog with the release notes and a
+- * "Download &amp; install" button that fetches the APK into the cache dir and
+- * fires {@code ACTION_VIEW} with the package-archive MIME type.
++ * "Download &amp; install" button that fetches the APK into the app's external
++ * files directory and fires {@code ACTION_VIEW} with the package-archive MIME
++ * type.
+  *
+  * <p>The run-number comparison avoids any dependency on the upstream
+  * {@code baseVersionCode} — only the {@code bisubNN} suffix matters.</p>
++ *
++ * <p>Downloaded APKs are cached with a version-specific filename
++ * ({@code bisub-update-NN.apk}) so that a repeated "check for updates"
++ * after a failed install reuses the existing file instead of
++ * re-downloading.</p>
+  */
+ public final class BisubUpdateChecker {
+ 
+@@ -100,7 +107,7 @@ public final class BisubUpdateChecker {
+                 final String releaseName =
+                         json.optString("name", tagName);
+                 runOnUi(() -> showUpdateAvailable(
+-                        context, releaseName, notes, apkUrl));
++                        context, releaseName, notes, apkUrl, remote));
+             }
+         } catch (final Exception e) {
+             BisubLog.e("Update check failed", e);
+@@ -183,7 +190,7 @@ public final class BisubUpdateChecker {
+ 
+     private static void showUpdateAvailable(final Context context,
+             final String releaseName, final String notes,
+-            final String apkUrl) {
++            final String apkUrl, final int remoteNumber) {
+         final ScrollView scroller = new ScrollView(context);
+         final TextView view = new TextView(context);
+         view.setText(notes);
+@@ -197,21 +204,82 @@ public final class BisubUpdateChecker {
+                         releaseName))
+                 .setView(scroller)
+                 .setPositiveButton(R.string.bisub_update_download,
+-                        (d, w) -> downloadAndInstall(context, apkUrl))
++                        (d, w) -> downloadAndInstall(
++                                context, apkUrl, remoteNumber))
+                 .setNegativeButton(android.R.string.cancel, null)
+                 .show();
+     }
+ 
++    /**
++     * Returns the path where the APK for the given bisub run-number
++     * should be stored.  Prefers the external files dir (persistent,
++     * not cleared by the OS); falls back to the cache dir if external
++     * storage is unavailable.
++     */
++    private static File getApkFile(final Context context,
++                                   final int remoteNumber) {
++        final String name = "bisub-update-" + remoteNumber + ".apk";
++        final File extDir = context.getExternalFilesDir(null);
++        if (extDir != null) {
++            return new File(extDir, name);
++        }
++        return new File(context.getCacheDir(), name);
++    }
++
++    /**
++     * Deletes any previously cached APK files that belong to a
++     * different bisub version, keeping the download directory tidy.
++     */
++    private static void cleanupOldApks(final File currentApk) {
++        final File dir = currentApk.getParentFile();
++        if (dir == null) {
++            return;
++        }
++        final File[] files = dir.listFiles();
++        if (files == null) {
++            return;
++        }
++        for (final File f : files) {
++            final String fn = f.getName();
++            if (fn.startsWith("bisub-update-")
++                    && fn.endsWith(".apk")
++                    && !fn.equals(currentApk.getName())) {
++                f.delete();
++            }
++        }
++    }
++
++    @SuppressWarnings("deprecation")
+     private static void downloadAndInstall(final Context context,
+-                                           final String apkUrl) {
+-        Toast.makeText(context, R.string.bisub_update_downloading,
+-                Toast.LENGTH_SHORT).show();
+-        new Thread(() -> doDownload(context, apkUrl)).start();
++                                           final String apkUrl,
++                                           final int remoteNumber) {
++        final File apkFile = getApkFile(context, remoteNumber);
++        if (apkFile.exists() && apkFile.length() > 0) {
++            Toast.makeText(context, R.string.bisub_update_installing,
++                    Toast.LENGTH_SHORT).show();
++            installApk(context, apkFile);
++            return;
++        }
++
++        final ProgressDialog progress = new ProgressDialog(context);
++        progress.setTitle(R.string.bisub_update_downloading);
++        progress.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
++        progress.setMax(100);
++        progress.setProgress(0);
++        progress.setIndeterminate(false);
++        progress.setCancelable(false);
++        progress.show();
++
++        new Thread(() -> doDownload(
++                context, apkUrl, apkFile, progress)).start();
+     }
+ 
+     private static void doDownload(final Context context,
+-                                   final String apkUrl) {
++                                   final String apkUrl,
++                                   final File apkFile,
++                                   final ProgressDialog progress) {
+         try {
++            cleanupOldApks(apkFile);
+             final OkHttpClient client = new OkHttpClient.Builder()
+                     .connectTimeout(30, TimeUnit.SECONDS)
+                     .readTimeout(120, TimeUnit.SECONDS)
+@@ -223,26 +291,54 @@ public final class BisubUpdateChecker {
+             try (Response response = client.newCall(request).execute()) {
+                 if (!response.isSuccessful()) {
+                     final int code = response.code();
+-                    runOnUi(() -> showError(context,
+-                            "Download HTTP " + code));
++                    runOnUi(() -> {
++                        progress.dismiss();
++                        showError(context, "Download HTTP " + code);
++                    });
+                     return;
+                 }
+-                final File apkFile = new File(
+-                        context.getCacheDir(), "bisub-update.apk");
++                final long contentLength =
++                        response.body().contentLength();
+                 try (InputStream is = response.body().byteStream();
+                      FileOutputStream fos =
+                              new FileOutputStream(apkFile)) {
+                     final byte[] buf = new byte[8192];
+                     int n;
++                    long total = 0;
++                    long lastUpdate = 0;
+                     while ((n = is.read(buf)) > 0) {
+                         fos.write(buf, 0, n);
++                        total += n;
++                        if (contentLength > 0
++                                && total - lastUpdate > 100_000) {
++                            lastUpdate = total;
++                            final int pct = (int) (total * 100
++                                    / contentLength);
++                            runOnUi(() -> progress.setProgress(pct));
++                        }
+                     }
+                 }
+-                runOnUi(() -> installApk(context, apkFile));
++                if (contentLength > 0
++                        && apkFile.length() != contentLength) {
++                    apkFile.delete();
++                    runOnUi(() -> {
++                        progress.dismiss();
++                        showError(context, "Download incomplete");
++                    });
++                    return;
++                }
++                runOnUi(() -> {
++                    progress.dismiss();
++                    installApk(context, apkFile);
++                });
+             }
+         } catch (final Exception e) {
+             BisubLog.e("APK download failed", e);
+-            runOnUi(() -> showError(context, e.getMessage()));
++            apkFile.delete();
++            runOnUi(() -> {
++                progress.dismiss();
++                showError(context, e.getMessage());
++            });
+         }
+     }
+ 
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index baa12cd84..ab366d152 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1463,6 +1463,7 @@
+     <string name="bisub_update_available_title">发现新版本：%s</string>
+     <string name="bisub_update_download">下载并安装</string>
+     <string name="bisub_update_downloading">正在下载 APK…</string>
++    <string name="bisub_update_installing">正在安装已下载的 APK…</string>
+ 
+     <!-- bisub cloud backup presets -->
+     <string name="bisub_cloud_backup_preset_title">预设服务</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 8a93dab4d..2813aaf52 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1467,6 +1467,7 @@
+     <string name="bisub_update_available_title">Update available: %s</string>
+     <string name="bisub_update_download">Download &amp; install</string>
+     <string name="bisub_update_downloading">Downloading APK…</string>
++    <string name="bisub_update_installing">Installing downloaded APK…</string>
+ 
+     <!-- bisub cloud backup presets -->
+     <string name="bisub_cloud_backup_preset_title">Preset service</string>
+diff --git a/app/src/main/res/xml/bisub_file_paths.xml b/app/src/main/res/xml/bisub_file_paths.xml
+index c2f19cb64..aa5a21480 100644
+--- a/app/src/main/res/xml/bisub_file_paths.xml
++++ b/app/src/main/res/xml/bisub_file_paths.xml
+@@ -1,5 +1,8 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <paths>
++    <external-files-path
++        name="bisub_ext"
++        path="." />
+     <cache-path
+         name="bisub_cache"
+         path="." />
+-- 
+2.54.0.windows.1
+
