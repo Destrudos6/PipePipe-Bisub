@@ -1,0 +1,438 @@
+From 73be63f80980ef242d9461b16467a392970ea804 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Mon, 26 Oct 2026 11:32:43 +0800
+Subject: [PATCH] 0052: Add in-app update checker for GitHub releases
+
+Check the PipePipe-Bisub GitHub releases API from a new "Check for
+updates" preference in the bisub settings page. Compare the bisub
+run-number in the release tag (bisub-NN) with the one in
+BuildConfig.VERSION_NAME. If newer, show a dialog with release notes
+and a download button that fetches the APK and fires ACTION_VIEW.
+
+Requires REQUEST_INSTALL_PACKAGES and a dedicated FileProvider for
+the cache dir.
+---
+ app/src/main/AndroidManifest.xml              |  10 +
+ .../newpipe/bisub/BisubUpdateChecker.java     | 261 ++++++++++++++++++
+ .../settings/BisubSettingsFragment.java       |  14 +
+ app/src/main/res/values-zh-rCN/strings.xml    |  14 +
+ app/src/main/res/values/strings.xml           |  14 +
+ app/src/main/res/xml/bisub_file_paths.xml     |   6 +
+ app/src/main/res/xml/bisub_settings.xml       |  12 +
+ 7 files changed, 331 insertions(+)
+ create mode 100644 app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+ create mode 100644 app/src/main/res/xml/bisub_file_paths.xml
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index cdfc7496b..e075d4528 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -6,6 +6,7 @@
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+@@ -200,6 +201,15 @@
+                 android:name="android.support.FILE_PROVIDER_PATHS"
+                 android:resource="@xml/nnf_provider_paths" />
+         </provider>
++        <provider
++            android:name="androidx.core.content.FileProvider"
++            android:authorities="${applicationId}.bisub.provider"
++            android:exported="false"
++            android:grantUriPermissions="true">
++            <meta-data
++                android:name="android.support.FILE_PROVIDER_PATHS"
++                android:resource="@xml/bisub_file_paths" />
++        </provider>
+ 
+         <activity
+                 android:name=".local.playlist.PlayPlaylistShortcutActivity"
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+new file mode 100644
+index 000000000..590cfde67
+--- /dev/null
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+@@ -0,0 +1,261 @@
++package org.schabi.newpipe.bisub;
++
++import android.app.AlertDialog;
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++import android.os.Handler;
++import android.os.Looper;
++import android.widget.ScrollView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.core.content.FileProvider;
++
++import org.json.JSONArray;
++import org.json.JSONObject;
++import org.schabi.newpipe.BuildConfig;
++import org.schabi.newpipe.R;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.InputStream;
++import java.util.concurrent.TimeUnit;
++
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.Response;
++
++/**
++ * Checks {@code https://github.com/Destrudos6/PipePipe-Bisub/releases} for a
++ * newer bisub build, compares the bisub run-number embedded in the release
++ * tag ({@code bisub-NN}) with the one baked into {@link BuildConfig#VERSION_NAME},
++ * and if a newer release exists, shows a dialog with the release notes and a
++ * "Download &amp; install" button that fetches the APK into the cache dir and
++ * fires {@code ACTION_VIEW} with the package-archive MIME type.
++ *
++ * <p>The run-number comparison avoids any dependency on the upstream
++ * {@code baseVersionCode} — only the {@code bisubNN} suffix matters.</p>
++ */
++public final class BisubUpdateChecker {
++
++    private static final String RELEASES_API =
++            "https://api.github.com/repos/Destrudos6/PipePipe-Bisub"
++                    + "/releases/latest";
++
++    private BisubUpdateChecker() { }
++
++    /**
++     * Asynchronously checks for a newer release.  A toast is shown
++     * immediately; the result dialog (update available / up to date /
++     * error) appears on the main thread when the API call completes.
++     *
++     * @param context any context; the dialog is shown with
++     *                {@code FLAG_ACTIVITY_NEW_TASK} if needed.
++     */
++    public static void checkForUpdates(final Context context) {
++        Toast.makeText(context, R.string.bisub_update_checking,
++                Toast.LENGTH_SHORT).show();
++        new Thread(() -> doCheck(context)).start();
++    }
++
++    private static void doCheck(final Context context) {
++        try {
++            final OkHttpClient client = new OkHttpClient.Builder()
++                    .connectTimeout(15, TimeUnit.SECONDS)
++                    .readTimeout(15, TimeUnit.SECONDS)
++                    .build();
++            final Request request = new Request.Builder()
++                    .url(RELEASES_API)
++                    .header("Accept", "application/vnd.github+json")
++                    .header("User-Agent", "BiPipe-UpdateChecker")
++                    .build();
++            try (Response response = client.newCall(request).execute()) {
++                if (!response.isSuccessful()) {
++                    final int code = response.code();
++                    runOnUi(() -> showError(context, "HTTP " + code));
++                    return;
++                }
++                final String bodyStr = response.body().string();
++                final JSONObject json = new JSONObject(bodyStr);
++                final String tagName = json.getString("tag_name");
++                final int remote = parseRemoteNumber(tagName);
++                if (remote <= 0) {
++                    runOnUi(() -> showError(context,
++                            "Unrecognized tag: " + tagName));
++                    return;
++                }
++                final int local = parseLocalNumber();
++                if (remote <= local) {
++                    runOnUi(() -> showUpToDate(context));
++                    return;
++                }
++                final String notes = json.optString("body", "");
++                final String apkUrl = findApkUrl(json);
++                if (apkUrl == null) {
++                    runOnUi(() -> showError(context,
++                            "Release has no APK asset"));
++                    return;
++                }
++                final String releaseName =
++                        json.optString("name", tagName);
++                runOnUi(() -> showUpdateAvailable(
++                        context, releaseName, notes, apkUrl));
++            }
++        } catch (final Exception e) {
++            BisubLog.e("Update check failed", e);
++            runOnUi(() -> showError(context, e.getMessage()));
++        }
++    }
++
++    /**
++     * Extracts the bisub run-number from the local {@code VERSION_NAME}.
++     * "5.5.0-bisub63" → 63; "5.5.0" (pre-injection builds) → 0.
++     */
++    private static int parseLocalNumber() {
++        final String name = BuildConfig.VERSION_NAME;
++        final int idx = name.indexOf("bisub");
++        if (idx < 0) {
++            return 0;
++        }
++        try {
++            return Integer.parseInt(name.substring(idx + 5));
++        } catch (final NumberFormatException e) {
++            return 0;
++        }
++    }
++
++    /**
++     * Extracts the bisub run-number from a release tag.
++     * "bisub-63" → 63; anything else → -1 (invalid).
++     */
++    private static int parseRemoteNumber(final String tagName) {
++        if (tagName != null && tagName.startsWith("bisub-")) {
++            try {
++                return Integer.parseInt(tagName.substring(6));
++            } catch (final NumberFormatException e) {
++                return -1;
++            }
++        }
++        return -1;
++    }
++
++    private static String findApkUrl(final JSONObject json) {
++        final JSONArray assets = json.optJSONArray("assets");
++        if (assets == null) {
++            return null;
++        }
++        for (int i = 0; i < assets.length(); i++) {
++            final JSONObject asset = assets.optJSONObject(i);
++            if (asset == null) {
++                continue;
++            }
++            final String name = asset.optString("name", "");
++            if (name.endsWith(".apk")) {
++                return asset.optString("browser_download_url", null);
++            }
++        }
++        return null;
++    }
++
++    private static void runOnUi(final Runnable r) {
++        new Handler(Looper.getMainLooper()).post(r);
++    }
++
++    private static void showUpToDate(final Context context) {
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_update_up_to_date_title)
++                .setMessage(R.string.bisub_update_up_to_date_msg)
++                .setPositiveButton(android.R.string.ok, null)
++                .show();
++    }
++
++    private static void showError(final Context context,
++                                  final String detail) {
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_update_error_title)
++                .setMessage(context.getString(
++                        R.string.bisub_update_error_msg,
++                        detail == null ? "unknown" : detail))
++                .setPositiveButton(android.R.string.ok, null)
++                .show();
++    }
++
++    private static void showUpdateAvailable(final Context context,
++            final String releaseName, final String notes,
++            final String apkUrl) {
++        final ScrollView scroller = new ScrollView(context);
++        final TextView view = new TextView(context);
++        view.setText(notes);
++        final int pad = Math.round(
++                16f * context.getResources().getDisplayMetrics().density);
++        view.setPadding(pad, pad / 2, pad, pad / 2);
++        scroller.addView(view);
++        new AlertDialog.Builder(context)
++                .setTitle(context.getString(
++                        R.string.bisub_update_available_title,
++                        releaseName))
++                .setView(scroller)
++                .setPositiveButton(R.string.bisub_update_download,
++                        (d, w) -> downloadAndInstall(context, apkUrl))
++                .setNegativeButton(android.R.string.cancel, null)
++                .show();
++    }
++
++    private static void downloadAndInstall(final Context context,
++                                           final String apkUrl) {
++        Toast.makeText(context, R.string.bisub_update_downloading,
++                Toast.LENGTH_SHORT).show();
++        new Thread(() -> doDownload(context, apkUrl)).start();
++    }
++
++    private static void doDownload(final Context context,
++                                   final String apkUrl) {
++        try {
++            final OkHttpClient client = new OkHttpClient.Builder()
++                    .connectTimeout(30, TimeUnit.SECONDS)
++                    .readTimeout(120, TimeUnit.SECONDS)
++                    .build();
++            final Request request = new Request.Builder()
++                    .url(apkUrl)
++                    .header("User-Agent", "BiPipe-UpdateChecker")
++                    .build();
++            try (Response response = client.newCall(request).execute()) {
++                if (!response.isSuccessful()) {
++                    final int code = response.code();
++                    runOnUi(() -> showError(context,
++                            "Download HTTP " + code));
++                    return;
++                }
++                final File apkFile = new File(
++                        context.getCacheDir(), "bisub-update.apk");
++                try (InputStream is = response.body().byteStream();
++                     FileOutputStream fos =
++                             new FileOutputStream(apkFile)) {
++                    final byte[] buf = new byte[8192];
++                    int n;
++                    while ((n = is.read(buf)) > 0) {
++                        fos.write(buf, 0, n);
++                    }
++                }
++                runOnUi(() -> installApk(context, apkFile));
++            }
++        } catch (final Exception e) {
++            BisubLog.e("APK download failed", e);
++            runOnUi(() -> showError(context, e.getMessage()));
++        }
++    }
++
++    private static void installApk(final Context context,
++                                   final File apkFile) {
++        final Uri uri = FileProvider.getUriForFile(context,
++                context.getPackageName() + ".bisub.provider",
++                apkFile);
++        final Intent intent = new Intent(Intent.ACTION_VIEW);
++        intent.setDataAndType(uri,
++                "application/vnd.android.package-archive");
++        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        context.startActivity(intent);
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 60be13be6..e2d93f5d2 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -117,6 +117,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         // The cached subtitles list is a second-level page
+         // (BisubCacheFragment) opened through android:fragment.
+         setupDebugLogButton();
++        setupCheckUpdateButton();
+         refreshProfileBindings();
+         prefs.registerOnSharedPreferenceChangeListener(prefChangeListener);
+     }
+@@ -662,6 +663,19 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+         });
+     }
+ 
++    /**
++     * Checks GitHub for a newer bisub release and, if one exists,
++     * shows a dialog with the release notes and a download button.
++     */
++    private void setupCheckUpdateButton() {
++        final Preference updatePref =
++                requirePreference(R.string.bisub_check_update_key);
++        updatePref.setOnPreferenceClickListener((final Preference p) -> {
++            BisubUpdateChecker.checkForUpdates(requireContext());
++            return true;
++        });
++    }
++
+     /**
+      * Shows the debug log entries, newest at the bottom, and offers copy,
+      * clear and dismiss actions.
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 5edba35d6..4b64bd9cc 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1449,4 +1449,18 @@
+     <string name="bisub_cloud_backup_restoring">正在从云端恢复…</string>
+     <string name="bisub_cloud_backup_done">云备份完成</string>
+     <string name="bisub_cloud_backup_failed">云备份失败：%s</string>
++
++    <!-- bisub update checker -->
++    <string name="bisub_update_category_title">更新</string>
++    <string name="bisub_check_update_key">bisub_check_update</string>
++    <string name="bisub_check_update_title">检查更新</string>
++    <string name="bisub_check_update_summary">检查 GitHub 上最新的 BiPipe 版本</string>
++    <string name="bisub_update_checking">正在检查更新…</string>
++    <string name="bisub_update_up_to_date_title">已是最新版本</string>
++    <string name="bisub_update_up_to_date_msg">您正在使用最新版本。</string>
++    <string name="bisub_update_error_title">检查更新失败</string>
++    <string name="bisub_update_error_msg">错误：%s</string>
++    <string name="bisub_update_available_title">发现新版本：%s</string>
++    <string name="bisub_update_download">下载并安装</string>
++    <string name="bisub_update_downloading">正在下载 APK…</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 2ac428637..9cc9b4340 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1453,5 +1453,19 @@
+     <string name="bisub_cloud_backup_restoring">Restoring from the cloud…</string>
+     <string name="bisub_cloud_backup_done">Cloud backup complete</string>
+     <string name="bisub_cloud_backup_failed">Cloud backup failed: %s</string>
++
++    <!-- bisub update checker -->
++    <string name="bisub_update_category_title">Updates</string>
++    <string name="bisub_check_update_key">bisub_check_update</string>
++    <string name="bisub_check_update_title">Check for updates</string>
++    <string name="bisub_check_update_summary">Check for the latest BiPipe release on GitHub</string>
++    <string name="bisub_update_checking">Checking for updates…</string>
++    <string name="bisub_update_up_to_date_title">Up to date</string>
++    <string name="bisub_update_up_to_date_msg">You are running the latest version.</string>
++    <string name="bisub_update_error_title">Update check failed</string>
++    <string name="bisub_update_error_msg">Error: %s</string>
++    <string name="bisub_update_available_title">Update available: %s</string>
++    <string name="bisub_update_download">Download &amp; install</string>
++    <string name="bisub_update_downloading">Downloading APK…</string>
+ </resources>
+ 
+diff --git a/app/src/main/res/xml/bisub_file_paths.xml b/app/src/main/res/xml/bisub_file_paths.xml
+new file mode 100644
+index 000000000..c2f19cb64
+--- /dev/null
++++ b/app/src/main/res/xml/bisub_file_paths.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<paths>
++    <cache-path
++        name="bisub_cache"
++        path="." />
++</paths>
+\ No newline at end of file
+diff --git a/app/src/main/res/xml/bisub_settings.xml b/app/src/main/res/xml/bisub_settings.xml
+index b70e899cf..bea3a08f0 100644
+--- a/app/src/main/res/xml/bisub_settings.xml
++++ b/app/src/main/res/xml/bisub_settings.xml
+@@ -170,4 +170,16 @@
+             app:iconSpaceReserved="false"
+             app:singleLineTitle="false" />
+     </PreferenceCategory>
++
++    <PreferenceCategory
++        android:title="@string/bisub_update_category_title"
++        app:iconSpaceReserved="false">
++
++        <Preference
++            android:key="@string/bisub_check_update_key"
++            android:summary="@string/bisub_check_update_summary"
++            android:title="@string/bisub_check_update_title"
++            app:iconSpaceReserved="false"
++            app:singleLineTitle="false" />
++    </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

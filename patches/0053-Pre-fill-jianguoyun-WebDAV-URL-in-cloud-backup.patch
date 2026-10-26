@@ -1,0 +1,155 @@
+From b8afa17119def3749817e1dd5f01631876cafe8e Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Mon, 26 Oct 2026 11:40:08 +0800
+Subject: [PATCH] 0053: Pre-fill jianguoyun WebDAV URL in cloud backup
+
+Add a "Preset service" ListPreference to the cloud backup settings
+that, when set to jianguoyun, automatically fills the WebDAV URL
+with https://dav.jianguoyun.com/dav/ and switches the provider to
+WebDAV. The user only needs to enter username and password.
+The preset selector is hidden when S3 is the active provider.
+---
+ .../newpipe/settings/CloudBackupFragment.java | 25 +++++++++++++++++++
+ app/src/main/res/values-zh-rCN/strings.xml    |  5 ++++
+ app/src/main/res/values/settings_keys.xml     |  9 +++++++
+ app/src/main/res/values/strings.xml           |  5 ++++
+ .../main/res/xml/cloud_backup_settings.xml    | 10 ++++++++
+ 5 files changed, 54 insertions(+)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+index c1e520896..3d3b77e4d 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/CloudBackupFragment.java
+@@ -8,6 +8,7 @@ import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.preference.EditTextPreference;
+ import androidx.preference.ListPreference;
+ import androidx.preference.Preference;
+ import androidx.preference.SwitchPreferenceCompat;
+@@ -47,6 +48,7 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+         addPreferencesFromResourceRegistry();
+ 
+         bindProviderPreference();
++        bindPresetPreference();
+         bindServerFields();
+         bindActions();
+         bindAutomaticBackups();
+@@ -85,6 +87,27 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+         });
+     }
+ 
++    private void bindPresetPreference() {
++        final ListPreference preset =
++                (ListPreference) requirePreference(
++                        R.string.bisub_cloud_backup_preset_key);
++        preset.setOnPreferenceChangeListener((p, value) -> {
++            if ("jianguoyun".equals(value)) {
++                final EditTextPreference urlPref =
++                        (EditTextPreference) requirePreference(
++                                R.string.bisub_cloud_backup_webdav_url_key);
++                urlPref.setText("https://dav.jianguoyun.com/dav/");
++                final ListPreference providerPref =
++                        (ListPreference) requirePreference(
++                                R.string.bisub_cloud_backup_provider_key);
++                providerPref.setValue("webdav");
++                applyProviderVisibility();
++                refreshSummaries();
++            }
++            return true;
++        });
++    }
++
+     private void bindServerFields() {
+         // Editing any server field may complete or invalidate the
+         // configuration, so the automatic schedule must be re-evaluated.
+@@ -160,6 +183,8 @@ public final class CloudBackupFragment extends BasePreferenceFragment {
+         for (final int key : s3Keys) {
+             requirePreference(key).setVisible(!webdav);
+         }
++        requirePreference(R.string.bisub_cloud_backup_preset_key)
++                .setVisible(webdav);
+     }
+ 
+     private void refreshSummaries() {
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 4b64bd9cc..baa12cd84 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1463,4 +1463,9 @@
+     <string name="bisub_update_available_title">发现新版本：%s</string>
+     <string name="bisub_update_download">下载并安装</string>
+     <string name="bisub_update_downloading">正在下载 APK…</string>
++
++    <!-- bisub cloud backup presets -->
++    <string name="bisub_cloud_backup_preset_title">预设服务</string>
++    <string name="bisub_cloud_backup_preset_none">无</string>
++    <string name="bisub_cloud_backup_preset_jianguoyun">坚果云</string>
+ </resources>
+diff --git a/app/src/main/res/values/settings_keys.xml b/app/src/main/res/values/settings_keys.xml
+index eb0b14fcc..b0c53dcce 100644
+--- a/app/src/main/res/values/settings_keys.xml
++++ b/app/src/main/res/values/settings_keys.xml
+@@ -1907,6 +1907,7 @@
+     <string name="bisub_app_id_key">bisub_app_id</string>
+     <string name="bisub_cloud_backup_provider_key">bisub_cloud_backup_provider</string>
+     <string name="bisub_cloud_backup_webdav_url_key">bisub_cloud_backup_webdav_url</string>
++    <string name="bisub_cloud_backup_preset_key">bisub_cloud_backup_preset</string>
+     <string name="bisub_cloud_backup_webdav_username_key">bisub_cloud_backup_webdav_username</string>
+     <string name="bisub_cloud_backup_webdav_password_key">bisub_cloud_backup_webdav_password</string>
+     <string name="bisub_cloud_backup_s3_endpoint_key">bisub_cloud_backup_s3_endpoint</string>
+@@ -1963,6 +1964,14 @@
+         <item>webdav</item>
+         <item>s3</item>
+     </string-array>
++    <string-array name="bisub_cloud_backup_presets">
++        <item>@string/bisub_cloud_backup_preset_none</item>
++        <item>@string/bisub_cloud_backup_preset_jianguoyun</item>
++    </string-array>
++    <string-array name="bisub_cloud_backup_preset_values">
++        <item>none</item>
++        <item>jianguoyun</item>
++    </string-array>
+     <string-array name="bisub_cloud_backup_intervals">
+         <item>@string/bisub_cloud_backup_auto_interval_daily</item>
+         <item>@string/bisub_cloud_backup_auto_interval_weekly</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9cc9b4340..8a93dab4d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1467,5 +1467,10 @@
+     <string name="bisub_update_available_title">Update available: %s</string>
+     <string name="bisub_update_download">Download &amp; install</string>
+     <string name="bisub_update_downloading">Downloading APK…</string>
++
++    <!-- bisub cloud backup presets -->
++    <string name="bisub_cloud_backup_preset_title">Preset service</string>
++    <string name="bisub_cloud_backup_preset_none">None</string>
++    <string name="bisub_cloud_backup_preset_jianguoyun">坚果云 (jianguoyun)</string>
+ </resources>
+ 
+diff --git a/app/src/main/res/xml/cloud_backup_settings.xml b/app/src/main/res/xml/cloud_backup_settings.xml
+index 8deb82741..2d4413099 100644
+--- a/app/src/main/res/xml/cloud_backup_settings.xml
++++ b/app/src/main/res/xml/cloud_backup_settings.xml
+@@ -18,6 +18,16 @@
+                 app:singleLineTitle="false"
+                 app:iconSpaceReserved="false" />
+ 
++        <ListPreference
++                android:key="@string/bisub_cloud_backup_preset_key"
++                android:defaultValue="none"
++                android:entries="@array/bisub_cloud_backup_presets"
++                android:entryValues="@array/bisub_cloud_backup_preset_values"
++                android:title="@string/bisub_cloud_backup_preset_title"
++                android:summary="%s"
++                app:singleLineTitle="false"
++                app:iconSpaceReserved="false" />
++
+         <EditTextPreference
+                 android:key="@string/bisub_cloud_backup_webdav_url_key"
+                 android:title="@string/bisub_cloud_backup_webdav_url_title"
+-- 
+2.54.0.windows.1
+

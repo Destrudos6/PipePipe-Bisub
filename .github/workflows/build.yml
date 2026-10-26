@@ -115,6 +115,15 @@ jobs:
             echo "No extractor patches present, skipping"
           fi
 
+      - name: Inject bisub version number
+        working-directory: src/PipePipeClient
+        run: |
+          RUN_NUM=${{ github.run_number }}
+          BISUB_VC=$((1110 + RUN_NUM))
+          sed -i -E "s/def baseVersionCode = [0-9]+/def baseVersionCode = $BISUB_VC/" app/build.gradle
+          sed -i -E "s/(def appVersionName = ).*/\1\"5.5.0-bisub${RUN_NUM}\"/" app/build.gradle
+          echo "Injected versionCode=$BISUB_VC versionName=5.5.0-bisub${RUN_NUM}"
+
       - name: Build debug APK
         working-directory: src/PipePipeClient
         run: ./gradlew assembleDebug --stacktrace -DskipFormatKtlint
@@ -135,6 +144,7 @@ jobs:
 
             - PipePipeClient: ${{ env.CLIENT_REF }}
             - PipePipeExtractor: ${{ env.EXTRACTOR_REF }}
+            - Version: 5.5.0-bisub${{ github.run_number }} (versionCode ${{ github.run_number }})
           files: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
