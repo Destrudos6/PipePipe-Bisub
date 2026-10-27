@@ -1,0 +1,120 @@
+From 06b92ba64af1872578cebebfed45c3c2a4081f2d Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 27 Oct 2026 13:38:47 +0800
+Subject: [PATCH] 0058: Fix video frame drops when restoring from mini player
+
+Three optimizations to reduce frame drops when expanding the video
+from the mini player (bottom-sheet collapsed) back to the detail page
+or entering fullscreen:
+
+1. Add configChanges to MainActivity so orientation changes no
+   longer recreate the activity. The player's orientation logic is
+   already handled by PlayerBroadcastReceiver through the system
+   ACTION_CONFIGURATION_CHANGED broadcast, and AppCompatActivity's
+   onConfigurationChanged updates support-library UI components.
+
+2. In addVideoPlayerView(), move setHeightThumbnail() after
+   target.addView() so the surface is reattached as quickly as
+   possible during fullscreen reparent, narrowing the surface gap
+   where ExoPlayer cannot render.
+
+3. In onStateChanged(STATE_EXPANDED), defer startBCPlayer() to the
+   next frame so the bottom-sheet expand animation and surface resize
+   are not competing with bullet-comments initialization for the main
+   thread.
+---
+ app/src/main/AndroidManifest.xml                    |  3 ++-
+ .../main/java/org/schabi/newpipe/MainActivity.java  | 12 ++++++++++++
+ .../fragments/detail/VideoDetailFragment.java       | 13 +++++++++++--
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index e075d4528..f29d42abe 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -64,7 +64,8 @@
+         <activity
+                 android:name=".MainActivity"
+                 android:label="@string/app_name"
+-                android:launchMode="singleTask" android:exported="true">
++                android:launchMode="singleTask" android:exported="true"
++                android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+ 
+diff --git a/app/src/main/java/org/schabi/newpipe/MainActivity.java b/app/src/main/java/org/schabi/newpipe/MainActivity.java
+index b9a24b4b6..0b261511c 100644
+--- a/app/src/main/java/org/schabi/newpipe/MainActivity.java
++++ b/app/src/main/java/org/schabi/newpipe/MainActivity.java
+@@ -25,6 +25,7 @@ import static org.schabi.newpipe.util.Localization.assureCorrectAppLanguage;
+ import android.app.Dialog;
+ import android.content.*;
+ import android.content.pm.PackageManager;
++import android.content.res.Configuration;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.Handler;
+@@ -170,6 +171,17 @@ public class MainActivity extends AppCompatActivity {
+         NotificationWorker.initialize(this);
+     }
+ 
++    // BISUB-BEGIN: handle configuration changes without recreating the activity
++    // to avoid video frame drops when entering fullscreen triggers an orientation
++    // change. The player's orientation logic is handled through
++    // PlayerBroadcastReceiver's ACTION_CONFIGURATION_CHANGED listener.
++    @Override
++    public void onConfigurationChanged(final Configuration newConfig) {
++        super.onConfigurationChanged(newConfig);
++        assureCorrectAppLanguage(this);
++    }
++    // BISUB-END
++
+     @Override
+     protected void onPostCreate(final Bundle savedInstanceState) {
+         super.onPostCreate(savedInstanceState);
+diff --git a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+index 41c0c815c..1216784ef 100644
+--- a/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/fragments/detail/VideoDetailFragment.java
+@@ -1803,8 +1803,10 @@ public final class VideoDetailFragment
+         if (player.getRootView().getParent() != target) {
+             playerService.removeViewFromParent();
+         }
+-        setHeightThumbnail();
+ 
++        // BISUB-BEGIN: setHeightThumbnail() was between removeView and addView,
++        // widening the surface gap during fullscreen reparent. Move it after
++        // addView so the surface is reattached as quickly as possible.
+         // Prevent from re-adding a view multiple times
+         if (player.getRootView().getParent() == null) {
+             target.addView(player.getRootView());
+@@ -1812,6 +1814,8 @@ public final class VideoDetailFragment
+                 player.onMarkSeekbarRequested(currentInfo);
+             }
+         }
++        setHeightThumbnail();
++        // BISUB-END
+ 
+         binding.fullscreenPlayerContainer.setVisibility(fullscreen ? View.VISIBLE : View.GONE);
+         // Keep the DPAD focus from wandering into the hidden detail page
+@@ -2879,11 +2883,16 @@ public final class VideoDetailFragment
+                             // from the player
+                             applyOverlayForState(newState);
+                             hideSystemUiIfNeeded();
++                            // BISUB-BEGIN: defer bullet-comments init to the next
++                            // frame so the bottom-sheet expand animation and surface
++                            // resize are not competing for the main thread.
+                             if (isPlayerAvailable()
+                                     && player.isPlaying()
+                                     && player.videoPlayerSelected()) {
+-                                player.startBCPlayer();
++                                player.getRootView().post(
++                                        () -> player.startBCPlayer());
+                             }
++                            // BISUB-END
+                             break;
+                         case BottomSheetBehavior.STATE_COLLAPSED:
+                             moveFocusToMainFragment(true);
+-- 
+2.54.0.windows.1
+
