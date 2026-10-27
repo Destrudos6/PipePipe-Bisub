@@ -1,0 +1,280 @@
+From 62d5a487715a19ad186f717c1751a4b15485f4dd Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 27 Oct 2026 12:59:29 +0800
+Subject: [PATCH] 0057: Improve debug log system and add install diagnostics
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add install diagnostic logging in BisubUpdateChecker: log APK file
+  path/size/exists/canRead, FileProvider URI, Intent action/type/flags
+  before firing install, and wrap startActivity in try-catch to log
+  any exception — helps diagnose '解析软件包时出现问题'
+- Log download start and completion in doDownload
+- Make debug log text selectable (setTextIsSelectable) so users can
+  select and copy specific portions instead of only whole-text copy
+- Add 'Upload to cloud' button in debug log dialog: uploads log as
+  bisub-debug-log.txt to the configured WebDAV/S3 cloud backup endpoint
+- CloudBackupManager.uploadLog method for direct log text upload
+- Restructure dialog buttons: Copy (positive), Upload (neutral), Clear (negative)
+---
+ .../newpipe/bisub/BisubUpdateChecker.java     | 27 +++++++++-
+ .../bisub/backup/CloudBackupManager.java      | 38 +++++++++++++
+ .../settings/BisubSettingsFragment.java       | 53 ++++++++++++++++++-
+ app/src/main/res/values-zh-rCN/strings.xml    |  4 ++
+ app/src/main/res/values/strings.xml           |  4 ++
+ 5 files changed, 123 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+index ea721add6..7ee9d5211 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+@@ -17,6 +17,7 @@ import org.json.JSONArray;
+ import org.json.JSONObject;
+ import org.schabi.newpipe.BuildConfig;
+ import org.schabi.newpipe.R;
++import org.schabi.newpipe.bisub.BisubLog;
+ 
+ import java.io.File;
+ import java.io.FileOutputStream;
+@@ -280,6 +281,8 @@ public final class BisubUpdateChecker {
+                                    final ProgressDialog progress) {
+         try {
+             cleanupOldApks(apkFile);
++            BisubLog.i("Update: downloading APK from " + apkUrl
++                    + " to " + apkFile.getAbsolutePath());
+             final OkHttpClient client = new OkHttpClient.Builder()
+                     .connectTimeout(30, TimeUnit.SECONDS)
+                     .readTimeout(120, TimeUnit.SECONDS)
+@@ -327,6 +330,11 @@ public final class BisubUpdateChecker {
+                     });
+                     return;
+                 }
++                BisubLog.i("Update: APK download complete, "
++                        + apkFile.length() + " bytes, "
++                        + (contentLength > 0
++                                ? "Content-Length=" + contentLength
++                                : "Content-Length unknown"));
+                 runOnUi(() -> {
+                     progress.dismiss();
+                     installApk(context, apkFile);
+@@ -344,14 +352,31 @@ public final class BisubUpdateChecker {
+ 
+     private static void installApk(final Context context,
+                                    final File apkFile) {
++        BisubLog.i("Update: preparing install — APK file="
++                + apkFile.getAbsolutePath()
++                + " exists=" + apkFile.exists()
++                + " length=" + apkFile.length()
++                + " canRead=" + apkFile.canRead());
+         final Uri uri = FileProvider.getUriForFile(context,
+                 context.getPackageName() + ".bisub.provider",
+                 apkFile);
++        BisubLog.i("Update: FileProvider URI=" + uri);
+         final Intent intent = new Intent(Intent.ACTION_VIEW);
+         intent.setDataAndType(uri,
+                 "application/vnd.android.package-archive");
+         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-        context.startActivity(intent);
++        BisubLog.i("Update: firing install intent action="
++                + intent.getAction()
++                + " type=" + intent.getType()
++                + " flags=0x" + Integer.toHexString(intent.getFlags()));
++        try {
++            context.startActivity(intent);
++            BisubLog.i("Update: install intent sent successfully");
++        } catch (final Exception e) {
++            BisubLog.e("Update: install intent failed", e);
++            runOnUi(() -> showError(context,
++                    "Cannot start installer: " + e.getMessage()));
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+index 50ba6b56e..c90827a7c 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+@@ -19,6 +19,8 @@ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
+ import java.text.SimpleDateFormat;
+ import java.util.Date;
+ import java.util.List;
+@@ -123,6 +125,42 @@ public final class CloudBackupManager {
+                 + ".zip";
+     }
+ 
++    /**
++     * Uploads the bisub debug log as a plain-text file to the configured
++     * remote storage, so it can be inspected from another device or shared
++     * for troubleshooting. The file is named {@code bisub-debug-log.txt}
++     * and placed in the same remote directory as backups.
++     *
++     * @param logText the full formatted log text
++     * @return the remote file name
++     * @throws Exception when the upload fails; the message is user-facing
++     */
++    @NonNull
++    public String uploadLog(@NonNull final String logText) throws Exception {
++        synchronized (this) {
++            final CloudBackupConfig config = CloudBackupConfig.load(appContext);
++            if (!config.isConfigured()) {
++                throw new IOException("Cloud backup is not configured");
++            }
++            final RemoteBackend backend = config.toBackend();
++            final String name = "bisub-debug-log.txt";
++            final File temp = new File(appContext.getCacheDir(), name);
++            try {
++                Files.write(temp.toPath(),
++                        logText.getBytes(StandardCharsets.UTF_8));
++                backend.ensureRemoteDir(config.remoteDir);
++                backend.uploadBackup(config.remoteDir, name, temp);
++                Log.i(TAG, "Debug log uploaded: " + name
++                        + " (" + temp.length() + " bytes)");
++                return name;
++            } finally {
++                if (temp.exists() && !temp.delete()) {
++                    temp.deleteOnExit();
++                }
++            }
++        }
++    }
++
+     /**
+      * @return the remote backups, newest first
+      * @throws IOException when the connection or the listing fails
+diff --git a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+index 1ca4afdd3..1f8a6b9ca 100644
+--- a/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
++++ b/app/src/main/java/org/schabi/newpipe/settings/BisubSettingsFragment.java
+@@ -7,6 +7,8 @@ import android.content.DialogInterface;
+ import android.content.SharedPreferences;
+ import android.graphics.Typeface;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
+ import android.util.TypedValue;
+ import android.view.LayoutInflater;
+ import android.view.View;
+@@ -37,6 +39,8 @@ import org.schabi.newpipe.bisub.BisubPrefs;
+ import org.schabi.newpipe.bisub.BisubStyle;
+ import org.schabi.newpipe.bisub.BisubSubtitleView;
+ import org.schabi.newpipe.bisub.SubtitleTranslator;
++import org.schabi.newpipe.bisub.backup.CloudBackupConfig;
++import org.schabi.newpipe.bisub.backup.CloudBackupManager;
+ 
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -680,6 +684,7 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 16f * context.getResources().getDisplayMetrics().density);
+         view.setPadding(padding, padding / 2, padding, padding / 2);
+         view.setText(text.isEmpty() ? getString(R.string.bisub_debug_log_empty) : text);
++        view.setTextIsSelectable(true);
+         final ScrollView scroller = new ScrollView(context);
+         scroller.addView(view);
+         scroller.post(() -> scroller.fullScroll(ScrollView.FOCUS_DOWN));
+@@ -690,13 +695,15 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 .setPositiveButton(R.string.bisub_debug_log_copy,
+                         (final DialogInterface dialog, final int which) ->
+                                 copyDebugLog(context))
+-                .setNeutralButton(R.string.bisub_debug_log_clear,
++                .setNeutralButton(R.string.bisub_debug_log_upload,
++                        (final DialogInterface dialog, final int which) ->
++                                uploadLogToCloud(context, text))
++                .setNegativeButton(R.string.bisub_debug_log_clear,
+                         (final DialogInterface dialog, final int which) -> {
+                             BisubLog.clear();
+                             Toast.makeText(context, R.string.bisub_debug_log_cleared,
+                                     Toast.LENGTH_SHORT).show();
+                         })
+-                .setNegativeButton(android.R.string.cancel, null)
+                 .show();
+     }
+ 
+@@ -716,6 +723,48 @@ public class BisubSettingsFragment extends BasePreferenceFragment {
+                 Toast.LENGTH_SHORT).show();
+     }
+ 
++    /**
++     * Uploads the current debug log to the configured cloud backup endpoint
++     * so it can be inspected from another device or shared for support.
++     */
++    private void uploadLogToCloud(@NonNull final Context context,
++                                  @NonNull final String logText) {
++        if (logText.isEmpty()) {
++            Toast.makeText(context, R.string.bisub_debug_log_empty,
++                    Toast.LENGTH_SHORT).show();
++            return;
++        }
++        if (!CloudBackupConfig.load(context).isConfigured()) {
++            Toast.makeText(context, R.string.bisub_debug_log_no_cloud,
++                    Toast.LENGTH_LONG).show();
++            return;
++        }
++        final android.app.ProgressDialog progress =
++                new android.app.ProgressDialog(context);
++        progress.setMessage(getString(R.string.bisub_debug_log_upload));
++        progress.setCancelable(false);
++        progress.show();
++        final Handler ui = new Handler(Looper.getMainLooper());
++        new Thread(() -> {
++            try {
++                CloudBackupManager.getInstance(context).uploadLog(logText);
++                ui.post(() -> {
++                    progress.dismiss();
++                    Toast.makeText(context, R.string.bisub_debug_log_uploaded,
++                            Toast.LENGTH_SHORT).show();
++                });
++            } catch (final Exception e) {
++                ui.post(() -> {
++                    progress.dismiss();
++                    Toast.makeText(context,
++                            getString(R.string.bisub_debug_log_upload_failed,
++                                    e.getMessage()),
++                            Toast.LENGTH_LONG).show();
++                });
++            }
++        }).start();
++    }
++
+     /**
+      * Builds the short detail label of a profile: the model name for chat
+      * model providers, the engine display name for translation engines
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index ab366d152..930355bd3 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1398,6 +1398,10 @@
+     <string name="bisub_debug_log_clear">清空</string>
+     <string name="bisub_debug_log_copied">调试日志已复制到剪贴板</string>
+     <string name="bisub_debug_log_cleared">调试日志已清空</string>
++    <string name="bisub_debug_log_upload">上传到云端</string>
++    <string name="bisub_debug_log_uploaded">调试日志已上传到云端</string>
++    <string name="bisub_debug_log_upload_failed">上传失败：%s</string>
++    <string name="bisub_debug_log_no_cloud">云备份未配置，请先在设置→备份中配置 WebDAV 或 S3。</string>
+ 
+     <string name="bisub_cloud_backup_title">云备份</string>
+     <string name="bisub_cloud_backup_summary">备份到你自己的 WebDAV 或 S3 存储</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 2813aaf52..70a348317 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1402,6 +1402,10 @@
+     <string name="bisub_debug_log_clear">Clear</string>
+     <string name="bisub_debug_log_copied">Debug log copied to the clipboard</string>
+     <string name="bisub_debug_log_cleared">Debug log cleared</string>
++    <string name="bisub_debug_log_upload">Upload to cloud</string>
++    <string name="bisub_debug_log_uploaded">Debug log uploaded to cloud backup</string>
++    <string name="bisub_debug_log_upload_failed">Upload failed: %s</string>
++    <string name="bisub_debug_log_no_cloud">Cloud backup is not configured. Set up WebDAV or S3 in Settings → Backup first.</string>
+ 
+     <string name="bisub_cloud_backup_title">Cloud backup</string>
+     <string name="bisub_cloud_backup_summary">Back up to your own WebDAV or S3 storage</string>
+-- 
+2.54.0.windows.1
+
