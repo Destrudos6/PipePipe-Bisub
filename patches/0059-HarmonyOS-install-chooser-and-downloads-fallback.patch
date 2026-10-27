@@ -1,0 +1,212 @@
+From 1eaf159d169adc1c0c45f4fe0df90964a47b8290 Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Tue, 27 Oct 2026 16:52:10 +0800
+Subject: [PATCH] bisub-78: HarmonyOS install compatibility
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Use Intent.createChooser() to force app chooser dialog when installing
+APK, so users on HarmonyOS can select Zhuoyitong (卓易通) or another
+third-party installer instead of the broken built-in one.
+
+Also copy the APK to the public Downloads directory as a fallback:
+if the chooser fails, show a dialog telling the user to open the
+APK from Downloads with a file manager and select Zhuoyitong.
+
+Strings: bisub_install_chooser_title/hint, bisub_install_fallback_title/msg
+---
+ .../newpipe/bisub/BisubUpdateChecker.java     | 114 ++++++++++++++++--
+ app/src/main/res/values-zh-rCN/strings.xml    |   4 +
+ app/src/main/res/values/strings.xml           |   4 +
+ 3 files changed, 113 insertions(+), 9 deletions(-)
+
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+index 7ee9d5211..12fcd1b37 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+@@ -2,11 +2,15 @@ package org.schabi.newpipe.bisub;
+ 
+ import android.app.AlertDialog;
+ import android.app.ProgressDialog;
++import android.content.ContentValues;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.net.Uri;
++import android.os.Build;
++import android.os.Environment;
+ import android.os.Handler;
+ import android.os.Looper;
++import android.provider.MediaStore;
+ import android.widget.ScrollView;
+ import android.widget.TextView;
+ import android.widget.Toast;
+@@ -20,8 +24,10 @@ import org.schabi.newpipe.R;
+ import org.schabi.newpipe.bisub.BisubLog;
+ 
+ import java.io.File;
++import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+ import java.io.InputStream;
++import java.io.OutputStream;
+ import java.util.concurrent.TimeUnit;
+ 
+ import okhttp3.OkHttpClient;
+@@ -357,6 +363,14 @@ public final class BisubUpdateChecker {
+                 + " exists=" + apkFile.exists()
+                 + " length=" + apkFile.length()
+                 + " canRead=" + apkFile.canRead());
++
++        final String downloadName = copyApkToDownloads(context, apkFile);
++        if (downloadName != null) {
++            BisubLog.i("Update: APK copy to Downloads: " + downloadName);
++        } else {
++            BisubLog.w("Update: failed to copy APK to Downloads");
++        }
++
+         final Uri uri = FileProvider.getUriForFile(context,
+                 context.getPackageName() + ".bisub.provider",
+                 apkFile);
+@@ -366,17 +380,99 @@ public final class BisubUpdateChecker {
+                 "application/vnd.android.package-archive");
+         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-        BisubLog.i("Update: firing install intent action="
+-                + intent.getAction()
+-                + " type=" + intent.getType()
+-                + " flags=0x" + Integer.toHexString(intent.getFlags()));
++
++        final Intent chooser = Intent.createChooser(intent,
++                context.getString(R.string.bisub_install_chooser_title));
++        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
++        BisubLog.i("Update: firing install chooser intent");
++        try {
++            context.startActivity(chooser);
++            BisubLog.i("Update: install chooser intent sent successfully");
++            runOnUi(() -> Toast.makeText(context,
++                    R.string.bisub_install_chooser_hint,
++                    Toast.LENGTH_LONG).show());
++        } catch (final Exception e) {
++            BisubLog.e("Update: install chooser intent failed", e);
++            runOnUi(() -> showInstallFallback(context, downloadName, e));
++        }
++    }
++
++    /**
++     * Copies the downloaded APK to the public Downloads directory
++     * so that the user can manually open it with a file manager
++     * and choose a third-party installer (e.g. Zhuoyitong on
++     * HarmonyOS) if the in-app chooser does not work.
++     *
++     * @return the filename if the copy succeeded, {@code null} otherwise.
++     */
++    private static String copyApkToDownloads(final Context context,
++                                             final File apkFile) {
++        final String fileName = apkFile.getName();
+         try {
+-            context.startActivity(intent);
+-            BisubLog.i("Update: install intent sent successfully");
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++                final ContentValues values = new ContentValues();
++                values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
++                values.put(MediaStore.Downloads.MIME_TYPE,
++                        "application/vnd.android.package-archive");
++                values.put(MediaStore.Downloads.RELATIVE_PATH,
++                        Environment.DIRECTORY_DOWNLOADS);
++                final Uri dlUri = context.getContentResolver().insert(
++                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
++                if (dlUri == null) {
++                    return null;
++                }
++                try (FileInputStream fis = new FileInputStream(apkFile);
++                     OutputStream os = context.getContentResolver()
++                             .openOutputStream(dlUri)) {
++                    if (os == null) {
++                        return null;
++                    }
++                    final byte[] buf = new byte[8192];
++                    int n;
++                    while ((n = fis.read(buf)) > 0) {
++                        os.write(buf, 0, n);
++                    }
++                }
++                return fileName;
++            } else {
++                final File downloadsDir = Environment
++                        .getExternalStoragePublicDirectory(
++                                Environment.DIRECTORY_DOWNLOADS);
++                if (!downloadsDir.exists() && !downloadsDir.mkdirs()) {
++                    return null;
++                }
++                final File dest = new File(downloadsDir, fileName);
++                try (FileInputStream fis = new FileInputStream(apkFile);
++                     FileOutputStream fos = new FileOutputStream(dest)) {
++                    final byte[] buf = new byte[8192];
++                    int n;
++                    while ((n = fis.read(buf)) > 0) {
++                        fos.write(buf, 0, n);
++                    }
++                }
++                return fileName;
++            }
+         } catch (final Exception e) {
+-            BisubLog.e("Update: install intent failed", e);
+-            runOnUi(() -> showError(context,
+-                    "Cannot start installer: " + e.getMessage()));
++            BisubLog.e("Failed to copy APK to Downloads", e);
++            return null;
++        }
++    }
++
++    private static void showInstallFallback(final Context context,
++                                            final String downloadName,
++                                            final Exception error) {
++        final String msg;
++        if (downloadName != null) {
++            msg = context.getString(
++                    R.string.bisub_install_fallback_msg, downloadName);
++        } else {
++            msg = "Cannot start installer: " + error.getMessage();
+         }
++        new AlertDialog.Builder(context)
++                .setTitle(R.string.bisub_install_fallback_title)
++                .setMessage(msg)
++                .setPositiveButton(android.R.string.ok, null)
++                .show();
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 930355bd3..8a031b0e5 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1468,6 +1468,10 @@
+     <string name="bisub_update_download">下载并安装</string>
+     <string name="bisub_update_downloading">正在下载 APK…</string>
+     <string name="bisub_update_installing">正在安装已下载的 APK…</string>
++    <string name="bisub_install_chooser_title">选择安装方式</string>
++    <string name="bisub_install_chooser_hint">请选择卓易通或其他安装器（鸿蒙系统请勿使用自带安装器）</string>
++    <string name="bisub_install_fallback_title">无法打开安装器</string>
++    <string name="bisub_install_fallback_msg">APK 已复制到下载目录 Downloads/%s。\n请用文件管理器打开并选择卓易通安装。</string>
+ 
+     <!-- bisub cloud backup presets -->
+     <string name="bisub_cloud_backup_preset_title">预设服务</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 70a348317..b984b76c2 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1472,6 +1472,10 @@
+     <string name="bisub_update_download">Download &amp; install</string>
+     <string name="bisub_update_downloading">Downloading APK…</string>
+     <string name="bisub_update_installing">Installing downloaded APK…</string>
++    <string name="bisub_install_chooser_title">Choose installer</string>
++    <string name="bisub_install_chooser_hint">Select Zhuoyitong or another installer (avoid the system installer on HarmonyOS)</string>
++    <string name="bisub_install_fallback_title">Installer unavailable</string>
++    <string name="bisub_install_fallback_msg">APK copied to Downloads/%s.\nPlease open it with a file manager and select Zhuoyitong to install.</string>
+ 
+     <!-- bisub cloud backup presets -->
+     <string name="bisub_cloud_backup_preset_title">Preset service</string>
+-- 
+2.54.0.windows.1
+
