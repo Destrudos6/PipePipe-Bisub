@@ -1,0 +1,605 @@
+From 0cb245e2e885b825dd8305048fcf1b2e89ce356a Mon Sep 17 00:00:00 2001
+From: Destrudos6 <3411622425@qq.com>
+Date: Wed, 4 Nov 2026 14:19:48 +0800
+Subject: [PATCH] 0060: Fix audited bugs in translation, lookup, backup and
+ update flows
+
+Fixes for real-world problems found in a full audit of the 59-patch stack.
+Every change is behaviour-preserving except where noted:
+
+- BisubManager: untranslated cues were written twice into the bilingual VTT
+  (the dedup map was pre-filled with the original text, and composeBilingual
+  writes the second line for any non-empty value), so partially translated
+  videos showed every missing line twice; the placeholder is empty now.
+- BisubManager: a run that translated zero lines still wrote the .done marker
+  and reported success, which also promoted a half-written cache from an
+  earlier run; it now fails so the user can retry.
+- BisubManager: automatic cache cleanup silently stopped deleting anything as
+  soon as the oldest entry was pinned to the reading shelf; pinned entries are
+  skipped instead of aborting the pass.
+- BisubManager: the ReCaptcha activity was opened with the timedtext subtitle
+  URL, a page that cannot render a solvable challenge; open YouTube instead
+  (upstream default) and never let a blocked background activity start hide
+  the original download error.
+- SubtitleTranslator: a base URL with a path (the built-in Zhipu/GLM preset is
+  .../api/paas/v4) got /v1/chat/completions appended and always returned 404;
+  a path-carrying base now only gets /chat/completions, a bare host keeps /v1.
+- YoudaoDictionary/WordLookupService: a malformed HTTP 200 reply was cached as
+  an empty entry, so that word could never be looked up again until restart.
+- BisubSubtitleView: clamp the wrap width to the video area (not the whole
+  letterboxed surface) so fullscreen playback wraps like the style editor
+  preview; restore the per-layer text size before drawing (both layers share
+  one TextPaint and StaticLayout keeps a reference to it).
+- Player: playSilently() left the silent-transition flag behind when playback
+  was already running (no state transition), which silenced the next manual
+  pause; skip the call in that case.
+- WordBook: serialize the read-modify-write methods; a background Maimemo sync
+  and a foreground add/remove could overwrite each other and lose a word.
+- CloudBackupManager: Context#getDataDir() is API 24 but minSdk is 23; use
+  ContextCompat.getDataDir(). Open the database before checkpoint() so the
+  periodic Worker (cold process, App.onCreate does not open it) no longer
+  fails silently and automatic cloud backups actually run.
+- BisubUpdateChecker: pick the APK matching the device ABI instead of the
+  first asset (the arm64 package was downloaded on 32-bit/x86 devices), refuse
+  to install a truncated cached APK (an interrupted download used to fail
+  permanently for that release), run the 60+ MB copy/install off the main
+  thread (ANR), and never show dialogs on a destroyed activity (BadToken
+  crash after leaving the About page during a slow request).
+- build.gradle: use the _nio desugar variant so java.nio.file works on
+  Android 6/7 (minSdk 23), where the bisub cache/reader/backup used to crash.
+---
+ app/build.gradle                              |   5 +-
+ .../schabi/newpipe/bisub/BisubManager.java    |  43 ++++-
+ .../newpipe/bisub/BisubSubtitleView.java      |  17 +-
+ .../newpipe/bisub/BisubUpdateChecker.java     | 148 +++++++++++++++---
+ .../newpipe/bisub/SubtitleTranslator.java     |   9 ++
+ .../bisub/backup/CloudBackupManager.java      |  10 +-
+ .../newpipe/bisub/wordlookup/WordBook.java    |  14 +-
+ .../bisub/wordlookup/WordLookupService.java   |   6 +-
+ .../bisub/wordlookup/YoudaoDictionary.java    |   8 +-
+ .../org/schabi/newpipe/player/Player.java     |   6 +
+ 10 files changed, 231 insertions(+), 35 deletions(-)
+
+diff --git a/app/build.gradle b/app/build.gradle
+index 7727448..4798879 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -179,7 +179,10 @@ afterEvaluate {
+ 
+ dependencies {
+ /** Desugaring **/
+-    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
++    // The _nio variant also desugars java.nio.file (Files/Paths/StandardCopyOption)
++    // for Android 6-7 (minSdk 23, java.nio.file exists from API 26 only); the base
++    // artifact lacks it, which made the bisub cache/reader/backup crash there.
++    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.5'
+ 
+ /** NewPipe libraries **/
+     implementation 'com.github.TeamNewPipe:nanojson:1d9e1aea9049fc9f85e68b43ba39fe7be1c1f751'
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+index 37cfb03..4d4d5c5 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubManager.java
+@@ -744,7 +744,15 @@ public final class BisubManager {
+         // entries is newest-first; the deletable tail is the oldest
+         // unpinned run at the end.
+         int deleted = 0;
+-        for (int i = entries.size() - 1; i >= threshold && !entries.get(i).pinned; i--) {
++        for (int i = entries.size() - 1;
++                i >= 0 && entries.size() - deleted > threshold; i--) {
++            if (entries.get(i).pinned) {
++                // Shelved subtitles are never deleted, but they must not stop the
++                // cleanup of the older unpinned entries behind them. The previous
++                // loop condition gave up as soon as the oldest entry was pinned,
++                // which silently disabled the automatic cleanup entirely.
++                continue;
++            }
+             if (deleteCachedSubtitle(entries.get(i))) {
+                 deleted++;
+             } else {
+@@ -966,7 +974,12 @@ public final class BisubManager {
+         final List<String> uniqueTexts = new ArrayList<>();
+         for (final VttParser.Cue cue : cues) {
+             if (!translationMap.containsKey(cue.joinedText())) {
+-                translationMap.put(cue.joinedText(), cue.joinedText());
++                // The map doubles as the dedup set and as the translation lookup.
++                // The placeholder must stay empty: composeBilingual writes the
++                // second line only for a non-empty value, so a cue that was not
++                // translated shows the original once instead of printing the
++                // original text twice (dimmed original + "translation").
++                translationMap.put(cue.joinedText(), "");
+                 uniqueTexts.add(cue.joinedText());
+             }
+         }
+@@ -1059,6 +1072,17 @@ public final class BisubManager {
+             throw new IOException("The provider rejected the translation request, "
+                     + "check the translation settings");
+         }
++        if (translatedCount == 0 && !toTranslate.isEmpty()) {
++            // Nothing at all was translated (network down, quota exhausted,
++            // unusable model replies). Marking the file done here used to hide a
++            // failed translation behind a "finished" button and also promoted a
++            // half-written cache left by an earlier run, so fail and let the user
++            // retry instead.
++            BisubLog.e("Translation: video " + target.videoId
++                    + " - no line was translated, nothing was marked done");
++            throw new IOException("No line could be translated; check the network "
++                    + "and the translation settings");
++        }
+         writeMetaQuietly(target, translatedCount, cues.size());
+         atomicWriteCache(target.doneFile, "");
+         notifyFinished(target.cacheKey, true);
+@@ -1451,8 +1475,19 @@ public final class BisubManager {
+             // the next subtitle download attempt will succeed.
+             final Intent intent = new Intent(context, ReCaptchaActivity.class);
+             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-            intent.putExtra(ReCaptchaActivity.RECAPTCHA_URL_EXTRA, url);
+-            context.startActivity(intent);
++            // The subtitle URL is a timedtext API endpoint, not a page that renders
++            // a solvable challenge. Load the regular YouTube page instead: that is
++            // what the reCAPTCHA flow expects and what refreshes the blocking
++            // cookie in DownloaderImpl so the next attempt can succeed.
++            intent.putExtra(ReCaptchaActivity.RECAPTCHA_URL_EXTRA,
++                    ReCaptchaActivity.YT_URL);
++            try {
++                context.startActivity(intent);
++            } catch (final Exception startError) {
++                // Background activity starts may be blocked by the OS; never let
++                // that hide the original subtitle download failure.
++                BisubLog.w("Could not open the ReCaptcha activity", startError);
++            }
+             throw new IOException("ReCaptcha challenge while downloading subtitle", e);
+         }
+         final String body = response.responseBody();
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+index f1b31b1..7c503bd 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubSubtitleView.java
+@@ -370,6 +370,16 @@ public final class BisubSubtitleView extends View {
+         // playback — and to the style editor preview.
+         final float videoHeight = videoAspectRatio > 0f
+                 ? Math.min(height, width / videoAspectRatio) : height;
++        // The width needs the same treatment for the opposite case: on a screen
++        // that is wider than the video (a 16:9 video on a 19.5:9 phone in
++        // landscape), the surface view shrinks the video to its aspect ratio and
++        // centers it, so the real video area is narrower than this view. Laying
++        // the cues out at the raw view width would wrap later than the style
++        // editor preview and let the subtitle bar extend over the letterbox
++        // bars. Portrait video (aspect < 1) keeps the full width: narrowing it
++        // there would squeeze every line into a few characters.
++        final float videoWidth = videoAspectRatio >= 1f
++                ? Math.min(width, videoHeight * videoAspectRatio) : width;
+         // The video area is centered inside the view when it is letterboxed
+         // (portrait playback of a landscape video), so its top edge sits
+         // below the view top. Anchoring the subtitles without this offset
+@@ -398,7 +408,7 @@ public final class BisubSubtitleView extends View {
+         // sized by the text that is actually shown (fit-content), so it
+         // only spans the wrap width when the text really needs it.
+         final float wrapWidth = Math.max(1f,
+-                width * Math.max(0.5f, Math.min(1.0f, style.maxWidthPercent)));
++                videoWidth * Math.max(0.5f, Math.min(1.0f, style.maxWidthPercent)));
+ 
+         if (preview) {
+             final float scale = Math.min(viewWidth / width, viewHeight / height);
+@@ -570,6 +580,11 @@ public final class BisubSubtitleView extends View {
+                              final float textSize, final float alpha) {
+         canvas.save();
+         canvas.translate(x, y);
++        // StaticLayout keeps a reference to the TextPaint it was built with, and
++        // both layers share this instance: restore the size of this layer before
++        // drawing, otherwise the dimmed original is drawn with the size that
++        // fitTextSize computed for the translation layer.
++        textPaint.setTextSize(textSize);
+         // The whole layer (outline included) fades together, like setting
+         // opacity on the text element in CSS: both the black stroke and the
+         // fill of the dimmed original layer keep the same transparency.
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+index 12fcd1b..6b8edd9 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/BisubUpdateChecker.java
+@@ -1,5 +1,6 @@
+ package org.schabi.newpipe.bisub;
+ 
++import android.app.Activity;
+ import android.app.AlertDialog;
+ import android.app.ProgressDialog;
+ import android.content.ContentValues;
+@@ -154,29 +155,88 @@ public final class BisubUpdateChecker {
+         return -1;
+     }
+ 
++    /**
++     * Picks the APK asset that matches this device's ABI. The release contains
++     * one APK per ABI and GitHub returns them in upload order, so simply taking
++     * the first one downloads the arm64 package on a 32-bit or x86 device
++     * (INSTALL_FAILED_NO_MATCHING_ABIS). Falls back to the first APK when no
++     * name matches, which keeps the old behaviour for unusual assets.
++     */
+     private static String findApkUrl(final JSONObject json) {
+         final JSONArray assets = json.optJSONArray("assets");
+         if (assets == null) {
+             return null;
+         }
+-        for (int i = 0; i < assets.length(); i++) {
+-            final JSONObject asset = assets.optJSONObject(i);
+-            if (asset == null) {
+-                continue;
+-            }
+-            final String name = asset.optString("name", "");
+-            if (name.endsWith(".apk")) {
+-                return asset.optString("browser_download_url", null);
++        final String[] abis = Build.SUPPORTED_ABIS;
++        String fallback = null;
++        for (int a = 0; a < abis.length; a++) {
++            for (int i = 0; i < assets.length(); i++) {
++                final JSONObject asset = assets.optJSONObject(i);
++                if (asset == null) {
++                    continue;
++                }
++                final String name = asset.optString("name", "");
++                if (!name.endsWith(".apk")) {
++                    continue;
++                }
++                final String url = asset.optString("browser_download_url", null);
++                if (fallback == null) {
++                    fallback = url;
++                }
++                // The dashes keep "-x86-" from matching the "-x86_64-" package.
++                if (name.contains("-" + abis[a] + "-")) {
++                    return url;
++                }
+             }
+         }
+-        return null;
++        return fallback;
++    }
++
++    /**
++     * @return whether the file is a complete, parseable APK; an interrupted
++     *         download leaves a truncated file that the installer cannot read
++     */
++    private static boolean isUsableApk(final Context context, final File apkFile) {
++        return apkFile.length() > 1024L * 1024L
++                && context.getPackageManager()
++                        .getPackageArchiveInfo(apkFile.getAbsolutePath(), 0) != null;
+     }
+ 
+     private static void runOnUi(final Runnable r) {
+         new Handler(Looper.getMainLooper()).post(r);
+     }
+ 
++    /**
++     * A dialog needs a live window token. The network callbacks arrive seconds
++     * after the tap, when the user may already have left the About page; showing
++     * an AlertDialog on a destroyed activity throws BadTokenException.
++     *
++     * @return whether dialogs may be shown on this context
++     */
++    private static boolean canShowDialog(final Context context) {
++        return !(context instanceof Activity)
++                || (!((Activity) context).isFinishing()
++                    && !((Activity) context).isDestroyed());
++    }
++
++    /** Dismisses the download progress without crashing on a dead window. */
++    private static void dismissQuietly(final ProgressDialog progress) {
++        try {
++            if (progress.isShowing()) {
++                progress.dismiss();
++            }
++        } catch (final RuntimeException e) {
++            BisubLog.w("Update: could not dismiss the progress dialog", e);
++        }
++    }
++
+     private static void showUpToDate(final Context context) {
++        if (!canShowDialog(context)) {
++            Toast.makeText(context.getApplicationContext(),
++                    R.string.bisub_update_up_to_date_msg,
++                    Toast.LENGTH_LONG).show();
++            return;
++        }
+         new AlertDialog.Builder(context)
+                 .setTitle(R.string.bisub_update_up_to_date_title)
+                 .setMessage(R.string.bisub_update_up_to_date_msg)
+@@ -186,6 +246,13 @@ public final class BisubUpdateChecker {
+ 
+     private static void showError(final Context context,
+                                   final String detail) {
++        if (!canShowDialog(context)) {
++            Toast.makeText(context.getApplicationContext(),
++                    context.getString(R.string.bisub_update_error_msg,
++                            detail == null ? "unknown" : detail),
++                    Toast.LENGTH_LONG).show();
++            return;
++        }
+         new AlertDialog.Builder(context)
+                 .setTitle(R.string.bisub_update_error_title)
+                 .setMessage(context.getString(
+@@ -198,6 +265,13 @@ public final class BisubUpdateChecker {
+     private static void showUpdateAvailable(final Context context,
+             final String releaseName, final String notes,
+             final String apkUrl, final int remoteNumber) {
++        if (!canShowDialog(context)) {
++            Toast.makeText(context.getApplicationContext(),
++                    context.getString(R.string.bisub_update_available_title,
++                            releaseName),
++                    Toast.LENGTH_LONG).show();
++            return;
++        }
+         final ScrollView scroller = new ScrollView(context);
+         final TextView view = new TextView(context);
+         view.setText(notes);
+@@ -260,12 +334,27 @@ public final class BisubUpdateChecker {
+     private static void downloadAndInstall(final Context context,
+                                            final String apkUrl,
+                                            final int remoteNumber) {
++        if (!canShowDialog(context)) {
++            return;
++        }
+         final File apkFile = getApkFile(context, remoteNumber);
+         if (apkFile.exists() && apkFile.length() > 0) {
+-            Toast.makeText(context, R.string.bisub_update_installing,
+-                    Toast.LENGTH_SHORT).show();
+-            installApk(context, apkFile);
+-            return;
++            if (!isUsableApk(context, apkFile)) {
++                // An earlier download was interrupted (process killed); the
++                // truncated file must never reach the installer, and reusing it
++                // made the update fail permanently for this release.
++                BisubLog.w("Update: cached APK is incomplete, downloading again");
++                apkFile.delete();
++            } else {
++                Toast.makeText(context, R.string.bisub_update_installing,
++                        Toast.LENGTH_SHORT).show();
++                // Copying the APK to Downloads and talking to the package
++                // manager takes seconds for a 60+ MB file: keep it off the main
++                // thread so the update does not freeze the UI / hit an ANR.
++                new Thread(() -> installApk(context, apkFile),
++                        "bisub-install").start();
++                return;
++            }
+         }
+ 
+         final ProgressDialog progress = new ProgressDialog(context);
+@@ -301,7 +390,7 @@ public final class BisubUpdateChecker {
+                 if (!response.isSuccessful()) {
+                     final int code = response.code();
+                     runOnUi(() -> {
+-                        progress.dismiss();
++                        dismissQuietly(progress);
+                         showError(context, "Download HTTP " + code);
+                     });
+                     return;
+@@ -331,26 +420,35 @@ public final class BisubUpdateChecker {
+                         && apkFile.length() != contentLength) {
+                     apkFile.delete();
+                     runOnUi(() -> {
+-                        progress.dismiss();
++                        dismissQuietly(progress);
+                         showError(context, "Download incomplete");
+                     });
+                     return;
+                 }
++                if (!isUsableApk(context, apkFile)) {
++                    apkFile.delete();
++                    runOnUi(() -> {
++                        dismissQuietly(progress);
++                        showError(context, "Download corrupted");
++                    });
++                    return;
++                }
+                 BisubLog.i("Update: APK download complete, "
+                         + apkFile.length() + " bytes, "
+                         + (contentLength > 0
+                                 ? "Content-Length=" + contentLength
+                                 : "Content-Length unknown"));
+-                runOnUi(() -> {
+-                    progress.dismiss();
+-                    installApk(context, apkFile);
+-                });
++                runOnUi(() -> dismissQuietly(progress));
++                // Copying to Downloads and starting the installer takes seconds
++                // for a 60+ MB file; do it off the main thread (ANR).
++                new Thread(() -> installApk(context, apkFile),
++                        "bisub-install").start();
+             }
+         } catch (final Exception e) {
+             BisubLog.e("APK download failed", e);
+             apkFile.delete();
+             runOnUi(() -> {
+-                progress.dismiss();
++                dismissQuietly(progress);
+                 showError(context, e.getMessage());
+             });
+         }
+@@ -358,6 +456,12 @@ public final class BisubUpdateChecker {
+ 
+     private static void installApk(final Context context,
+                                    final File apkFile) {
++        if (!canShowDialog(context)) {
++            // The user left while downloading: do not copy another 60 MB into
++            // Downloads nor start an installer from a dead activity.
++            BisubLog.w("Update: install skipped, the activity is gone");
++            return;
++        }
+         BisubLog.i("Update: preparing install — APK file="
+                 + apkFile.getAbsolutePath()
+                 + " exists=" + apkFile.exists()
+@@ -462,6 +566,10 @@ public final class BisubUpdateChecker {
+     private static void showInstallFallback(final Context context,
+                                             final String downloadName,
+                                             final Exception error) {
++        if (!canShowDialog(context)) {
++            BisubLog.w("Update: fallback dialog skipped, the activity is gone");
++            return;
++        }
+         final String msg;
+         if (downloadName != null) {
+             msg = context.getString(
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+index fc2ae58..128dc17 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/SubtitleTranslator.java
+@@ -1684,6 +1684,15 @@ public final class SubtitleTranslator {
+         if (url.endsWith("/v1")) {
+             return url + "/chat/completions";
+         }
++        // A base URL that already carries a path is the complete API root: the
++        // built-in Zhipu (GLM) preset is https://open.bigmodel.cn/api/paas/v4,
++        // and appending /v1 produced .../paas/v4/v1/chat/completions -> HTTP 404.
++        // Only a bare host still needs the /v1 suffix.
++        final int schemeEnd = url.indexOf("://");
++        final int pathStart = schemeEnd < 0 ? -1 : url.indexOf('/', schemeEnd + 3);
++        if (pathStart > 0 && pathStart < url.length() - 1) {
++            return url + "/chat/completions";
++        }
+         return url + "/v1/chat/completions";
+     }
+ }
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+index c90827a..a474d41 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/backup/CloudBackupManager.java
+@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
+ import android.util.Log;
+ 
+ import androidx.annotation.NonNull;
++import androidx.core.content.ContextCompat;
+ 
+ import androidx.preference.PreferenceManager;
+ import androidx.work.ExistingPeriodicWorkPolicy;
+@@ -61,8 +62,10 @@ public final class CloudBackupManager {
+     }
+ 
+     private ContentSettingsManager settingsManager() {
++        // Context#getDataDir() needs API 24 but the app supports API 23; the
++        // ContextCompat helper is the upstream-safe variant.
+         return new ContentSettingsManager(
+-                new NewPipeFileLocator(appContext.getDataDir()));
++                new NewPipeFileLocator(ContextCompat.getDataDir(appContext)));
+     }
+ 
+     /**
+@@ -76,6 +79,11 @@ public final class CloudBackupManager {
+     @NonNull
+     public String backupNow() throws Exception {
+         synchronized (this) {
++            // The periodic Worker runs in a cold process where App.onCreate never
++            // opened the database, and checkpoint() throws "database is not
++            // initialized" in that case - which silently disabled automatic cloud
++            // backups. Opening it here is idempotent and cheap.
++            NewPipeDatabase.getInstance(appContext);
+             NewPipeDatabase.checkpoint();
+             final CloudBackupConfig config = CloudBackupConfig.load(appContext);
+             final RemoteBackend backend = config.toBackend();
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+index 503e649..c36f14f 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordBook.java
+@@ -49,8 +49,9 @@ public final class WordBook {
+      * @param entry   the looked-up definition, or {@code null} when the
+      *                lookup has not finished (filled in later)
+      */
+-    public static void add(@NonNull final Context context, @NonNull final String word,
+-                           @Nullable final WordEntry entry) {
++    public static synchronized void add(@NonNull final Context context,
++                                        @NonNull final String word,
++                                        @Nullable final WordEntry entry) {
+         final List<Item> items = readItems(context);
+         // Keep the other items' timestamps: only the saved word becomes
+         // "most recent". (Iterating instead of removeIf: the project
+@@ -74,7 +75,7 @@ public final class WordBook {
+      * @param word    the word whose definition to store
+      * @param entry   the finished lookup result
+      */
+-    public static void updateEntry(@NonNull final Context context,
++    public static synchronized void updateEntry(@NonNull final Context context,
+                                    @NonNull final String word,
+                                    @Nullable final WordEntry entry) {
+         final List<Item> items = readItems(context);
+@@ -93,7 +94,8 @@ public final class WordBook {
+      * @param context any context
+      * @param word    the word to remove
+      */
+-    public static void remove(@NonNull final Context context, @NonNull final String word) {
++    public static synchronized void remove(@NonNull final Context context,
++                                           @NonNull final String word) {
+         final List<Item> items = readItems(context);
+         boolean removed = false;
+         for (int i = items.size() - 1; i >= 0; i--) {
+@@ -128,7 +130,7 @@ public final class WordBook {
+      * @param context any context
+      * @param words   the words to remove
+      */
+-    public static void removeAll(@NonNull final Context context,
++    public static synchronized void removeAll(@NonNull final Context context,
+                                  @NonNull final List<String> words) {
+         if (words.isEmpty()) {
+             return;
+@@ -208,7 +210,7 @@ public final class WordBook {
+      * @param context any context
+      * @param words   the words that were confirmed in the notepad
+      */
+-    public static void markSynced(@NonNull final Context context,
++    public static synchronized void markSynced(@NonNull final Context context,
+                                   @NonNull final List<String> words) {
+         if (words.isEmpty()) {
+             return;
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordLookupService.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordLookupService.java
+index 5c589e9..e2b21ae 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordLookupService.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/WordLookupService.java
+@@ -60,7 +60,11 @@ public final class WordLookupService {
+         } else {
+             entry = YoudaoDictionary.lookup(word);
+         }
+-        CACHE.put(cacheKey, entry);
++        // Do not cache empty results: a failed lookup must be retried on the next
++        // tap instead of sticking as a permanent "no result" for the whole process.
++        if (!entry.isEmpty() || entry.isWord) {
++            CACHE.put(cacheKey, entry);
++        }
+         return entry;
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+index 9e10246..9d921c8 100644
+--- a/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
++++ b/app/src/main/java/org/schabi/newpipe/bisub/wordlookup/YoudaoDictionary.java
+@@ -93,7 +93,13 @@ public final class YoudaoDictionary {
+         BisubLog.i("dict lookup '" + word + "': HTTP 200, " + body.length()
+                 + " chars in " + (System.currentTimeMillis() - start) + " ms");
+         final WordEntry entry = parse(word, body);
+-        CACHE.put(key, entry);
++        // A malformed or non-JSON reply (captive portal, proxy error page,
++        // truncated body) parses into an empty entry. Caching that would make the
++        // failure permanent for the whole process - the word could never be looked
++        // up again until the app restarts - so only cache entries that carry data.
++        if (!entry.isEmpty() || entry.isWord) {
++            CACHE.put(key, entry);
++        }
+         return entry;
+     }
+ 
+diff --git a/app/src/main/java/org/schabi/newpipe/player/Player.java b/app/src/main/java/org/schabi/newpipe/player/Player.java
+index bdd1a99..2489741 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/Player.java
++++ b/app/src/main/java/org/schabi/newpipe/player/Player.java
+@@ -1174,6 +1174,12 @@ public final class Player {
+      * {@link #pauseSilently()}.
+      */
+     public void playSilently() {
++        if (getPlayWhenReady()) {
++            // Already in the playing state: play() would not produce a state
++            // transition, so the flag would survive and silence the next manual
++            // pause instead (missing control layer, wrong play/pause icon).
++            return;
++        }
+         bisubSilentTransition = true;
+         play();
+     }
+-- 
+2.56.0.windows.2
+
