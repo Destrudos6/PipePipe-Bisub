@@ -115,14 +115,6 @@ jobs:
             echo "No extractor patches present, skipping"
           fi
 
-      - name: Install the fixed debug keystore
-        # GitHub runners are fresh VMs: without this, AGP generates a new random
-        # debug key on every run, so every release APK has a different signature
-        # and "download & install" fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
-        run: |
-          mkdir -p ~/.android
-          cp debug.keystore ~/.android/debug.keystore
-
       - name: Inject bisub version number
         working-directory: src/PipePipeClient
         run: |
@@ -141,6 +133,15 @@ jobs:
 
       - name: Build debug APK
         working-directory: src/PipePipeClient
+        # KEY_PATH makes app/build.gradle sign the debug APK with the committed
+        # keystore instead of the random per-machine debug key AGP would generate
+        # (patch 0061). Ephemeral CI runners otherwise produce a new signature on
+        # every build, which breaks in-app updates.
+        env:
+          KEY_PATH: ${{ github.workspace }}/debug.keystore
+          KEY_STORE_PASSWORD: android
+          KEY_ALIAS: androiddebugkey
+          KEY_PASSWORD: android
         run: ./gradlew assembleDebug --stacktrace -DskipFormatKtlint
 
       - name: Upload APK artifact

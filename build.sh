@@ -55,15 +55,16 @@ git config user.email "bisub-build@localhost"
 git am "$PATCH_DIR"/*.patch
 echo "    Patches applied cleanly."
 
-echo "==> Installing the fixed debug keystore"
-# The committed keystore keeps the APK signature identical across builds (and
-# equal to the CI releases), so a local APK can be installed over a release and
-# vice versa. Without it every build gets a fresh random debug key and Android
-# refuses to update the installed app. Same behaviour as the CI workflow.
-mkdir -p "$HOME/.android"
-cp "$WORKDIR/debug.keystore" "$HOME/.android/debug.keystore"
-
-echo "==> Building debug APK"
+echo "==> Building debug APK (signed with the committed debug.keystore)"
+# app/build.gradle signs the debug APK with KEY_PATH when the KEY_* env vars are
+# set (patch 0061), so local builds share the signature of the CI releases: a
+# local APK can be installed over a release and vice versa. Without this, AGP
+# would generate a random debug key per machine and Android would refuse the
+# update with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+export KEY_PATH="$WORKDIR/debug.keystore"
+export KEY_STORE_PASSWORD="android"
+export KEY_ALIAS="androiddebugkey"
+export KEY_PASSWORD="android"
 ./gradlew assembleDebug --stacktrace -DskipFormatKtlint
 
 echo ""

@@ -2,7 +2,7 @@
 
 基于 [PipePipe](https://github.com/InfinityLoop1308/PipePipe)（NewPipe 分支）的 Android 客户端，叠加双语字幕翻译、点词查词、生词本、云备份等语言学习功能。
 
-不 fork 上游、不长期维护整个项目——只维护 **60 个 client patch + 4 个 extractor patch**，通过 CI 自动应用到上游源码并构建 APK。
+不 fork 上游、不长期维护整个项目——只维护 **61 个 client patch + 4 个 extractor patch**，通过 CI 自动应用到上游源码并构建 APK。
 
 ## 功能
 
@@ -80,7 +80,7 @@
 ## 架构
 
 ```
-patches/              60 个 client patch（0001-0060）
+patches/              61 个 client patch（0001-0061）
 patches-extractor/    4 个 extractor patch（0001-0004）
 debug.keystore        固定 debug 签名（CI 与本地构建共用，保证可覆盖安装）
 .github/workflows/    CI 构建工作流
