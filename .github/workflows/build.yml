@@ -159,7 +159,7 @@ jobs:
 
             - PipePipeClient: ${{ env.CLIENT_REF }}
             - PipePipeExtractor: ${{ env.EXTRACTOR_REF }}
-            - Version: 5.5.0-bisub${{ github.run_number }} (versionCode 1110 + ${{ github.run_number }})
+            - Version: 5.5.0-bisub${{ github.run_number }} (baseVersionCode 1110 + ${{ github.run_number }}; APK versionCode = 100 x base + ABI offset)
           files: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -179,7 +179,7 @@ jobs:
     needs: [check-upstream, build]
     # Only record a state when the probe really saw a move and produced
     # both SHAs; otherwise there is nothing new to write.
-    if: >
+    if: >-
       always() && github.event_name == 'schedule' && !cancelled()
       && needs.check-upstream.outputs.changed == 'true'
       && needs.check-upstream.outputs.client_sha != ''
