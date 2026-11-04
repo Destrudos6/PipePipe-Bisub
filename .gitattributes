@@ -3,3 +3,5 @@
 *.sh text eol=lf
 *.yml text eol=lf
 *.md text eol=auto
+# Read by the CI probe (`grep '^client='`); a stray CR would break the comparison
+.upstream-state text eol=lf

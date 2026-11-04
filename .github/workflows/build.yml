@@ -115,6 +115,14 @@ jobs:
             echo "No extractor patches present, skipping"
           fi
 
+      - name: Install the fixed debug keystore
+        # GitHub runners are fresh VMs: without this, AGP generates a new random
+        # debug key on every run, so every release APK has a different signature
+        # and "download & install" fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+        run: |
+          mkdir -p ~/.android
+          cp debug.keystore ~/.android/debug.keystore
+
       - name: Inject bisub version number
         working-directory: src/PipePipeClient
         run: |
@@ -122,6 +130,13 @@ jobs:
           BISUB_VC=$((1110 + RUN_NUM))
           sed -i -E "s/def baseVersionCode = [0-9]+/def baseVersionCode = $BISUB_VC/" app/build.gradle
           sed -i -E "s/(def appVersionName = ).*/\1\"5.5.0-bisub${RUN_NUM}\"/" app/build.gradle
+          # Fail loudly if upstream changed those lines: a silently un-injected
+          # build ships without the bisub run number, and every installed copy
+          # then believes it is out of date forever.
+          grep -q "def baseVersionCode = $BISUB_VC" app/build.gradle \
+            || { echo "::error::versionCode injection failed"; exit 1; }
+          grep -q "def appVersionName = \"5.5.0-bisub${RUN_NUM}\"" app/build.gradle \
+            || { echo "::error::versionName injection failed"; exit 1; }
           echo "Injected versionCode=$BISUB_VC versionName=5.5.0-bisub${RUN_NUM}"
 
       - name: Build debug APK
@@ -144,7 +159,7 @@ jobs:
 
             - PipePipeClient: ${{ env.CLIENT_REF }}
             - PipePipeExtractor: ${{ env.EXTRACTOR_REF }}
-            - Version: 5.5.0-bisub${{ github.run_number }} (versionCode ${{ github.run_number }})
+            - Version: 5.5.0-bisub${{ github.run_number }} (versionCode 1110 + ${{ github.run_number }})
           files: src/PipePipeClient/app/build/outputs/apk/debug/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -156,8 +171,19 @@ jobs:
   # re-runs every two hours forever. Recording the attempt stops the
   # retries; the next actual upstream movement re-triggers the build.
   record-state:
-    needs: build
-    if: always() && github.event_name == 'schedule' && !cancelled()
+    # `check-upstream` MUST be a direct dependency: GitHub only exposes a
+    # job's outputs to jobs that list it in `needs`, so through `build`
+    # alone the SHA outputs are empty. That wrote an empty .upstream-state,
+    # the probe then saw "upstream moved" on every run, and this job has
+    # failed with "nothing to commit" ever since - rebuilding every 2h.
+    needs: [check-upstream, build]
+    # Only record a state when the probe really saw a move and produced
+    # both SHAs; otherwise there is nothing new to write.
+    if: >
+      always() && github.event_name == 'schedule' && !cancelled()
+      && needs.check-upstream.outputs.changed == 'true'
+      && needs.check-upstream.outputs.client_sha != ''
+      && needs.check-upstream.outputs.extractor_sha != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: write

@@ -2,7 +2,7 @@
 
 基于 [PipePipe](https://github.com/InfinityLoop1308/PipePipe)（NewPipe 分支）的 Android 客户端，叠加双语字幕翻译、点词查词、生词本、云备份等语言学习功能。
 
-不 fork 上游、不长期维护整个项目——只维护 **51 个 client patch + 4 个 extractor patch**，通过 CI 自动应用到上游源码并构建 APK。
+不 fork 上游、不长期维护整个项目——只维护 **60 个 client patch + 4 个 extractor patch**，通过 CI 自动应用到上游源码并构建 APK。
 
 ## 功能
 
@@ -52,6 +52,8 @@
 
 支持架构：arm64-v8a / armeabi-v7a / x86 / x86_64
 
+签名：CI 与本地构建共用仓库根的 `debug.keystore`（固定签名），因此相邻版本可以直接覆盖安装、应用内更新也能真正生效。早期版本（bisub-108 及更早）每次构建的签名都不同，从它们升级需要先**卸载旧版**（会清空应用数据，请先用「备份与恢复」导出，装好后再恢复）。
+
 ## 配置
 
 ### 翻译引擎
@@ -78,11 +80,13 @@
 ## 架构
 
 ```
-patches/              51 个 client patch（0001-0051）
+patches/              60 个 client patch（0001-0060）
 patches-extractor/    4 个 extractor patch（0001-0004）
+debug.keystore        固定 debug 签名（CI 与本地构建共用，保证可覆盖安装）
 .github/workflows/    CI 构建工作流
 .upstream-state       上游 SHA 记录
 build.sh              本地构建脚本
+docs/                 审计报告与设计文档
 ```
 
 CI 流程：clone 上游 PipePipeClient + PipePipeExtractor → `git am` 应用所有 patch → `./gradlew assembleDebug` → 发布 Release
